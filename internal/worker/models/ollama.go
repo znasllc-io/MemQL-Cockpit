@@ -84,12 +84,14 @@ func (d *Discoverer) probeOllama(ctx context.Context) ([]Info, string) {
 			BaseURL: base,
 			Attributes: Attributes{
 				MaxConcurrent: parallel,
-				// Verbatim, and unvalidated here on purpose: the label
-				// renderer is the single gate on what a quantization
-				// level may contain (quantSafe), so `memql worker models`
-				// can still show an operator the odd string their runtime
-				// actually reported.
-				Quant: strings.TrimSpace(m.Details.QuantizationLevel),
+				// Otherwise verbatim: quantLevel folds only Ollama's own
+				// "I could not tell" answer to absent, and the label
+				// renderer (quantSafe) is still the single gate on what
+				// characters a level may contain. Everything in between
+				// reaches `memql worker models` as the odd string the
+				// runtime actually reported, which is what an operator
+				// compares against `ollama list`.
+				Quant: quantLevel(m.Details.QuantizationLevel),
 			},
 		}
 		if n, ok := parseParameterSize(m.Details.ParameterSize); ok {
@@ -264,4 +266,30 @@ func (d *Discoverer) do(req *http.Request, out any) error {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// quantLevel reads a quantization level out of what Ollama reported, and
+// treats the literal string "unknown" as ABSENT.
+//
+// Ollama fills `details.quantization_level` with "unknown" for models
+// whose GGUF does not carry a file type it recognises -- every model
+// pulled from Hugging Face through `hf.co/<owner>/<repo>` on the machine
+// this was found on, which is one of the two sources this epic exists to
+// support. Passing it through renders `quant=unknown` on the label, and
+// that is not a missing value, it is a POSITIVE CLAIM that the model is
+// quantized at a level named "unknown": the engine's fleet projection
+// reduces quantizations to a set across machines and would carry the
+// word as a member, and an operator reading the Fleet page cannot tell it
+// from a level somebody chose.
+//
+// So it goes back to absent, which is what the rest of this package does
+// with every fact a probe could not establish -- and `memql worker
+// models` then says "quantization not advertised", which is true and
+// actionable, instead of "unknown", which reads like an answer.
+func quantLevel(reported string) string {
+	q := strings.TrimSpace(reported)
+	if strings.EqualFold(q, "unknown") {
+		return ""
+	}
+	return q
 }

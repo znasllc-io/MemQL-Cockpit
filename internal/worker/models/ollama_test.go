@@ -316,3 +316,32 @@ func TestOllamaStructuredOutput_ToolsIsTheProxy(t *testing.T) {
 		}
 	}
 }
+
+// TestQuantLevel_UnknownIsAbsentNotAValue.
+//
+// Ollama answers "unknown" for a GGUF whose file type it does not
+// recognise, which is every model pulled through hf.co on the machine
+// this was written on. The distinction is not cosmetic: an absent quant
+// is a fact this machine did not establish, while `quant=unknown` on the
+// label is a claim that the level IS "unknown" -- and the engine reduces
+// quantizations to a set across the fleet, so the word would sit in that
+// set beside Q4_K_M as though somebody had chosen it.
+func TestQuantLevel_UnknownIsAbsentNotAValue(t *testing.T) {
+	for reported, want := range map[string]string{
+		"unknown":  "",
+		"UNKNOWN":  "",
+		"Unknown":  "",
+		" unknown": "",
+		"":         "",
+		"   ":      "",
+		"Q4_K_M":   "Q4_K_M",
+		" F16 ":    "F16",
+		// Not a substring match: a real level that merely contains the
+		// word keeps its value.
+		"unknown-q4": "unknown-q4",
+	} {
+		if got := quantLevel(reported); got != want {
+			t.Errorf("quantLevel(%q) = %q, want %q", reported, got, want)
+		}
+	}
+}
