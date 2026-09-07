@@ -17,16 +17,28 @@ import (
 // ===========================================================================
 // THE CREDENTIAL IS THE SIGNED-IN USER'S, AND IT HAS TO BE
 // ===========================================================================
-// The Library's HTTP routes resolve an actor only for a `class="user"` (or
-// classless) bearer -- the engine's own http_access.go pins every machine
-// class OFF that surface deliberately, so byte-storing writes cannot be
-// reached by a credential whose gRPC pin denies them everywhere else. The
-// worker token this process authenticates its STREAM with is one of those:
-// `mql_wkr_` is admitted on WorkerService and nowhere else, and no HTTP
-// middleware anywhere reads it.
+// The Library's HTTP routes gate on the ACTOR RESOLVING TO A USER: the
+// upload path stamps `ownerUserId` from `actor.userId` and keys the blob path
+// on it, so a credential with no user behind it has nowhere to put the bytes.
+// The worker token this process authenticates its STREAM with is exactly that
+// kind of credential -- `mql_wkr_` names a machine, is admitted on
+// WorkerService and nowhere else, and no HTTP middleware anywhere reads it.
 //
-// So the sweeper runs as the person, through the cockpit's ordinary OIDC
-// session. That is the arrangement that makes row authorization here exactly
+// THE RULE IS "RESOLVES TO A USER", NOT "IS class=user", and the distinction
+// became load-bearing in memql#4863. An app session's back-channel is now
+// minted as `class="app_session"` whose `sub` IS the owning user's id, and
+// those routes admit it for precisely that reason -- which is what makes
+// internal/worker/appsession's Library.Pull and .Push work at all. So do not
+// read this paragraph as "only class=user reaches /artifacts" and conclude the
+// app-session path cannot; the classes that stay off the surface are the ones
+// that name a MACHINE (`service_account`, `voice_agent`, `worker_token`,
+// `node`), because those have no user for the row to belong to.
+//
+// The sweeper still runs as the PERSON, and that is a separate decision rather
+// than a consequence of the above. A folder backup is that person's own files
+// moving, and it must not depend on a delegated run's short-lived credential
+// happening to exist: no app session is open when a machine sweeps at three in
+// the morning. Running as the person also makes row authorization here exactly
 // the browser's -- the same reads, the same writes, the same refusals -- with
 // no second story to keep in step.
 //

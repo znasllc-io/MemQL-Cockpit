@@ -249,10 +249,18 @@ that is the complexity cliff this sits on the safe side of, and a test asserts
 the sweeper sends no destructive call at all.
 
 **The credential is the SIGNED-IN USER'S, and it has to be.** The Library's
-HTTP routes resolve an actor only for a `class="user"` (or classless) bearer;
-the engine pins every machine class off that surface deliberately. So the
-`mql_wkr_` token this process authenticates its STREAM with cannot reach
-`/artifacts`, and neither can a PAT (PATs verify only on the identity node).
+HTTP routes gate on the actor RESOLVING TO A USER -- the upload path stamps
+`ownerUserId` from `actor.userId`, so a credential with no user behind it has
+nowhere to put the bytes. The `mql_wkr_` token this process authenticates its
+STREAM with is one of those: it names a machine, is admitted on WorkerService
+and nowhere else, and no HTTP middleware reads it. Neither can a PAT (PATs
+verify only on the identity node). **The rule is not "class must be `user`"** --
+since memql#4863 an app session's back-channel is `class="app_session"` whose
+`sub` is the owning user's id, and `/artifacts` admits it, which is what makes
+`appsession`'s Library pull and push work; the classes that stay off the
+surface are the ones naming a MACHINE. The sweeper runs as the person anyway,
+and for its own reason: a folder backup is that person's files moving and must
+not wait on a delegated run's short-lived credential existing.
 A machine that is paired but not signed in backs nothing up, which is the
 ordinary state of a fresh worker and must not be a startup failure --
 `backupBearer` returns nil and the manager is a working no-op. The sign-in is

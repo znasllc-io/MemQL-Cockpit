@@ -189,27 +189,71 @@ func (l *Library) Pull(ctx context.Context, id, dir string) (string, error) {
 }
 
 // pullStatusError turns a refusal into text that names the right party.
+func pullStatusError(id string, resp *http.Response) error {
+	return libraryStatusError("input", id, resp)
+}
+
+// pushStatusError is the same for the upload direction. A push has no 404
+// -- there is no id to miss yet -- so the shared function's 404 branch is
+// simply never reached from here.
+func pushStatusError(name string, resp *http.Response) error {
+	return libraryStatusError("push", name, resp)
+}
+
+// libraryStatusError turns a refusal into text that names the right party.
 //
 // The credential acts as the OWNING USER, so most refusals are statements
 // about that user's access rather than about this machine. Getting this
 // wrong sends an operator to check a worker token that is working fine.
-func pullStatusError(id string, resp *http.Response) error {
+//
+// THE 401 BRANCH USED TO SAY THE WRONG THING, and the reason is worth
+// keeping because the wrong reading is the one a search engine will still
+// hand you. It said "the bearer is expired or malformed". Before
+// memql#4863 that was false in the ordinary case: the bearer was fine and
+// the Library's byte routes simply did not admit its class, because an
+// app session's back-channel was minted as class="service_account" and
+// those routes require the actor to resolve to a USER. Since memql#4863
+// the class is `app_session` and its `sub` IS the owning user's id, so
+// that reading is now DEAD for an app session -- and stating it would
+// send the next person to re-read an auth path that is working.
+//
+// What is left is genuinely two things the wire does not distinguish (the
+// route answers a bare "unauthorized" either way), so both are named,
+// most likely first:
+//
+//   - EXPIRY, which is the expected one. The mint caps an app-session
+//     credential's lifetime whatever the engine asked for, precisely
+//     because the bearer lands in a file on somebody's laptop. A session
+//     that outlives its credential is therefore normal rather than
+//     exceptional, and the fix is a renewal in place --
+//     AppSessionControl{action: "renew_credential"} -- not a restart.
+//   - A credential of some OTHER class reaching this code at all, which
+//     would be a cockpit bug rather than a user's access problem.
+//
+// Row authorization is NOT in here on purpose: it is 403 or 404 below,
+// and folding it into the 401 would report "you may not read this" as
+// "your login failed".
+func libraryStatusError(what, subject string, resp *http.Response) error {
 	switch resp.StatusCode {
 	case http.StatusUnauthorized:
-		return fmt.Errorf("library: input %s: the session credential was rejected (401) -- "+
-			"this is the cockpit's side: the bearer is expired or malformed", id)
+		return fmt.Errorf("library: %s %s: the session credential was rejected (401) -- "+
+			"most likely it expired, which is ordinary for a long session because the mint caps "+
+			"its lifetime; the engine renews it in place with "+
+			"AppSessionControl{action: \"renew_credential\"}. If it has not expired, this bearer is "+
+			"not the app-session credential (class \"app_session\") the Library admits, which is a "+
+			"cockpit bug rather than an access problem for the owning user", what, subject)
 	case http.StatusForbidden:
-		return fmt.Errorf("library: input %s: the owning user cannot reach this artifact (403) -- "+
-			"this is an access question for that user, not a cockpit misconfiguration", id)
+		return fmt.Errorf("library: %s %s: the owning user cannot reach this artifact (403) -- "+
+			"this is an access question for that user, not a cockpit misconfiguration", what, subject)
 	case http.StatusNotFound:
 		// The route answers 404 on deny by design, so a URL cannot probe
 		// which ids exist. Both readings are stated because the wire
 		// genuinely does not distinguish them.
-		return fmt.Errorf("library: input %s: not found (404) -- either the artifact does not exist, "+
+		return fmt.Errorf("library: %s %s: not found (404) -- either the artifact does not exist, "+
 			"or the owning user cannot reach it; the Library answers 404 for both so a link cannot "+
-			"be used to probe which ids exist", id)
+			"be used to probe which ids exist", what, subject)
 	default:
-		return fmt.Errorf("library: input %s: %s", id, strings.TrimSpace(resp.Status))
+		return fmt.Errorf("library: %s %s: %s", what, subject, strings.TrimSpace(resp.Status))
 	}
 }
 
@@ -281,11 +325,12 @@ func (l *Library) pushReader(ctx context.Context, r io.Reader, name string) (str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		if resp.StatusCode == http.StatusForbidden {
-			return "", fmt.Errorf("library: push %s: the owning user cannot write to the Library (403) -- "+
-				"an access question for that user, not a cockpit misconfiguration", name)
-		}
-		return "", fmt.Errorf("library: push %s: %s", name, strings.TrimSpace(resp.Status))
+		// Through the same reader as the pull direction, so a 401 on the
+		// way out says what a 401 on the way in says. It did not before,
+		// and a run that pulled its inputs fine and then failed to push
+		// its output reported the two halves of one expiry as two
+		// unrelated problems.
+		return "", pushStatusError(name, resp)
 	}
 	var out PushResult
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {

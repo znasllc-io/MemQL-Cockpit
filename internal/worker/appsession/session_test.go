@@ -568,7 +568,13 @@ func TestSession_PullErrorNamesTheRightParty(t *testing.T) {
 		}
 	})
 
-	t.Run("401 is the cockpit's side", func(t *testing.T) {
+	// A 401 used to be reported as "the cockpit's side: the bearer is
+	// expired or malformed", and this test asserted that wording. Both were
+	// wrong: before memql#4863 the bearer was fine and the Library simply
+	// did not admit its class, and since memql#4863 the class IS admitted,
+	// so what is left is an expiry the engine can fix in place. The
+	// assertion moved with the sentence -- see memql-cockpit#371.
+	t.Run("401 points at renewal, not at a broken cockpit", func(t *testing.T) {
 		h := newHarness(t)
 		h.library.mu.Lock()
 		h.library.pullCode["stale"] = http.StatusUnauthorized
@@ -577,8 +583,11 @@ func TestSession_PullErrorNamesTheRightParty(t *testing.T) {
 			s.SessionId = "sess-401"
 			s.Inputs = []string{"stale"}
 		})
-		if !strings.Contains(end.GetError(), "cockpit's side") {
-			t.Errorf("error = %q, want it to name the cockpit", end.GetError())
+		if !strings.Contains(end.GetError(), "renew_credential") {
+			t.Errorf("error = %q, want it to name the renewal the engine can send", end.GetError())
+		}
+		if strings.Contains(end.GetError(), "malformed") {
+			t.Errorf("error = %q, must not resurrect the malformed-bearer diagnosis", end.GetError())
 		}
 	})
 }
