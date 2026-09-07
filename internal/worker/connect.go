@@ -47,7 +47,7 @@ type Connection struct {
 // sends the worker-protocol Register handshake. Returns the live
 // connection and the registration metadata pulled from the
 // RegisterAck.
-func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, logger *slog.Logger) (*Connection, error) {
+func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, inferenceServe string, logger *slog.Logger) (*Connection, error) {
 	endpoint, useTLS, err := sdkworker.ParseClusterURL(cfg.ClusterURL)
 	if err != nil {
 		return nil, err
@@ -68,7 +68,7 @@ func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv mo
 		logger: logger,
 	}
 
-	if err := c.register(ctx, cfg, inventory, modelInv); err != nil {
+	if err := c.register(ctx, cfg, inventory, modelInv, inferenceServe); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv mo
 // shape -- in particular that capability_descriptor_json always
 // satisfies the server-side validation rules (memql#1331: raw size,
 // schemaVersion, action-name pattern) -- without a live stream.
-func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory) *memqlv1.Register {
+func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string) *memqlv1.Register {
 	hostname, _ := os.Hostname()
 	// Local models (memql-cockpit#361). They ride the EXISTING
 	// registration mechanism -- `model:<id>` and `runtime:<kind>` labels
@@ -114,7 +114,7 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 	// proto field is optional -- on the (never-expected) marshal
 	// failure we register without it rather than fail the handshake;
 	// the server treats omission as valid.
-	if descJSON, err := tools.CapabilityDescriptorJSON(); err == nil {
+	if descJSON, err := tools.CapabilityDescriptorJSONFor(inferenceServe); err == nil {
 		register.CapabilityDescriptorJson = descJSON
 	}
 	registerHardware(register, hw)
@@ -122,8 +122,8 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 }
 
 // register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory) error {
-	register := buildRegister(cfg, inventory, modelInv, hardware.Local(ctx))
+func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, inferenceServe string) error {
+	register := buildRegister(cfg, inventory, modelInv, hardware.Local(ctx), inferenceServe)
 	c.ModelFingerprint = advertisedFingerprint(modelInv.Labels())
 	if err := c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
@@ -152,6 +152,7 @@ func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.
 			"registration_id", c.RegistrationId,
 			"owner_user_id", c.OwnerUserId,
 			"models_offered", len(modelInv.Advertised()),
+			"inference_serve", inferenceServe,
 		)
 	}
 	return nil

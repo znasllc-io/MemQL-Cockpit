@@ -17,6 +17,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/modelcall"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
 // Re-advertising a changed model set (memql-cockpit#361).
@@ -56,6 +57,7 @@ type Runner struct {
 	calls     *modelcall.Manager
 	sessions  *appsession.Manager
 	heartbeat time.Duration
+	serve     func() string
 	metrics   *Metrics
 
 	conn            atomic.Pointer[Connection]
@@ -98,6 +100,16 @@ type Options struct {
 	Sessions  *appsession.Manager
 	Heartbeat time.Duration
 	Metrics   *Metrics
+	// InferenceServe reads this machine's sharing consent from the live
+	// policy (memql-cockpit#399). A FUNCTION rather than a value,
+	// because the value is re-read on SIGHUP and a snapshot taken at
+	// startup would advertise a consent the file no longer states --
+	// and this is the one setting whose stale value hands somebody
+	// else's prompt to this machine's GPU.
+	//
+	// Nil reports tools.ServeOwner, which is the fail-closed default a
+	// build that does not wire this should send.
+	InferenceServe func() string
 }
 
 // NewRunner constructs a Runner. The runner is not yet running; call
@@ -123,6 +135,7 @@ func NewRunner(opts Options) (*Runner, error) {
 		sessions:  opts.Sessions,
 		heartbeat: hb,
 		metrics:   opts.Metrics,
+		serve:     opts.InferenceServe,
 		closed:    make(chan struct{}),
 		// Room for one. A nil channel would be safe (both the send and
 		// the receive sit in a select), but it would make every request
@@ -166,7 +179,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 
-		conn, err := Connect(ctx, r.cfg, r.inventory(ctx), r.modelInventory(ctx), r.logger)
+		conn, err := Connect(ctx, r.cfg, r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe(), r.logger)
 		if err != nil {
 			if r.metrics != nil {
 				r.metrics.RecordReconnect()
@@ -312,6 +325,17 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 			}
 		}
 	}
+}
+
+// inferenceServe reads the live sharing consent, defaulting closed.
+func (r *Runner) inferenceServe() string {
+	if r.serve == nil {
+		return tools.ServeOwner
+	}
+	if v := r.serve(); v == tools.ServeCluster {
+		return tools.ServeCluster
+	}
+	return tools.ServeOwner
 }
 
 // modelInventory takes the current local model inventory, or the zero

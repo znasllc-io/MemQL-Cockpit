@@ -62,12 +62,31 @@ var buildAgnosticComputerActions = []string{computerWaitAction}
 // (memql-cockpit#165): 0 on headless builds and when no display
 // server is reachable, at least 1 otherwise. An additive field --
 // schemaVersion stays 1.
+//
+// InferenceServe is this machine's sharing consent, from policy.yaml
+// `inference.serve` (memql-cockpit#399, engine memql#5146 record D6).
+// Additive in exactly the way Displays was, and SCHEMAVERSION STAYS 1
+// -- the engine admits that number and no other, rejecting anything
+// else by value ("unsupported schemaVersion %d"), so a bump here fails
+// every registration on the fleet at once.
+//
+// The engine at the current pin (5c4f6ae9) TOLERATES this key and does
+// not store it: ParseCapabilityDescriptor unmarshals into a struct
+// without DisallowUnknownFields, so an unknown key survives validation,
+// and its AsMap() then re-serialises only the fields it knows. So this
+// travels safely and arrives nowhere until memql#5146 lands. That is
+// the same one-way situation the model label's params/quant/tools
+// attributes are in, and it is safe in this direction only: a reader
+// that skips a key it does not know cannot be broken by one, while a
+// key this side misspells is never rejected, never logged, and simply
+// never read.
 type CapabilityDescriptor struct {
 	Platform             string   `json:"platform"`
 	DisplayServer        string   `json:"displayServer"`
 	ComputerUseAvailable bool     `json:"computerUseAvailable"`
 	Actions              []string `json:"actions"`
 	Displays             int      `json:"displays"`
+	InferenceServe       string   `json:"inferenceServe"`
 	SchemaVersion        int      `json:"schemaVersion"`
 }
 
@@ -154,7 +173,29 @@ func detectDisplayServer(goos string, getenv func(string) string) string {
 // workerComputer.capabilities. Same source of truth as that action
 // (ComputeCapabilities), so the two can never disagree.
 func CapabilityDescriptorJSON() (string, error) {
-	body, err := json.Marshal(ComputeCapabilities())
+	return CapabilityDescriptorJSONFor(ServeOwner)
+}
+
+// CapabilityDescriptorJSONFor is the same descriptor with this
+// machine's sharing consent attached.
+//
+// The consent is passed IN rather than read from a policy here, because
+// ComputeCapabilities describes the BINARY AND THE HOST and knows
+// nothing about a config file. Reaching for one from inside it would
+// give this function a filesystem dependency on the Register path, and
+// a machine whose policy.yaml had gone missing would then fail its
+// handshake over a field that is optional.
+func CapabilityDescriptorJSONFor(serve string) (string, error) {
+	desc := ComputeCapabilities()
+	// Normalised HERE as well as in the policy, because this function
+	// takes a bare string from any caller. Anything that is not the
+	// grant is the default, which is the direction a consent has to
+	// fail in.
+	desc.InferenceServe = ServeOwner
+	if serve == ServeCluster {
+		desc.InferenceServe = ServeCluster
+	}
+	body, err := json.Marshal(desc)
 	if err != nil {
 		return "", fmt.Errorf("marshal capability descriptor: %w", err)
 	}

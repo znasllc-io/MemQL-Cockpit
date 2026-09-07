@@ -329,6 +329,10 @@ func handleRun(args []string) {
 		Calls:    calls,
 		Sessions: sessions,
 		Metrics:  metrics,
+		// Read from the LIVE policy on every connect, so a SIGHUP that
+		// changed the consent is honoured at the next reconnect
+		// (record D6: "a change takes effect on the next reconnect").
+		InferenceServe: policy.InferenceServe,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -342,10 +346,36 @@ func handleRun(args []string) {
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
+				// Captured BEFORE the reload so the change can be
+				// named rather than merely implied. An operator who
+				// edits a sharing consent and sees only "policy
+				// reloaded" cannot tell from the log whether the file
+				// they edited is the one the worker read.
+				serveBefore := policy.InferenceServe()
 				if err := policy.Reload(); err != nil {
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
+
+					// A CHANGED CONSENT TAKES EFFECT ON THE NEXT
+					// RECONNECT, and nothing here forces one. The
+					// descriptor is built at Register, which the engine
+					// accepts exactly once per stream -- so the value
+					// on the cluster is the one this worker sent when
+					// it connected.
+					//
+					// No reconnect is taken for it, deliberately. A
+					// reconnect interrupts nothing when the machine is
+					// idle and abandons a running generation when it is
+					// not, and this field steers no call already in
+					// flight: the router chose this machine before the
+					// call started. That is the same trade
+					// RequestImmediateReadvertise refuses to make for
+					// labels, where the payoff is larger.
+					if after := policy.InferenceServe(); after != serveBefore {
+						logger.Info("inference.serve changed; it takes effect on the next reconnect",
+							"from", serveBefore, "to", after)
+					}
 					// A RELOADED models.allow THAT NOBODY
 					// RE-ADVERTISED IS A MODEL THE CLUSTER STILL
 					// CANNOT SEE. Model labels are bound at Register
