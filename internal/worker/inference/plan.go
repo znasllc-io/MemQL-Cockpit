@@ -182,6 +182,19 @@ type Host struct {
 	LookPath func(string) (string, error)
 }
 
+// RuntimePresentFor reports whether a MODEL runtime answered on this
+// machine, by the same three signals Decide reads.
+//
+// Exported for the runtime-install command, which needs the fact
+// without needing a Plan: `setup --runtime image` refuses when there is
+// no model runtime, because image generation is a capability of one
+// rather than a service of its own -- and re-deriving that from a
+// second set of probes would be a second answer to a question Decide
+// already settles.
+func (h Host) RuntimePresentFor() bool {
+	return h.OllamaServing || ollamaAnswered(h.Ollama) || h.lookPath("ollama")
+}
+
 func (h Host) lookPath(name string) bool {
 	look := h.LookPath
 	if look == nil {
@@ -330,7 +343,7 @@ func Decide(h Host) Plan {
 	// hand -- and a plan that printed `docker run` at a machine whose own
 	// inventory lists three pulled models would be refuted by the very
 	// field it ignored.
-	p.RuntimePresent = h.OllamaServing || ollamaAnswered(h.Ollama) || h.lookPath("ollama")
+	p.RuntimePresent = h.RuntimePresentFor()
 
 	// The floor's own sentence, verbatim.
 	//

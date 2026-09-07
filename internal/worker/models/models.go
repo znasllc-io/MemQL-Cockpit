@@ -375,6 +375,15 @@ type Inventory struct {
 	// the connection". Absence of a runtime is not an error and is not
 	// logged as one; it is a sentence an operator can read when they ask.
 	ProbeNotes []string
+	// RuntimeVersions is the version each runtime kind reported, keyed
+	// by kind (memql-cockpit#400, engine record D7). It becomes the
+	// VALUE of the `runtime:<kind>` label, which was previously empty.
+	//
+	// A runtime present with no readable version keeps an empty value,
+	// exactly as today: the LABEL is the advertisement that the runtime
+	// is here, and the version is extra. Dropping the label because a
+	// version could not be read would hide a runtime that is running.
+	RuntimeVersions map[string]string
 }
 
 // Advertised is the set this machine actually offers: allowed models, and
@@ -405,7 +414,12 @@ func (inv Inventory) Labels() map[string]string {
 	out := make(map[string]string, len(advertised)+2)
 	for _, m := range advertised {
 		out[Label(m.ID)] = m.Attributes.String()
-		out[RuntimeLabel(m.Kind)] = ""
+		// The runtime label now carries its VERSION as the value
+		// (record D7: "advertise runtime:<name> with a version once
+		// present"). It was empty before, so this changes every
+		// machine's label fingerprint once on rollout -- the cost D8
+		// accepts, and the same one params and quant already charged.
+		out[RuntimeLabel(m.Kind)] = strings.TrimSpace(inv.RuntimeVersions[m.Kind])
 	}
 	return out
 }

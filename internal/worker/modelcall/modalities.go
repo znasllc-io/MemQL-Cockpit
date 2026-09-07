@@ -83,10 +83,26 @@ type TranscribeRequest struct {
 	Prompt string
 }
 
+// TranscriptSegment is one timed span of a transcript.
+//
+// The wire carries these on both Delta and End (memql#5137): a windowed
+// transcriber emits one Delta per window with that window's timings,
+// and End carries the authoritative full set. The cockpit's own
+// transcribe path is one-shot, so it fills End's -- and it fills them
+// only when the RUNTIME reported timings, never by dividing the
+// duration up, which would be inventing a fact the caller would then
+// seek on.
+type TranscriptSegment struct {
+	StartSeconds float64
+	EndSeconds   float64
+	Text         string
+}
+
 // TranscribeResult is what came back.
 type TranscribeResult struct {
-	Text  string
-	Usage Usage
+	Text     string
+	Segments []TranscriptSegment
+	Usage    Usage
 }
 
 // SpeakRequest is text in, audio out.
@@ -101,6 +117,13 @@ type SpeakRequest struct {
 	// Format is the container asked for ("mp3", "wav"). Empty means the
 	// runtime's default.
 	Format string
+	// Speed is a rate multiplier, and SpeedSet says the caller asked
+	// for one. The pair rather than a bare float for the reason
+	// Params.Temperature carries one: 0 is a meaningful value in the
+	// type and is not the same request as "no preference" -- and a
+	// speed of 0 sent as a preference is a call that generates nothing.
+	Speed    float64
+	SpeedSet bool
 }
 
 // SpeakResult is the generated audio.
@@ -114,6 +137,14 @@ type SpeakResult struct {
 type ImageRequest struct {
 	Model  string
 	Prompt string
+	// Width, Height and Count are the caller's knobs; zero means the
+	// runtime's own default rather than a dimension this code chose.
+	// Ollama's image models each have a native resolution, and a size
+	// invented here would be upscaled or refused depending on the
+	// model.
+	Width, Height, Count int
+	// Format is the container asked for ("png", "jpeg", "webp").
+	Format string
 }
 
 // ImageResult is the generated image.
@@ -211,6 +242,10 @@ func (c *openAIClient) Transcribe(ctx context.Context, req TranscribeRequest) (T
 	if err != nil {
 		return TranscribeResult{}, err
 	}
+	// NO SEGMENTS. The chat route returns text and nothing about when
+	// each word was said, so this result carries none rather than
+	// dividing the duration up by word count -- which would be a
+	// timestamp the caller could seek on and land nowhere near.
 	return TranscribeResult{Text: text.String(), Usage: res.Usage}, nil
 }
 
@@ -261,6 +296,9 @@ func (c *kokoroClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult
 	}
 	if f := strings.TrimSpace(req.Format); f != "" {
 		body["response_format"] = f
+	}
+	if req.SpeedSet {
+		body["speed"] = req.Speed
 	}
 
 	raw, err := json.Marshal(body)
@@ -317,11 +355,19 @@ func (c *ollamaClient) GenerateImage(ctx context.Context, req ImageRequest) (Ima
 	if strings.TrimSpace(req.Prompt) == "" {
 		return ImageResult{}, fmt.Errorf("image: no prompt was supplied")
 	}
-	resp, err := c.post(ctx, "/api/generate", map[string]any{
+	request := map[string]any{
 		"model":  req.Model,
 		"prompt": req.Prompt,
 		"stream": false,
-	})
+	}
+	// The knobs are sent only when ASKED FOR. An unset dimension left
+	// out entirely gets the model's native resolution; sending a zero
+	// would be a request for a zero-pixel image, which some runtimes
+	// honour.
+	if opts := imageOptions(req); len(opts) > 0 {
+		request["options"] = opts
+	}
+	resp, err := c.post(ctx, "/api/generate", request)
 	if err != nil {
 		return ImageResult{}, err
 	}
@@ -363,4 +409,22 @@ func (c *ollamaClient) GenerateImage(ctx context.Context, req ImageRequest) (Ima
 		out.Images = append(out.Images, ImagePart{MediaType: "image/png", Data: data})
 	}
 	return out, nil
+}
+
+// imageOptions renders only the knobs the caller set.
+func imageOptions(req ImageRequest) map[string]any {
+	out := map[string]any{}
+	if req.Width > 0 {
+		out["width"] = req.Width
+	}
+	if req.Height > 0 {
+		out["height"] = req.Height
+	}
+	if req.Count > 0 {
+		out["n"] = req.Count
+	}
+	if f := strings.TrimSpace(req.Format); f != "" {
+		out["format"] = f
+	}
+	return out
 }

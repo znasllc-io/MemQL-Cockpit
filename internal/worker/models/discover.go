@@ -176,6 +176,13 @@ func (d *Discoverer) Probe(ctx context.Context, req Request) Inventory {
 		inv.ProbeNotes = append(inv.ProbeNotes, note)
 	}
 	inv.Models = append(inv.Models, found...)
+	if len(found) > 0 {
+		// The version is read only when the runtime ALREADY ANSWERED
+		// with models, so this adds no round trip to a machine that has
+		// no Ollama -- the case the probe is fastest on today, and the
+		// one that must not become slower.
+		inv.RuntimeVersions = setRuntimeVersion(inv.RuntimeVersions, KindOllama, d.ollamaVersion(ctx))
+	}
 
 	for _, rt := range req.Runtimes {
 		got, n := d.probeDeclared(ctx, rt)
@@ -202,6 +209,34 @@ func (d *Discoverer) Probe(ctx context.Context, req Request) Inventory {
 	})
 	inv.Models, inv.ProbeNotes = resolveDuplicates(inv.Models, inv.ProbeNotes)
 	return inv
+}
+
+// setRuntimeVersion records a version, dropping an empty one rather
+// than storing a blank entry. The map's presence is not the
+// advertisement -- the LABEL is -- so an entry with no version says
+// nothing that its absence does not.
+func setRuntimeVersion(m map[string]string, kind, version string) map[string]string {
+	if strings.TrimSpace(version) == "" {
+		return m
+	}
+	if m == nil {
+		m = map[string]string{}
+	}
+	m[kind] = strings.TrimSpace(version)
+	return m
+}
+
+// ollamaVersion asks /api/version. A runtime that does not answer it
+// keeps an empty version, which is "present, version unknown" -- the
+// label is still written, because the runtime is still there.
+func (d *Discoverer) ollamaVersion(ctx context.Context) string {
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := d.getJSON(ctx, d.ollamaBaseURL()+"/api/version", "", &body); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(body.Version)
 }
 
 // resolveDuplicates keeps ONE entry per model id.

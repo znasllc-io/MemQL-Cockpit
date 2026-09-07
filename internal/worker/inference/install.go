@@ -99,18 +99,53 @@ func InstallRuntime(ctx context.Context, p Plan, consent func(commands []string)
 	// was never going to finish, and finding that out after the first line
 	// has installed Homebrew's Ollama leaves the machine half-built with a
 	// consent already spent.
-	argvs := make([][]string, 0, len(p.Install))
-	for _, cmd := range p.Install {
-		argv, err := splitCommand(cmd)
-		if err != nil {
-			return err
-		}
-		argvs = append(argvs, argv)
+	argvs, err := splitAll(p.Install)
+	if err != nil {
+		return err
 	}
 
 	if consent == nil || !consent(p.Install) {
 		return ErrConsentRefused
 	}
+	return runAll(ctx, p.Install, argvs, run)
+}
+
+// RunCommands runs an already-consented list.
+//
+// It exists for `setup --runtime`, which asks its own question in its
+// own words and would otherwise have to build a Plan to reach
+// InstallRuntime's consent callback -- a shape that reads as though a
+// runtime install were a model-runtime install, which it is not. The
+// SPLIT-EVERYTHING-FIRST rule and the name-the-failing-command rule are
+// shared rather than reimplemented, because those are the two that stop
+// a half-built machine.
+func RunCommands(ctx context.Context, commands []string, run Runner) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(commands) == 0 {
+		return ErrNothingToRun
+	}
+	argvs, err := splitAll(commands)
+	if err != nil {
+		return err
+	}
+	return runAll(ctx, commands, argvs, run)
+}
+
+func splitAll(commands []string) ([][]string, error) {
+	argvs := make([][]string, 0, len(commands))
+	for _, cmd := range commands {
+		argv, err := splitCommand(cmd)
+		if err != nil {
+			return nil, err
+		}
+		argvs = append(argvs, argv)
+	}
+	return argvs, nil
+}
+
+func runAll(ctx context.Context, commands []string, argvs [][]string, run Runner) error {
 	if run == nil {
 		run = ExecRunner(os.Stdout)
 	}
@@ -122,7 +157,7 @@ func InstallRuntime(ctx context.Context, p Plan, consent func(commands []string)
 			// The COMMAND is named, not just the error. "exit status 1"
 			// on its own sends a person to their shell history to work
 			// out which of two lines produced it.
-			return fmt.Errorf("%s: %w", p.Install[i], err)
+			return fmt.Errorf("%s: %w", commands[i], err)
 		}
 	}
 	return nil

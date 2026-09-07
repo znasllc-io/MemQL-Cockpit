@@ -244,3 +244,69 @@ func TestDeclaredRuntimeCarriesVisionAndImageGen(t *testing.T) {
 		t.Fatalf("declared vision / image_gen were dropped: %+v", inv.Models[0].Attributes)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Runtime labels carry a version (memql-cockpit#400, record D7)
+// -----------------------------------------------------------------------------
+
+// The label VALUE becomes the version. It was empty before, so this
+// changes every machine's label fingerprint once on rollout -- the cost
+// record D8 accepts, and the same one params and quant already charged.
+func TestRuntimeLabelCarriesTheVersion(t *testing.T) {
+	inv := Inventory{
+		Floor:           FloorVerdict{Met: true},
+		Models:          []Info{{ID: "m:9b", Kind: KindOllama, Allowed: true}},
+		RuntimeVersions: map[string]string{KindOllama: "0.13.0"},
+	}
+	if got := inv.Labels()["runtime:ollama"]; got != "0.13.0" {
+		t.Fatalf("runtime:ollama = %q, want 0.13.0", got)
+	}
+}
+
+// A runtime present with NO readable version keeps an empty value and
+// keeps its label. Dropping the label because a version could not be
+// read would hide a runtime that is running.
+func TestRuntimeLabelSurvivesAnUnreadableVersion(t *testing.T) {
+	inv := Inventory{
+		Floor:  FloorVerdict{Met: true},
+		Models: []Info{{ID: "m:9b", Kind: KindOllama, Allowed: true}},
+	}
+	labels := inv.Labels()
+	got, present := labels["runtime:ollama"]
+	if !present {
+		t.Fatal("the runtime label was dropped because no version was read")
+	}
+	if got != "" {
+		t.Fatalf("runtime:ollama = %q, want empty", got)
+	}
+}
+
+// The version moves the fingerprint, which is the reconnect this
+// change costs. Asserted so it is a thing somebody decided rather than
+// discovered on deploy.
+func TestTheRuntimeVersionChangesTheLabels(t *testing.T) {
+	base := Inventory{
+		Floor:  FloorVerdict{Met: true},
+		Models: []Info{{ID: "m:9b", Kind: KindOllama, Allowed: true}},
+	}
+	versioned := base
+	versioned.RuntimeVersions = map[string]string{KindOllama: "0.13.0"}
+
+	if base.Labels()["runtime:ollama"] == versioned.Labels()["runtime:ollama"] {
+		t.Fatal("adding a version must change the label")
+	}
+}
+
+// A version recorded for a runtime that advertises NO model does not
+// appear: Labels() is built from the advertised set, so a runtime
+// nothing is served through contributes no label to carry a version on.
+func TestRuntimeVersionForAnUnadvertisedRuntimeIsNotEmitted(t *testing.T) {
+	inv := Inventory{
+		Floor:           FloorVerdict{Met: true},
+		Models:          []Info{{ID: "m:9b", Kind: KindOllama, Allowed: true}},
+		RuntimeVersions: map[string]string{KindOllama: "0.13.0", "kokoro": "0.2.4"},
+	}
+	if _, present := inv.Labels()["runtime:kokoro"]; present {
+		t.Fatal("a runtime with no advertised model produced a label")
+	}
+}

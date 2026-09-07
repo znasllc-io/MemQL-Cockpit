@@ -36,8 +36,11 @@ const (
 	// "time to first token 32K" at 23.
 	probeFigureLabelWidth = 25
 	// probeValueWidth aligns the numbers so a column of them can be
-	// compared down the page rather than read one at a time.
-	probeValueWidth = 8
+	// compared down the page rather than read one at a time. Wide
+	// enough for the value AND its unit: the units DIFFER between rows
+	// here -- a ratio, a rate and a duration -- so a bare 36.4 beside a
+	// bare 1.04 is two numbers nobody can compare.
+	probeValueWidth = 13
 )
 
 type probeRun struct {
@@ -79,6 +82,24 @@ func handleProbe(args []string) {
 }
 
 func runProbe(ctx context.Context, r *probeRun) int {
+	// THE SUITE VERSION IS CHECKED FIRST, before this machine's models
+	// are even probed.
+	//
+	// The order is the point: an operator who typed --suite 9 asked a
+	// question about the SUITE, and answering "this machine offers no
+	// models" tells them nothing about the number they typed and sends
+	// them to policy.yaml to fix a model list that was never the
+	// problem. It also keeps the refusal reachable on a machine with
+	// nothing pulled, which is where somebody is most likely to be
+	// experimenting with the flag.
+	if r.suite != probe.SuiteVersion {
+		r.paragraph(capitalise(fmt.Sprintf(
+			"this machine knows probe suite version %d; you asked for version %d. "+
+				"Update the cockpit on this machine, or drop --suite.",
+			probe.SuiteVersion, r.suite)))
+		return SetupExitUsage
+	}
+
 	inv := r.inventory(ctx)
 
 	info, ok := r.pick(inv)
@@ -97,12 +118,14 @@ func runProbe(ctx context.Context, r *probeRun) int {
 	})
 	if err != nil {
 		r.line("")
-		// The version refusal is already a complete sentence written
-		// for this terminal; it is printed verbatim with only its first
-		// letter raised, the same way inference_cmd prints a plan's.
+		// The suite version was already checked above, so this arm is
+		// for a Run that refuses a version for some reason this command
+		// did not anticipate -- kept rather than dropped because
+		// probe.Run owns that gate and this command must not assume it
+		// is the only one.
 		if errors.Is(err, probe.ErrUnknownSuite) {
 			r.paragraph(capitalise(strings.TrimPrefix(err.Error(), "probe: unknown suite version: ")))
-			return SetupExitPrereq
+			return SetupExitUsage
 		}
 		r.paragraph(capitalise(err.Error()) + ".")
 		return SetupExitOpFailed
@@ -191,11 +214,19 @@ func (r *probeRun) figures(report probe.Report) {
 func figureValue(f probe.Figure) string {
 	switch f.Unit {
 	case "":
+		// A ratio between 0 and 1, and the two decimals are what make
+		// 0.80 and 1.00 the same width -- a column of ratios is read by
+		// scanning it, and a ragged one is read row by row.
 		return fmt.Sprintf("%.2f", f.Value)
 	case "sec":
-		return fmt.Sprintf("%.2fs", f.Value)
+		return fmt.Sprintf("%.2f s", f.Value)
+	case "tokens/sec":
+		// "tok/s" rather than "tokens/sec": the full spelling pushes
+		// the detail column past 80 characters over SSH, which is where
+		// this is actually read.
+		return fmt.Sprintf("%.1f tok/s", f.Value)
 	default:
-		return fmt.Sprintf("%.1f", f.Value)
+		return fmt.Sprintf("%.1f %s", f.Value, f.Unit)
 	}
 }
 

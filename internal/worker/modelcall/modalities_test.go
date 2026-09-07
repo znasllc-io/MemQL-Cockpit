@@ -567,3 +567,139 @@ func TestEveryModalityKindIsInTheTable(t *testing.T) {
 		t.Fatalf("ServedKinds = %v, want chat, embedding and the four modalities", ServedKinds())
 	}
 }
+
+// -----------------------------------------------------------------------------
+// The settled proto shape (memql#5137, agreed 2026-09-07)
+// -----------------------------------------------------------------------------
+
+// A media type this side does not recognise yields NO container, which
+// Transcribe then refuses by name. The fail-closed direction: passing
+// an unknown container through would have the runtime decode the bytes
+// as something they are not, and the result is a confident transcript
+// of noise rather than a failure anybody notices.
+func TestAudioFormatFor(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"audio/wav", "wav"},
+		{"audio/x-wav", "wav"},
+		{"audio/wave", "wav"},
+		{"AUDIO/WAV", "wav"},
+		{"  audio/wav  ", "wav"},
+		{"audio/mpeg", "mp3"},
+		{"audio/mp3", "mp3"},
+		{"audio/ogg", "opus"},
+		{"audio/opus", "opus"},
+		{"audio/flac", "flac"},
+		{"audio/m4a", "m4a"},
+		{"audio/webm", "webm"},
+		// Unrecognised, empty, and a plausible-looking near-miss.
+		{"audio/aiff", ""},
+		{"", ""},
+		{"wav", ""},
+		{"video/mp4", ""},
+	} {
+		if got := audioFormatFor(tc.in); got != tc.want {
+			t.Errorf("audioFormatFor(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The speak knobs travel only when SET. Speed carries an explicit
+// SpeedSet for the reason Params.Temperature does: zero is a meaningful
+// value in the type and is not the same request as "no preference" --
+// and a speed of 0 sent as a preference is a call that generates
+// nothing.
+func TestSpeakSendsSpeedOnlyWhenSet(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		req  SpeakRequest
+		want bool
+	}{
+		{"unset", SpeakRequest{Model: "m", Text: "hi"}, false},
+		{"set to zero", SpeakRequest{Model: "m", Text: "hi", SpeedSet: true}, true},
+		{"set", SpeakRequest{Model: "m", Text: "hi", Speed: 1.25, SpeedSet: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				_, _ = w.Write([]byte("audio"))
+			}))
+			t.Cleanup(srv.Close)
+
+			if _, err := NewKokoroClient(srv.URL, "", srv.Client()).Speak(context.Background(), tc.req); err != nil {
+				t.Fatal(err)
+			}
+			_, present := body["speed"]
+			if present != tc.want {
+				t.Fatalf("speed present = %v, want %v (body %v)", present, tc.want, body)
+			}
+		})
+	}
+}
+
+// The image knobs the same way: an unset dimension is LEFT OUT so the
+// model's native resolution applies. Sending a zero would be a request
+// for a zero-pixel image, which some runtimes honour.
+func TestImageSendsOnlyTheKnobsThatWereSet(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"images":["` + base64.StdEncoding.EncodeToString([]byte("x")) + `"]}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := &ollamaClient{baseURL: srv.URL, http: srv.Client()}
+
+	if _, err := c.GenerateImage(context.Background(), ImageRequest{Model: "m", Prompt: "a cube"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := body["options"]; present {
+		t.Fatalf("options were sent for a request that set none: %v", body)
+	}
+
+	body = nil
+	if _, err := c.GenerateImage(context.Background(), ImageRequest{
+		Model: "m", Prompt: "a cube", Width: 1024, Format: "png",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	opts := body["options"].(map[string]any)
+	if opts["width"] != float64(1024) || opts["format"] != "png" {
+		t.Fatalf("options = %v", opts)
+	}
+	if _, present := opts["height"]; present {
+		t.Fatalf("an unset height was sent: %v", opts)
+	}
+}
+
+// The chat route returns text and nothing about WHEN each word was
+// said, so a one-shot transcription carries NO segments rather than
+// dividing the duration up -- which would be a timestamp the caller
+// could seek on and land nowhere near.
+func TestTranscribeReportsNoSegmentsItDidNotReceive(t *testing.T) {
+	var seen []captured
+	c := fakeOpenAI(t, &seen, chunk("hello world"))
+
+	res, err := c.Transcribe(context.Background(), TranscribeRequest{
+		Model: "m", Audio: []byte("x"), Format: "wav",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Segments) != 0 {
+		t.Fatalf("segments were invented: %+v", res.Segments)
+	}
+	if res.Text != "hello world" {
+		t.Fatalf("text = %q", res.Text)
+	}
+}
+
+// The payload seam reports absent at this engine version, for every
+// kind. The test exists so that landing memql#5137 has an assertion
+// that changes -- rather than the seam quietly staying stubbed.
+func TestPayloadForIsAbsentAtThisEngineVersion(t *testing.T) {
+	for _, kind := range []string{KindVision, KindTranscribe, KindSpeak, KindImage} {
+		if _, ok := payloadFor(startModality("m", kind)); ok {
+			t.Fatalf("%s: payloadFor reported a payload; ModelCallStart has no modality fields yet", kind)
+		}
+	}
+}
