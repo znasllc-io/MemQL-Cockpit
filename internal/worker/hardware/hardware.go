@@ -197,6 +197,18 @@ func scanGPU(p Probe) *GPU {
 				mem = v
 			}
 		}
+		// NO MEMORY FIGURE, NO GPU ENTRY. On Metal the entry is
+		// synthesised from the chip and the unified pool, so without the
+		// pool there is nothing to synthesise -- and a GPU with zero
+		// VRAM would make Scanned() report true, which flips the class
+		// line from the GAP sentence ("could not be read") to the
+		// VERDICT sentence ("unsupported"), contradicting the Hardware
+		// line directly above it. That is exactly the confusion Scanned
+		// exists to prevent, and this is the one path that could commit
+		// it.
+		if mem == 0 {
+			return nil
+		}
 		name := "Apple GPU"
 		if p.Chip != nil {
 			if v, err := p.Chip(); err == nil && strings.TrimSpace(v) != "" {

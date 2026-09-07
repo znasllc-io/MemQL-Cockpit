@@ -192,7 +192,12 @@ func TestHardwareReportDistinguishesAGPUWithNoReadableMemory(t *testing.T) {
 	if !strings.Contains(out, "AMD GPU 0x744c, memory not established, rocm") {
 		t.Errorf("output:\n%s", out)
 	}
-	if strings.Contains(out, "none found") && !strings.Contains(out, "Runtimes     none found") {
+	// The GPU LINE specifically must not say "none found". The previous
+	// spelling of this check was `Contains(out, "none found") &&
+	// !Contains(out, "Runtimes     none found")`, whose second clause is
+	// permanently false on a fixture with no runtimes -- so the exact
+	// regression it names could never have failed it.
+	if strings.Contains(out, "GPU          none found") {
 		t.Errorf("a GPU with unreadable memory was reported as absent:\n%s", out)
 	}
 }

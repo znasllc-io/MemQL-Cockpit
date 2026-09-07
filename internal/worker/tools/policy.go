@@ -400,6 +400,13 @@ func (p *Policy) reload() error {
 // refused to boot over a misspelled sharing preference is a machine
 // nobody can reach to fix it.
 func (p *Policy) InferenceServe() string {
+	// A nil policy reports the closed default rather than panicking,
+	// which is what every sibling accessor here does. Unreachable from
+	// handleRun today; the guard costs a line and the alternative is a
+	// panic on the Register path.
+	if p == nil {
+		return ServeOwner
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	if p.inference.Serve == ServeCluster {

@@ -260,7 +260,7 @@ func TestRuntimeSetupNeverSaysAvailableNow(t *testing.T) {
 	}
 }
 
-// A refusal exits 2 (a prerequisite is missing) and runs nothing.
+// A refusal exits with the prerequisite code and runs nothing.
 func TestRuntimeSetupRefusalExitsPrereq(t *testing.T) {
 	h := dockerReady()
 	h.Docker = inference.DockerFacts{}

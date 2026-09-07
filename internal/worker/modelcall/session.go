@@ -364,6 +364,16 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 		return models.Info{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("this machine does not currently offer model %q", start.GetModel()))
 	}
+	// A SCHEMA ONLY MEANS SOMETHING ON A CHAT-SHAPED CALL. Vision is
+	// one; transcription, speech and image generation are not -- their
+	// answers are a transcript, audio bytes and image bytes, and there
+	// is no text for a schema to constrain. A schema arriving on one of
+	// those is refused rather than dropped, because dropping it would
+	// let a caller believe it had asked for something.
+	if len(start.GetResponseFormatSchema()) > 0 && isModalityKind(kind) && kind != KindVision {
+		return models.Info{}, refuse(CodeSchemaUnsupported,
+			fmt.Sprintf("a %q call returns no text for a response schema to constrain", kind))
+	}
 	if len(start.GetResponseFormatSchema()) > 0 && !info.StructuredOutput {
 		// The router only sends a schema to a machine that advertised
 		// the capability, so this is a stale advertisement rather than a
@@ -539,7 +549,27 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 // watchdog enforces the idle ceiling and emits the keepalives that make
 // it enforceable on the other side too.
 func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, limits callLimits, done <-chan struct{}) {
-	t := time.NewTicker(limits.keepalive)
+	// THE CHECK CADENCE IS HALF THE KEEPALIVE INTERVAL, and the halving
+	// is what makes keepalives fire at all.
+	//
+	// Ticking at exactly limits.keepalive and then testing
+	// `sinceSend() >= limits.keepalive` makes every tick land within
+	// scheduling jitter of the threshold it is testing: the elapsed
+	// time at tick N is the ticker period, which is the threshold, so
+	// whether the comparison is true is a coin flip. Half the calls
+	// emit no keepalive at all, and the engine -- whose idle ceiling
+	// the keepalive exists to keep enforceable -- sees silence it
+	// cannot distinguish from a wedged machine.
+	//
+	// Halved, a keepalive lands somewhere in [keepalive, 1.5 x
+	// keepalive], comfortably inside the idle ceiling (which limitsFrom
+	// holds at strictly more than the keepalive), and the idle check
+	// keeps its own granularity well under the deadline it guards.
+	tick := limits.keepalive / 2
+	if tick <= 0 {
+		tick = limits.keepalive
+	}
+	t := time.NewTicker(tick)
 	defer t.Stop()
 	for {
 		select {
@@ -605,6 +635,12 @@ func (m *Manager) runModality(
 		}
 		res, err := c.Vision(ctx, VisionRequest{
 			Model: info.ID, Messages: messages, Images: payload.Images, Params: params,
+			// The schema travels. A vision call IS a chat call, and
+			// resolve only admitted this one because the model
+			// advertises structured output -- so dropping it here
+			// would answer prose to a call that was routed on the
+			// promise of JSON.
+			Schema: start.GetResponseFormatSchema(),
 		}, emit)
 		return res, modalityResult{}, err
 

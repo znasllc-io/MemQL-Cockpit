@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1009,4 +1010,73 @@ func TestImageCallOmitsAHalfSize(t *testing.T) {
 	if _, present := body["size"]; present {
 		t.Fatalf("a half size was sent: %v", body)
 	}
+}
+
+// A SCHEMA IS HONOURED OR THE CALL FAILS, and a vision call is a chat
+// call -- so the schema has to reach the runtime. Dropping it silently
+// answers prose to a call the router only sent here because this
+// machine advertised structured output, and the parse failure surfaces
+// three layers away naming nothing.
+func TestVisionCallCarriesItsSchemaToTheRuntime(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"model":"m","message":{"content":"{}"},"done":true,"done_reason":"stop"}` + "\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	withPayload(t, Payload{Images: []ImagePart{{MediaType: "image/png", Data: []byte("P")}}})
+
+	rec := newRecorder()
+	m := NewManager(Options{Inventory: inventoryWith(ollamaModel(srv.URL, "seeing:9b",
+		models.Attributes{Vision: true, StructuredOutput: true, MaxConcurrent: 1}))})
+	s := start("r", "seeing:9b", KindVision)
+	s.ResponseFormatSchema = []byte(`{"type":"object","required":["caption"]}`)
+	m.Start(context.Background(), rec, s)
+
+	if end := rec.wait(t); end.GetErrorCode() != "" {
+		t.Fatalf("end = %+v", end)
+	}
+	if _, present := body["format"]; !present {
+		t.Fatalf("the schema never reached the runtime: request keys %v", keysOf(body))
+	}
+}
+
+// THE OTHER THREE KINDS RETURN NO TEXT for a schema to constrain -- a
+// transcript, audio bytes, image bytes -- so a schema arriving on one
+// is REFUSED rather than dropped. Dropping it lets a caller believe it
+// asked for something.
+func TestASchemaOnANonChatModalityIsRefused(t *testing.T) {
+	for _, kind := range []string{KindTranscribe, KindSpeak, KindImage} {
+		t.Run(kind, func(t *testing.T) {
+			rec := newRecorder()
+			m := NewManager(Options{Inventory: inventoryWith(models.Info{
+				ID: "m", Kind: models.KindOpenAICompatible, BaseURL: "http://127.0.0.1:1", Allowed: true,
+				Attributes: models.Attributes{
+					AudioIn: true, AudioOut: true, ImageGen: true,
+					StructuredOutput: true, MaxConcurrent: 1,
+				},
+			})})
+			s := startModality("m", kind)
+			s.ResponseFormatSchema = []byte(`{"type":"object"}`)
+			m.Start(context.Background(), rec, s)
+
+			end := rec.wait(t)
+			if end.GetErrorCode() != CodeSchemaUnsupported {
+				t.Fatalf("error_code = %q, want %q (%q)", end.GetErrorCode(), CodeSchemaUnsupported, end.GetError())
+			}
+			if !strings.Contains(end.GetError(), "no text for a response schema") {
+				t.Fatalf("the refusal must say WHY: %q", end.GetError())
+			}
+		})
+	}
+}
+
+func keysOf(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

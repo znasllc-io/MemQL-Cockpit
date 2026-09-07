@@ -334,13 +334,19 @@ func TestToolCorrectnessRequiresTheDeclaredKeys(t *testing.T) {
 // Throughput
 // -----------------------------------------------------------------------------
 
+// THE EXACT RATE, not merely a positive one.
+//
+// The clock steps one second per reading and the case reads it three
+// times -- start, first token, end -- so elapsed is exactly two seconds
+// and 200 tokens is exactly 100 tok/s. Asserting `> 0` instead would
+// stay green if the division became a multiplication, or the raw token
+// count, or a constant.
 func TestThroughputIsTokensOverElapsed(t *testing.T) {
-	// The clock steps one second per reading; the case reads it at
-	// start, at first token and at the end, so elapsed is deterministic.
 	rep := run(t, &fakeRuntime{
 		reply: goodAnswers(), toolCall: goodToolCalls(),
 		usage: modelcall.Usage{OutputTokens: 200, Known: true},
 	}, nil)
+
 	f := rep.Figure(FigureThroughput8K)
 	if !f.Measured() {
 		t.Fatalf("throughput_8k absent: %s", f.AbsentReason)
@@ -348,8 +354,39 @@ func TestThroughputIsTokensOverElapsed(t *testing.T) {
 	if f.Unit != "tokens/sec" {
 		t.Fatalf("Unit = %q, want tokens/sec", f.Unit)
 	}
-	if f.Value <= 0 {
-		t.Fatalf("Value = %v, want a positive rate", f.Value)
+	if f.Value != 100 {
+		t.Fatalf("Value = %v, want 200 tokens over 2 s = 100", f.Value)
+	}
+	if f.Detail != "200 tokens in 2s" {
+		t.Fatalf("Detail = %q", f.Detail)
+	}
+
+	// And the 32K case measures the SAME model over the same stepping
+	// clock, so its figure is the same arithmetic on the same numbers.
+	// A rate that varied between the two cases here would mean one of
+	// them is reading a different clock.
+	if g := rep.Figure(FigureThroughput32K); g.Value != f.Value {
+		t.Fatalf("8K = %v and 32K = %v on one clock", f.Value, g.Value)
+	}
+}
+
+// TIME TO FIRST TOKEN IS THE EXACT GAP, and it is measured from the
+// case's start rather than from the process's. One second on the
+// stepping clock: start is read first, the first delta second.
+func TestTimeToFirstTokenIsTheGapFromTheCaseStart(t *testing.T) {
+	rep := run(t, &fakeRuntime{
+		reply: goodAnswers(), toolCall: goodToolCalls(), usage: knownUsage(),
+	}, nil)
+
+	f := rep.Figure(FigureTTFT8K)
+	if !f.Measured() {
+		t.Fatalf("ttft_8k absent: %s", f.AbsentReason)
+	}
+	if f.Value != 1 {
+		t.Fatalf("Value = %v, want exactly one clock step", f.Value)
+	}
+	if f.Unit != "sec" {
+		t.Fatalf("Unit = %q, want sec", f.Unit)
 	}
 }
 
@@ -538,21 +575,49 @@ func TestAskingForAFigureTheSuiteDoesNotProduce(t *testing.T) {
 // watching a probe that hangs has to read off the screen which case
 // hung, and a line printed only on completion is the line the wedged
 // case never prints.
+// PROGRESS IS EMITTED BEFORE THE WORK, and the test proves the ORDER
+// rather than the count.
+//
+// It records every event -- started and finished alike -- in the order
+// they arrive, and asserts that each case's start precedes any figure
+// for that case. Counting start events alone would stay green with the
+// emit moved to AFTER c.Run, which is precisely the change that loses
+// the property: somebody watching a probe that hangs has to read off
+// the screen which case hung, and a line printed only on completion is
+// the line the wedged case never prints.
 func TestProgressAnnouncesEachCaseBeforeItRuns(t *testing.T) {
-	var started []string
+	type step struct {
+		name    string
+		started bool
+	}
+	var seen []step
 	run(t, &fakeRuntime{reply: goodAnswers(), toolCall: goodToolCalls(), usage: knownUsage()},
 		func(r *Request) {
-			r.Progress = func(e Event) {
-				if e.Started {
-					started = append(started, e.Case)
-				}
-			}
+			r.Progress = func(e Event) { seen = append(seen, step{e.Case, e.Started}) }
 		})
-	if len(started) != len(suite()) {
-		t.Fatalf("%d start events for %d cases: %v", len(started), len(suite()), started)
+
+	startedAt := map[string]int{}
+	for i, s := range seen {
+		if s.started {
+			if _, dup := startedAt[s.name]; dup {
+				t.Fatalf("%s announced twice: %v", s.name, seen)
+			}
+			startedAt[s.name] = i
+			continue
+		}
+		at, ok := startedAt[s.name]
+		if !ok {
+			t.Fatalf("a figure for %s arrived before its case was announced: %v", s.name, seen)
+		}
+		if at > i {
+			t.Fatalf("%s was announced after its figure", s.name)
+		}
 	}
-	if started[0] != FigureStructuredValidity {
-		t.Fatalf("first start event = %q", started[0])
+	if len(startedAt) != len(suite()) {
+		t.Fatalf("%d cases announced, want %d: %v", len(startedAt), len(suite()), seen)
+	}
+	if seen[0].name != FigureStructuredValidity || !seen[0].started {
+		t.Fatalf("the first event was %+v, want the first case starting", seen[0])
 	}
 }
 
@@ -561,5 +626,64 @@ func TestProgressAnnouncesEachCaseBeforeItRuns(t *testing.T) {
 func TestRunRefusesWithNoClient(t *testing.T) {
 	if _, err := Run(context.Background(), Request{SuiteVersion: SuiteVersion}); err == nil {
 		t.Fatal("want a refusal with no runtime client")
+	}
+}
+
+// A CANCELLATION MUST NOT ERASE A MEASUREMENT THAT ALREADY HAPPENED.
+// The window is one clock read wide -- the parent can be cancelled
+// after c.Run has returned complete figures -- and overwriting a real
+// value with "was not run" is exactly the figure-and-absence confusion
+// this package exists to prevent, committed by the code that documents
+// it.
+func TestCancellationKeepsAFigureTheCaseAlreadyMeasured(t *testing.T) {
+	measured := []Figure{
+		{Name: FigureThroughput8K, Value: 41.2, Unit: "tokens/sec", Detail: "100 tokens in 2.4s"},
+		{Name: FigureTTFT8K, AbsentReason: "no streamed output."},
+	}
+	absent := []Figure{
+		{Name: FigureThroughput8K, AbsentReason: "was not run."},
+		{Name: FigureTTFT8K, AbsentReason: "was not run."},
+	}
+
+	got := keepMeasured(measured, absent)
+	if len(got) != 2 {
+		t.Fatalf("got %d figures", len(got))
+	}
+	if !got[0].Measured() || got[0].Value != 41.2 {
+		t.Fatalf("a real measurement was erased by the cancellation: %+v", got[0])
+	}
+	// And a figure that was ALREADY absent takes the cancellation's
+	// reason, which is the more useful of the two.
+	if got[1].Measured() || got[1].AbsentReason != "was not run." {
+		t.Fatalf("an already-absent figure did not take the cancellation reason: %+v", got[1])
+	}
+}
+
+// End to end: a probe cancelled partway keeps everything it measured
+// and reports only the rest as not run.
+func TestACancelledProbeKeepsWhatItAlreadyMeasured(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Cancel once the structured case has answered, so the tool case is
+	// the first to see a cancelled parent.
+	rt := &fakeRuntime{reply: goodAnswers(), toolCall: goodToolCalls(), usage: knownUsage()}
+	rep, err := Run(ctx, Request{
+		SuiteVersion: SuiteVersion, Model: "m", Client: rt,
+		Now: steppingClock(time.Second),
+		Progress: func(e Event) {
+			if e.Started && e.Case == FigureToolCorrectness {
+				cancel()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("a cancelled probe must report what it has: %v", err)
+	}
+
+	if f := rep.Figure(FigureStructuredValidity); !f.Measured() {
+		t.Fatalf("the case that completed before the cancellation was erased: %+v", f)
+	}
+	if f := rep.Figure(FigureThroughput32K); f.Measured() {
+		t.Fatalf("a case that never ran reported a value: %+v", f)
 	}
 }

@@ -94,9 +94,18 @@ func TestProbeRendersAUnitOnEveryFigureThatHasOne(t *testing.T) {
 	if !strings.Contains(out, "1.04 s") {
 		t.Errorf("a duration was printed without its unit:\n%s", out)
 	}
-	// A ratio has no unit, and must not acquire one.
-	if strings.Contains(out, "1.00 ") && strings.Contains(out, "1.00 tok") {
+	// A RATIO HAS NO UNIT AND MUST NOT ACQUIRE ONE. Asserted against
+	// what figureValue would actually emit for a ratio wrongly given
+	// the tokens/sec unit -- "1.0 tok/s" -- rather than against
+	// "1.00 tok", which that branch can never produce and which
+	// therefore made this check unfailable.
+	if strings.Contains(out, "1.0 tok/s") {
 		t.Errorf("a ratio was given a unit:\n%s", out)
+	}
+	// And the ratio still renders at two decimals, which is what makes
+	// a column of them scannable.
+	if !strings.Contains(out, "  structured validity      1.00 ") {
+		t.Errorf("a ratio did not render at two decimals:\n%s", out)
 	}
 }
 
@@ -115,25 +124,42 @@ func TestProbeSaysTheFiguresGateNothing(t *testing.T) {
 // interrupted; a line printed only on completion is the line the wedged
 // case never prints.
 func TestProbeAnnouncesEachCaseBeforeItRuns(t *testing.T) {
-	var announced []string
+	var gotProgress bool
 	_, out := runProbeWith(t, offering(allowedModel("m", models.Attributes{})), measuredReport(), nil,
 		func(r *probeRun) {
 			inner := r.run
 			r.run = func(ctx context.Context, req probe.Request) (probe.Report, error) {
+				// The command MUST supply a Progress callback -- without
+				// one the suite runs silently and somebody watching a
+				// two-minute 32K generation has nothing on screen. The
+				// previous spelling of this test fabricated the events
+				// it then asserted on, so runProbe could have passed nil
+				// and still passed.
+				if req.Progress == nil {
+					t.Error("runProbe passed no Progress callback; the suite would run silently")
+					return inner(ctx, req)
+				}
+				gotProgress = true
 				req.Progress(probe.Event{Case: "structured_validity", Index: 1, Total: 4, Started: true})
 				req.Progress(probe.Event{Case: "tool_correctness", Index: 2, Total: 4, Started: true})
-				announced = append(announced, "called")
+				// A FINISHED event must print nothing: the heading is
+				// the announcement, and printing again on completion
+				// would double every line.
+				req.Progress(probe.Event{Case: "structured_validity", Index: 1, Total: 4})
 				return inner(ctx, req)
 			}
 		})
 
-	if len(announced) != 1 {
-		t.Fatalf("the suite did not run: %v", announced)
+	if !gotProgress {
+		t.Fatal("the suite did not run")
 	}
 	for _, want := range []string{"  [1/4] structured_validity", "  [2/4] tool_correctness"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
+	}
+	if n := strings.Count(out, "[1/4] structured_validity"); n != 1 {
+		t.Errorf("the case was announced %d times, want once (a finished event must print nothing)", n)
 	}
 }
 

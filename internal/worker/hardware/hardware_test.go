@@ -165,3 +165,37 @@ func TestScanRuntimesAreNeverNull(t *testing.T) {
 		t.Fatalf("want an empty list, got: %s", raw)
 	}
 }
+
+// A GAP IS NOT A VERDICT, on the one path that could confuse them.
+//
+// On Metal the GPU entry is synthesised from the chip and the unified
+// pool, so a machine whose memory probe failed has nothing to
+// synthesise from. Returning a GPU with zero VRAM there would make
+// Scanned() report true, which flips the class line from "could not be
+// read" to "unsupported" -- contradicting the Hardware line directly
+// above it.
+func TestAppleSiliconWithNoReadableMemoryReportsNoGPU(t *testing.T) {
+	inv := hardware.Scan(context.Background(), fixture(func(p *hardware.Probe) {
+		p.MemoryBytes = func() (uint64, error) { return 0, os.ErrPermission }
+	}))
+	if inv.GPU != nil {
+		t.Fatalf("a GPU was synthesised with no memory figure: %+v", inv.GPU)
+	}
+	if hardware.Scanned(inv) {
+		t.Fatal("Scanned reported true for an inventory nothing could be read into")
+	}
+	if got := hardware.Class(inv); got != hardware.ClassUnsupported {
+		t.Fatalf("Class = %q", got)
+	}
+}
+
+// And the ordinary Metal machine still gets its entry.
+func TestAppleSiliconWithMemoryStillReportsAGPU(t *testing.T) {
+	inv := hardware.Scan(context.Background(), fixture(nil))
+	if inv.GPU == nil {
+		t.Fatal("a Metal machine with a readable memory size reported no GPU")
+	}
+	if !hardware.Scanned(inv) {
+		t.Fatal("Scanned reported false for a machine that was scanned")
+	}
+}

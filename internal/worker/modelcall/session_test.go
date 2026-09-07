@@ -723,3 +723,52 @@ func TestASilentRuntimeIsEndedWhileKeepalivesStillFlow(t *testing.T) {
 		t.Fatal("no keepalive was sent; the engine had no reason to believe this worker was alive")
 	}
 }
+
+// KEEPALIVES MUST FIRE RELIABLY, not on a coin flip.
+//
+// The watchdog checks `sinceSend() >= limits.keepalive`, so a check
+// cadence equal to that threshold makes every tick land within
+// scheduling jitter of the value it is testing -- and roughly half the
+// calls emit no keepalive at all. The engine then sees silence it
+// cannot distinguish from a wedged machine, which is the exact
+// confusion the keepalive contract exists to remove.
+//
+// Asserted over repetitions, because a single run of a timing property
+// proves nothing about the one that fails under load.
+func TestKeepalivesFireOnEveryRun(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			drain(r)
+			flusher, _ := w.(http.Flusher)
+			fmt.Fprintf(w, "%s\n", mustJSON(map[string]any{"message": map[string]string{"content": "one"}, "done": false}))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		}))
+
+		m := managerFor(inventoryWith(ollamaModel(srv.URL, "m", models.Attributes{MaxConcurrent: 1})))
+		rec := newRecorder()
+		s := start("r", "m", KindChat)
+		s.Limits = &memqlv1.ModelCallLimits{TimeoutSeconds: 30, IdleTimeoutSeconds: 2, KeepaliveSeconds: 1}
+		m.Start(context.Background(), rec, s)
+
+		end := rec.wait(t)
+		srv.Close()
+
+		if end.GetFinishReason() != FinishTimeout {
+			t.Fatalf("run %d: finish = %q, want the idle ceiling to have ended it", i, end.GetFinishReason())
+		}
+		rec.mu.Lock()
+		keepalives := 0
+		for _, d := range rec.deltas {
+			if d.GetKeepalive() {
+				keepalives++
+			}
+		}
+		rec.mu.Unlock()
+		if keepalives == 0 {
+			t.Fatalf("run %d: no keepalive was sent before the idle ceiling fired", i)
+		}
+	}
+}

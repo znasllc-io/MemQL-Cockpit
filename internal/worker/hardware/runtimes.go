@@ -41,26 +41,48 @@ const probeTimeout = 5 * time.Second
 // overrides it for anybody who moved it.
 const DefaultKokoroBaseURL = "http://127.0.0.1:8880"
 
-// KokoroBaseURL resolves where to look for the speech runtime.
-func KokoroBaseURL() string {
-	if v := strings.TrimSpace(os.Getenv("MEMQL_KOKORO_HOST")); v != "" {
-		return strings.TrimSuffix(v, "/")
+// baseURLFrom normalises an operator's host setting into a URL.
+//
+// IT ACCEPTS THE THREE SHAPES PEOPLE ACTUALLY WRITE -- a full URL, a
+// bare host, and a host:port -- because all three appear in the wild
+// and two of them are not URLs. Accepting only the first is not a
+// stricter parser, it is a probe that reports a runtime ABSENT while it
+// is serving: url.Parse reads "127.0.0.1:11434/api/version" as a scheme
+// named "127.0.0.1", the request fails, and the machine says it has no
+// Ollama while `memql worker models` lists five.
+//
+// The default port is applied to a bare host for the same reason: a
+// person who wrote OLLAMA_HOST=box.local means the Ollama on box.local,
+// and http://box.local is port 80.
+//
+// This mirrors the models package's Discoverer.ollamaBaseURL exactly.
+// It is repeated rather than imported because that one is a method on a
+// Discoverer this package has no reason to construct -- and the two
+// MUST agree: they answer the same question, and a machine whose
+// hardware inventory and model inventory disagree about where Ollama is
+// reports a runtime absent while advertising its models.
+func baseURLFrom(value, defaultPort, fallback string) string {
+	host := strings.TrimSpace(value)
+	if host == "" {
+		return fallback
 	}
-	return DefaultKokoroBaseURL
+	if !strings.Contains(host, "://") {
+		if !strings.Contains(host, ":") {
+			host += ":" + defaultPort
+		}
+		host = "http://" + host
+	}
+	return strings.TrimRight(host, "/")
 }
 
-// ollamaBaseURL mirrors the models package's resolution. It is repeated
-// rather than imported because that one is a method on a Discoverer
-// this package has no reason to construct, and the fallback is the same
-// documented default in both places.
+// KokoroBaseURL resolves where to look for the speech runtime.
+func KokoroBaseURL() string {
+	return baseURLFrom(os.Getenv("MEMQL_KOKORO_HOST"), "8880", DefaultKokoroBaseURL)
+}
+
+// ollamaBaseURL resolves where to look for the model runtime.
 func ollamaBaseURL() string {
-	if v := strings.TrimSpace(os.Getenv("OLLAMA_HOST")); v != "" {
-		if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
-			v = "http://" + v
-		}
-		return strings.TrimSuffix(v, "/")
-	}
-	return "http://127.0.0.1:11434"
+	return baseURLFrom(os.Getenv("OLLAMA_HOST"), "11434", "http://127.0.0.1:11434")
 }
 
 func now() time.Time { return time.Now() }

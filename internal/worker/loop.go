@@ -123,7 +123,7 @@ func NewRunner(opts Options) (*Runner, error) {
 	}
 	hb := opts.Heartbeat
 	if hb <= 0 {
-		hb = 15 * time.Second
+		hb = DefaultHeartbeat
 	}
 	return &Runner{
 		logger:    opts.Logger,
@@ -264,6 +264,15 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
 		}
 	}
 }
+
+// DefaultHeartbeat is the beat interval when the caller states none.
+//
+// A named constant rather than a literal because the hardware refresh
+// cadence is stated in BEATS and its wall-clock interval follows from
+// this number -- so a test that pinned the interval against its own
+// copy of 15s would stay green while this moved, and the refresh would
+// silently become five minutes.
+const DefaultHeartbeat = 15 * time.Second
 
 // hardwareRefreshBeats is how often the hardware inventory is re-scanned
 // onto the heartbeat (design record D1: "refreshed on every tenth

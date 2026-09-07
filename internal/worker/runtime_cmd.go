@@ -108,17 +108,25 @@ func kokoroDetail(version string) string {
 	return fmt.Sprintf("%s (%s)", base, version)
 }
 
-// probeRuntime re-reads whether the runtime answers, AFTER an install.
+// probeRuntime re-reads whether the SPEECH runtime answers, after an
+// install.
 //
 // THE LABEL APPEARS ONLY ONCE THE RUNTIME ANSWERS A PROBE, which is
 // issue #400's acceptance criterion -- so the closing block reports what
 // a probe found, never that a command exited zero. A container that
 // started and then died on its first request would otherwise be reported
 // as a runtime this machine has.
+//
+// It answers for kokoro ALONE, and image is deliberately not a case
+// here: image generation installs nothing and advertises no
+// `runtime:` label at all, so there is nothing to re-probe. See
+// printAdvertisement, which routes the two apart.
 func probeRuntime(ctx context.Context, name string) (bool, string) {
+	if name != inference.RuntimeKokoro {
+		return false, ""
+	}
 	for _, rt := range hardware.Local(ctx).Runtimes {
-		switch {
-		case name == inference.RuntimeKokoro && rt.Name == hardware.RuntimeKokoro:
+		if rt.Name == hardware.RuntimeKokoro {
 			return true, kokoroDetail(rt.Version)
 		}
 	}
@@ -144,7 +152,7 @@ func runRuntimeSetup(ctx context.Context, s *runtimeSetup) int {
 		s.paragraph(fmt.Sprintf("%s is already running%s. Nothing to install.",
 			runtimeTitle(plan.Name), detailSuffix(plan.Detail)))
 		s.line("")
-		s.printAdvertisement(ctx, plan.Name)
+		s.printAdvertisement(ctx, plan)
 		return SetupExitOK
 	}
 
@@ -182,30 +190,50 @@ func runRuntimeSetup(ctx context.Context, s *runtimeSetup) int {
 		return SetupExitOpFailed
 	}
 	s.line("")
-	s.printAdvertisement(ctx, plan.Name)
+	s.printAdvertisement(ctx, plan)
 	return SetupExitOK
 }
 
 // printAdvertisement says what the cluster will see, and refuses to
 // overstate it.
 //
-// It PROBES rather than trusting the install: a container that started
-// and then died is a command that exited zero and a runtime that is not
-// there. And a runtime that answers is still not visible to the cluster
-// until the next reconnect -- labels bind at Register -- so the sentence
-// says "within a minute or two" rather than "available now", the same
+// THE TWO RUNTIMES ADVERTISE DIFFERENT THINGS, and saying so is the
+// whole job of this function. Kokoro is a SERVICE: it earns a
+// `runtime:kokoro` label, and whether it answers has to be re-probed
+// because a container that started and then died is a command that
+// exited zero and a runtime that is not there. Image generation is a
+// CAPABILITY OF A MODEL: it installs nothing, earns no `runtime:` label
+// at all, and surfaces as `imagegen=1` on the model's own label -- so
+// re-probing for a runtime that was never going to appear produced a
+// closing paragraph that contradicted the one above it on every single
+// machine.
+//
+// Either way, a thing that is present is still not VISIBLE until the
+// next reconnect -- labels bind at Register -- so the sentence says
+// "within a minute or two" rather than "available now", the same
 // distinction printReadvertise draws.
-func (s *runtimeSetup) printAdvertisement(ctx context.Context, name string) {
+func (s *runtimeSetup) printAdvertisement(ctx context.Context, plan inference.RuntimePlan) {
+	if plan.Name == inference.RuntimeImage {
+		if !plan.Present {
+			return
+		}
+		s.paragraph(fmt.Sprintf(
+			"This machine advertises imagegen=1 on %s once this worker reconnects, which takes a"+
+				" minute or two. Image generation carries no runtime label of its own: it is a"+
+				" capability of the model, not a service beside it.", plan.Detail))
+		return
+	}
+
 	present, detail := s.probe(ctx)
 	if !present {
 		s.paragraph(fmt.Sprintf(
 			"%s is not answering yet, so this machine advertises nothing for it. Give it a moment"+
 				" and run this again; the label appears only once the runtime answers a probe.",
-			runtimeTitle(name)))
+			runtimeTitle(plan.Name)))
 		return
 	}
 	s.paragraph(fmt.Sprintf("%s is answering at %s. The cluster sees runtime:%s once this worker"+
-		" reconnects, which takes a minute or two.", runtimeTitle(name), detail, name))
+		" reconnects, which takes a minute or two.", runtimeTitle(plan.Name), detail, plan.Name))
 }
 
 func (s *runtimeSetup) ask() bool {

@@ -187,8 +187,17 @@ func Run(ctx context.Context, req Request) (Report, error) {
 		// A cancelled PARENT is different: the person interrupted, and
 		// the remaining cases are not measured at all rather than
 		// reported as failures they never got the chance to be.
+		//
+		// A FIGURE THIS CASE ALREADY MEASURED IS KEPT, which is the
+		// package's first rule applied to its own bookkeeping: the
+		// cancellation can land after c.Run returned complete figures
+		// -- the window is one clock read wide -- and overwriting a
+		// real measurement with "was not run" is exactly the
+		// figure-and-absence confusion this package exists to prevent,
+		// committed by the code that documents it.
 		if ctx.Err() != nil {
-			figs = c.absent(fmt.Sprintf("the %s case was not run: the probe was cancelled.", c.Label))
+			figs = keepMeasured(figs, c.absent(
+				fmt.Sprintf("the %s case was not run: the probe was cancelled.", c.Label)))
 			report.Figures = append(report.Figures, figs...)
 			emitAll(req.Progress, c, i, len(cases), figs)
 			for _, rest := range cases[i+1:] {
@@ -222,6 +231,24 @@ func emit(f func(Event), e Event) {
 	if f != nil {
 		f(e)
 	}
+}
+
+// keepMeasured overlays `absent` onto `measured`, keeping any figure
+// that actually carries a value. Both slices name the same figures in
+// the same order, because both come from the same case.
+func keepMeasured(measured, absent []Figure) []Figure {
+	out := make([]Figure, 0, len(absent))
+	for _, a := range absent {
+		kept := a
+		for _, m := range measured {
+			if m.Name == a.Name && m.Measured() {
+				kept = m
+				break
+			}
+		}
+		out = append(out, kept)
+	}
+	return out
 }
 
 func emitAll(f func(Event), c probeCase, i, total int, figs []Figure) {

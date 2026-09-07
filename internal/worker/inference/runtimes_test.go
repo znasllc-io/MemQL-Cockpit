@@ -38,10 +38,35 @@ func TestDecideRuntimeKokoro(t *testing.T) {
 				"-p 127.0.0.1:8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest"},
 		},
 		{
-			name: "linux with gpu passthrough takes the GPU image",
-			host: kokoroHost(func(h *RuntimeHost) { h.Docker.GPUToolkit = true }),
+			name: "linux with NVIDIA passthrough takes the GPU image",
+			host: kokoroHost(func(h *RuntimeHost) {
+				h.Docker.GPUToolkit = true
+				h.Docker.GPUVendor = GPUVendorNVIDIA
+			}),
 			wantInstall: []string{"docker run -d --name kokoro --restart unless-stopped --gpus=all " +
 				"-p 127.0.0.1:8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest"},
+		},
+		{
+			// AMD sets GPUToolkit TRUE -- the /dev/kfd and /dev/dri
+			// nodes are the ROCm passthrough -- so a toolkit-only test
+			// hands a Radeon machine `--gpus=all` and Docker refuses
+			// with `could not select device driver`. Nothing installs.
+			name: "linux with AMD passthrough takes the CPU image, not --gpus=all",
+			host: kokoroHost(func(h *RuntimeHost) {
+				h.Docker.GPUToolkit = true
+				h.Docker.GPUVendor = GPUVendorAMD
+			}),
+			wantInstall: []string{"docker run -d --name kokoro --restart unless-stopped " +
+				"-p 127.0.0.1:8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest"},
+		},
+		{
+			// And a vendor neither probe recognised: the CPU image,
+			// which runs anywhere, rather than a flag for a card
+			// nobody established is there.
+			name: "linux with a toolkit and an unknown vendor takes the CPU image",
+			host: kokoroHost(func(h *RuntimeHost) { h.Docker.GPUToolkit = true }),
+			wantInstall: []string{"docker run -d --name kokoro --restart unless-stopped " +
+				"-p 127.0.0.1:8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest"},
 		},
 		{
 			// Docker on macOS, which D1 forbids for the MODEL runtime.
@@ -212,19 +237,39 @@ func TestDecideRuntimeAlwaysSaysSomething(t *testing.T) {
 // docker` for a person to run. The distinction is carried by the copy
 // in inference_cmd, so a refusal that gained a sudo line without the
 // caller learning about it would print an unlabelled root command.
+//
+// It walks the whole cross-product rather than InstallableRuntimes()
+// alone: `image` never populates Install on any host, so a loop over
+// the two names would run zero iterations for half of them and report
+// a pass it never earned.
 func TestNoInstallCommandRunsSudo(t *testing.T) {
+	checked := 0
 	for _, name := range InstallableRuntimes() {
 		for _, goos := range []string{"darwin", "linux"} {
-			p := DecideRuntime(RuntimeHost{
-				GOOS:   goos,
-				Docker: DockerFacts{CLIPresent: true, Present: true},
-			}, name)
-			for _, cmd := range p.Install {
-				if strings.Contains(cmd, "sudo") {
-					t.Fatalf("%s on %s would run sudo: %q", name, goos, cmd)
+			for _, vendor := range []GPUVendor{GPUVendorNVIDIA, GPUVendorAMD, GPUVendorUnknown} {
+				for _, toolkit := range []bool{true, false} {
+					p := DecideRuntime(RuntimeHost{
+						GOOS: goos,
+						Docker: DockerFacts{
+							CLIPresent: true, Present: true,
+							GPUVendor: vendor, GPUToolkit: toolkit,
+						},
+					}, name)
+					for _, cmd := range p.Install {
+						checked++
+						if strings.Contains(cmd, "sudo") {
+							t.Fatalf("%s on %s would run sudo: %q", name, goos, cmd)
+						}
+					}
 				}
 			}
 		}
+	}
+	// `image` contributes none, so this counts the kokoro paths only --
+	// stated so the day image gains an install command, this number
+	// moves and somebody looks.
+	if checked == 0 {
+		t.Fatal("no install command was examined; the loop covered nothing")
 	}
 }
 

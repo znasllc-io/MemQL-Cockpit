@@ -65,6 +65,16 @@ type VisionRequest struct {
 	// from the question.
 	Images []ImagePart
 	Params Params
+	// Schema is a JSON Schema for structured output, exactly as
+	// ChatRequest carries one.
+	//
+	// A VISION CALL IS A CHAT CALL, so a schema is as meaningful here as
+	// it is there -- and the package's rule is that a schema is honoured
+	// or the call FAILS. Dropping it silently would answer prose to a
+	// call the router only sent here because this machine advertised
+	// structured output, and the parse failure would surface three
+	// layers away naming nothing.
+	Schema []byte
 }
 
 // TranscribeRequest is audio in, text out.
@@ -169,6 +179,7 @@ func (c *openAIClient) Vision(ctx context.Context, req VisionRequest, emit Emit)
 		Model:    req.Model,
 		Messages: attachImages(req.Messages, req.Images),
 		Params:   req.Params,
+		Schema:   req.Schema,
 	}, emit)
 }
 
@@ -208,6 +219,7 @@ func (c *ollamaClient) Vision(ctx context.Context, req VisionRequest, emit Emit)
 		Model:    req.Model,
 		Messages: attachImages(req.Messages, req.Images),
 		Params:   req.Params,
+		Schema:   req.Schema,
 	}, emit)
 }
 

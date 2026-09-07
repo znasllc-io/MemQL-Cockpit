@@ -182,11 +182,23 @@ func decideKokoro(h RuntimeHost) RuntimePlan {
 		return p
 	}
 
-	// The GPU image where a container can reach a GPU, the CPU image
-	// otherwise. Both work; the first is faster, and choosing it on a
-	// machine without passthrough produces a container that will not
-	// start.
-	if h.GOOS == "linux" && h.Docker.GPUToolkit {
+	// The GPU image needs NVIDIA SPECIFICALLY, and reading GPUToolkit
+	// alone gets that wrong on exactly one machine: an AMD box.
+	// DockerFacts sets GPUToolkit for AMD whenever /dev/kfd and
+	// /dev/dri exist -- the device nodes ARE the ROCm passthrough --
+	// so a toolkit-only test hands a Radeon machine `--gpus=all`,
+	// which needs the NVIDIA container runtime and makes Docker refuse
+	// with `could not select device driver "" with capabilities:
+	// [[gpu]]`. Nothing installs, and the operator is looking at an
+	// NVIDIA flag on a machine that has no NVIDIA card.
+	//
+	// The answer for AMD is the CPU image rather than a ROCm one:
+	// kokoro-fastapi publishes no ROCm build, and this package's own
+	// note already argues that a CPU is fine for an 82M speech model.
+	// Naming a `-rocm` tag by symmetry with the model runtime would
+	// print an image nobody can pull -- the same mistake the inference
+	// record calls out about reaching for a "ROCm container toolkit".
+	if h.GOOS == "linux" && h.Docker.GPUToolkit && h.Docker.GPUVendor == GPUVendorNVIDIA {
 		p.Install = []string{installKokoroGPU}
 	} else {
 		p.Install = []string{installKokoroCPU}
