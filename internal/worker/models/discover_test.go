@@ -522,3 +522,38 @@ func TestProbe_DuplicateIdAcrossRuntimes(t *testing.T) {
 		t.Errorf("the shadowed entry must be reported, not silently dropped: %v", inv.ProbeNotes)
 	}
 }
+
+// TestResolvedOllamaBaseURL_IsTheSameAnswerTheProbeUses.
+//
+// The pull path in internal/worker/inference asks this instead of reading
+// OLLAMA_HOST for itself, so the two must be one answer. A second reading
+// that drifted would put a pulled model somewhere the discoverer never
+// looks -- and the operator would watch a pull succeed and the model
+// never appear in the fleet, with nothing anywhere connecting the two.
+func TestResolvedOllamaBaseURL_IsTheSameAnswerTheProbeUses(t *testing.T) {
+	cases := map[string]string{
+		"":                       DefaultOllamaBaseURL,
+		"127.0.0.1:9999":         "http://127.0.0.1:9999",
+		"http://box.local:11434": "http://box.local:11434",
+		"box.local":              "http://box.local:11434",
+	}
+	for host, want := range cases {
+		d := &Discoverer{Getenv: func(k string) string {
+			if k == "OLLAMA_HOST" {
+				return host
+			}
+			return ""
+		}}
+		if got := d.ResolvedOllamaBaseURL(); got != want {
+			t.Errorf("OLLAMA_HOST=%q -> %q, want %q", host, got, want)
+		}
+		if got, internal := d.ResolvedOllamaBaseURL(), d.ollamaBaseURL(); got != internal {
+			t.Errorf("the exported answer %q differs from the probe's %q", got, internal)
+		}
+	}
+	// The explicit override still wins, which is what tests set.
+	d := &Discoverer{OllamaBaseURL: "http://elsewhere:1234/"}
+	if got := d.ResolvedOllamaBaseURL(); got != "http://elsewhere:1234" {
+		t.Errorf("override -> %q", got)
+	}
+}
