@@ -123,6 +123,96 @@ its decision to make, and it can only make it because this says so.
 
 ---
 
+## Turns, and the harness that drives them
+
+A session is a **sequence of turns**, not one process with its output read off
+the terminal. The cockpit drives each app through the app's **own protocol**,
+so what the app said, what it spent, and which session to continue are three
+facts rather than three guesses.
+
+| Harness | What it is | Structured result | Usage |
+|---|---|---|---|
+| `claude-headless` | `claude -p --output-format stream-json --verbose`, **one process per turn**, continued with `--resume <session id>` | yes, via `--json-schema` | yes, from the `result` event |
+| `codex-app-server` | `codex app-server`, JSON-RPC 2.0 over the child's stdio, one process per session and one request per turn | yes, via `outputSchema` | yes, per turn |
+| `codex-mcp` | `codex mcp-server`, the `codex` / `codex-reply` tool pair over stdio MCP | **no** | **no** |
+
+**Which Codex you have decides which of the two you get**, and only this
+machine can tell: `codex app-server --help` is the probe, and a Codex too old
+to answer it falls back to `codex-mcp`. The answer is cached against the
+binary's size and mtime, so an upgrade takes effect at once. The session runner
+and the inventory ask the same question the same way, so what a session drives
+and what the machine advertises cannot disagree — the descriptor reaches
+`Register` once the engine has a field for it
+([memql#5096](https://github.com/znasllc-io/memql/issues/5096)), and the engine
+then never asks for a protocol this machine cannot speak.
+
+**Codex through `codex mcp-server` reports no usage and cannot constrain the
+answer, and both are stated rather than papered over.** The tool pair's output
+schema is `{threadId, content}` and nothing else; the token counts on its event
+stream are described by Codex itself as "accumulated, estimated, or replayed",
+and an estimate written to a ledger somebody bills from is worse than a gap. It
+also takes no output-schema argument, and its input schema refuses arguments it
+does not declare — so a turn that asked for a schema runs **unconstrained** and
+reports a structured result only if the answer happens to parse.
+
+### A follow-up
+
+`AppSessionControl{action: "message"}` starts the **next turn in the same
+conversation**. It is delivered even when it arrives while a turn is running:
+the prompt is queued and the loop takes it as soon as the turn ends. Turns are
+strictly sequential — two processes resuming one Claude Code session id would
+both append to the same transcript and neither would see the other's turn — and
+a follow-up that cannot be delivered (the session is finishing, or eight are
+already waiting) is **refused out loud**, in the log and in the transcript,
+rather than dropped.
+
+The session ends when a turn finishes and nothing is queued behind it.
+
+The control's `action` is a plain string, so `message` needs nothing new on the
+wire. Its **prompt** does: until memql#5096 adds `prompt` to
+`AppSessionControl`, the follow-up's text travels in `reason`.
+
+Because Claude Code reads its MCP configuration at startup and each turn is a
+new process, a `renew_credential` in the middle of a session **does** reach the
+next turn. That is the honest form of what renewal could never do for one long
+process.
+
+### A structured result
+
+When the engine asks for an answer against a JSON Schema and the app produces
+one, it leaves as the session's **last chunk**: an `event` chunk whose body is
+`{"type": "memql.app_session.result", "session_id": …, "result": …}`. The type
+word is namespaced because that same stream carries the app's own events, and
+Claude Code's own last line is literally `{"type":"result", …}`.
+
+**There is often no structured result, and that is not a failure.** No schema
+was asked for; or the app answered in prose; or the app is a Codex driven
+through `codex-mcp`, which cannot be constrained at all. The run is reported as
+having succeeded, with a note in the transcript, because "the app ran and
+answered unstructured" bills and retries differently from "the app never
+started". A result is never synthesised: an empty object would read downstream
+as *the app answered nothing*.
+
+Today **no session asks for a schema**: `AppSessionStart` has no field to carry
+one until memql#5096, so every turn runs unconstrained and no result chunk is
+produced. The machine side is in place and waiting for the field.
+
+### Chunk streams
+
+| Stream | What it carries |
+|---|---|
+| `event` | structured progress, as the app reported it |
+| `text` | assistant prose meant for a person |
+| `tool` | a tool call or its result |
+| `stdout` | anything printed that the protocol did not account for — a stack trace on the way down |
+| `stderr` | the process's stderr, verbatim |
+
+`text` and `tool` are new with the harnesses. An engine that predates them
+keeps every chunk regardless and renders the two as narration, so the finer
+split is what is lost, never the words.
+
+---
+
 ## The three kinds
 
 - **`run`** — headless and autonomous. This is the only kind anything
@@ -134,7 +224,11 @@ its decision to make, and it can only make it because this says so.
   `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `wezterm`, `foot`,
   `xterm`. Anywhere else it **fails immediately with a reason** rather than
   doing nothing.
-- **`attach`** — resumes the app's own session named by `app_session_ref`.
+- **`attach`** — resumes the app's own session named by `app_session_ref` and
+  sends it a turn. It needs a prompt: neither app offers a way to *watch* a run
+  somebody else started, so an attach with nothing to say would spend the
+  machine owner's subscription asking the app nothing. It is refused by name
+  instead.
 
 An `open` that cannot launch ends the session **at once** with a non-empty
 error. It never falls back to a headless run: the user asked to drive it
@@ -166,6 +260,10 @@ applied silently:
 | `/machines` shows the app but not selectable | one of `allowed` / `signed in` is false; the badge says which |
 | The machine never appears at all | `claude` / `codex` is not on the worker's `PATH`. A LaunchAgent's `PATH` is not your shell's |
 | `is not in this machine's policy.yaml apps.allow` | the engine routed here anyway; add it to `apps.allow` or ask why the label was derived |
+| `is allowed here but is not on this worker's PATH` | the binary moved, or the worker's `PATH` is not your shell's. A LaunchAgent inherits neither your shell profile nor a version manager's shims |
+| `kind=attach ... needs a prompt` | an attach that only wanted to watch. Send the turn you want run, or use `run` |
+| `this session is no longer taking turns` | a `message` control arrived after the last turn had already ended the session |
+| `the app answered, but not against the schema` | the run SUCCEEDED and produced no structured result. For `codex-mcp` that is expected: it cannot constrain the answer at all |
 | `not found (404) -- either the artifact does not exist, or the owning user cannot reach it` | the Library answers 404 for both on purpose, so a link cannot probe which ids exist. Check the OWNING USER's access, not the worker token |
 | `the session credential was rejected (401)` | this one IS the cockpit's side: the bearer expired or is malformed |
 | `no display: DISPLAY and WAYLAND_DISPLAY are both unset` | an `open` on a headless box. Correct refusal |

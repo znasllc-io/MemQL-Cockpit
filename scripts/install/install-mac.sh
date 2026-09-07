@@ -16,6 +16,7 @@
 #   --cluster <url>     Cluster URL. Required.
 #   --name <name>       Worker name (default: hostname).
 #   --computeruse               Install the computer-use variant (memql-computeruse).
+#   --inference         Also set this machine up to serve local models.
 #   --download-base <u> Base URL for binary downloads.
 #   --force             Overwrite existing worker.yaml.
 #   --no-service        Skip LaunchAgent installation.
@@ -71,6 +72,11 @@ Required:
 Options:
     --name <name>             Worker name (default: hostname)
     --computeruse                     Install the computer-use variant (memql-computeruse)
+    --inference               Also set this machine up to serve local models:
+                              install a model runtime, pull the default models,
+                              and write models.allow. A runtime install this
+                              cannot approve unattended is reported with the
+                              command for you to run; the install still succeeds.
     --user-local              Install under \$HOME/.memql/bin instead of
                               /usr/local/bin. Use when sudo isn't
                               available (CI, restricted environments).
@@ -93,6 +99,7 @@ function parse_args() {
     FORCE="no"
     INSTALL_SERVICE="yes"
     INSTALL_MODE="system"  # default: sudo-gated /usr/local/bin (#66)
+    INFERENCE="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -100,6 +107,7 @@ function parse_args() {
             --cluster)       CLUSTER_URL="$2"; shift 2 ;;
             --name)          NAME="$2"; shift 2 ;;
             --computeruse)           FLAVOUR="computeruse"; shift ;;
+            --inference)     INFERENCE="yes"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
             --force)         FORCE="yes"; shift ;;
@@ -218,6 +226,14 @@ function main() {
     install_binary
     write_config
     install_launch_agent
+    # AFTER the LaunchAgent, not before: `worker setup --inference` ends
+    # by signalling the running worker to re-read policy.yaml, and a
+    # worker that is not running yet is one it can only report it could
+    # not find. Its own refusals never fail this install -- see
+    # setup_inference.
+    if [[ "$INFERENCE" == "yes" ]]; then
+        setup_inference "$INSTALLED_BINARY"
+    fi
 
     cat << EOF
 

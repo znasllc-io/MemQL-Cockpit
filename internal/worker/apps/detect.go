@@ -25,6 +25,11 @@ type Detector struct {
 	// RunVersion asks an app for its own version string. Defaults to a
 	// bounded exec of the resolved binary.
 	RunVersion func(ctx context.Context, bin string, args []string) (string, error)
+	// RunProbe asks whether an app answers a subcommand at all. Only the
+	// error matters -- nil is yes -- because the question is "does this
+	// binary have `app-server`", not "what did it say". Defaults to a
+	// bounded exec that discards the output.
+	RunProbe func(ctx context.Context, bin string, args []string) error
 	// Home is where the apps keep their own state. Defaults to $HOME.
 	Home string
 	// Now defaults to time.Now.
@@ -33,8 +38,9 @@ type Detector struct {
 	// DefaultVersionTTL.
 	VersionTTL time.Duration
 
-	mu    sync.Mutex
-	cache map[string]versionEntry
+	mu           sync.Mutex
+	cache        map[string]versionEntry
+	harnessCache map[string]harnessEntry
 }
 
 // DefaultVersionTTL bounds how stale a cached version string may be.
@@ -46,24 +52,49 @@ type Detector struct {
 // processes a minute forever on somebody's laptop, to answer a question
 // whose answer changes when they run an installer.
 //
-// So the SLOW half is cached and the FAST half never is: the version
-// comes from a subprocess and is reused; presence and auth state are
-// filesystem reads and are taken fresh every beat. That keeps the
-// property the cadence exists for -- a sign-in shows up on the next beat
-// -- without the process churn.
+// So the SLOW half is cached and the FAST half never is: the version and
+// the harness probe come from subprocesses and are reused; presence and
+// auth state are filesystem reads and are taken fresh every beat. That
+// keeps the property the cadence exists for -- a sign-in shows up on the
+// next beat -- without the process churn.
+//
+// It bounds the harness probe as well, under the version's name. Both
+// answer "what did the operator install", and two probes allowed to go
+// stale at different rates would report a Codex version read at one
+// moment beside a Codex harness read at another.
 //
 // The cache key includes the binary's size and mtime, so an in-place
 // upgrade invalidates immediately rather than waiting out the TTL.
 const DefaultVersionTTL = 5 * time.Minute
 
-// versionProbeTimeout bounds one `--version` call. An app that hangs on
-// its own version flag must not wedge the heartbeat loop behind it.
-const versionProbeTimeout = 5 * time.Second
+// probeTimeout bounds one subprocess this package forks -- a `--version`
+// call or a harness probe. An app that hangs on its own version flag, or
+// one whose `app-server --help` decides to start a server instead of
+// printing anything, must not wedge the heartbeat loop behind it. The
+// timeout's failure direction is the safe one in both cases: no version,
+// and the fallback harness.
+const probeTimeout = 5 * time.Second
 
 type versionEntry struct {
 	version string
 	stamp   string
 	at      time.Time
+}
+
+// harnessEntry caches whether a binary earned its harness upgrade.
+//
+// BOTH OUTCOMES ARE CACHED, which is where this differs from the version
+// probe. A failed version call means "cannot tell" and must be retried,
+// so a half-finished install resolves on the next beat. A failed harness
+// probe is an ANSWER -- this binary has no app-server -- and re-forking
+// `codex app-server --help` every fifteen seconds forever, to re-learn
+// that last year's Codex is still last year's Codex, is exactly the churn
+// the TTL exists to prevent. An operator who upgrades changes the binary,
+// and the stamp key invalidates immediately.
+type harnessEntry struct {
+	upgraded bool
+	stamp    string
+	at       time.Time
 }
 
 func (d *Detector) now() time.Time {
@@ -94,13 +125,26 @@ func (d *Detector) runVersion(ctx context.Context, bin string, args []string) (s
 	if d.RunVersion != nil {
 		return d.RunVersion(ctx, bin, args)
 	}
-	ctx, cancel := context.WithTimeout(ctx, versionProbeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, bin, args...).Output()
 	if err != nil {
 		return "", err
 	}
 	return string(out), nil
+}
+
+func (d *Detector) runProbe(ctx context.Context, bin string, args []string) error {
+	if d.RunProbe != nil {
+		return d.RunProbe(ctx, bin, args)
+	}
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	// Stdout and Stderr stay nil, which sends both to the null device.
+	// The output is not the answer -- a help text and a silent success
+	// are the same yes -- and leaving a pipe nobody drains is how a
+	// chatty app blocks on a full buffer and takes the heartbeat with it.
+	return exec.CommandContext(ctx, bin, args...).Run()
 }
 
 // Detect returns the inventory to report, sorted by id.
@@ -127,12 +171,21 @@ func (d *Detector) Detect(ctx context.Context, allow []string) []Info {
 			continue
 		}
 		state := probeAuth(spec.ID, home)
+		// The descriptor is resolved for a BLOCKED app too. A descriptor
+		// for a blocked app is still a descriptor: it lets the portal
+		// say "present, blocked, would be driven through
+		// codex-app-server" instead of rendering the row identically to
+		// "not installed".
+		resolved := d.resolveHarness(ctx, spec, path)
 		out = append(out, Info{
-			Id:           spec.ID,
-			Version:      Truncate(d.version(ctx, spec, path)),
-			SignedIn:     state.signedIn,
-			Subscription: NormalizeSubscription(state.subscription),
-			Allowed:      allowed[spec.ID],
+			Id:               spec.ID,
+			Version:          Truncate(d.version(ctx, spec, path)),
+			SignedIn:         state.signedIn,
+			Subscription:     NormalizeSubscription(state.subscription),
+			Allowed:          allowed[spec.ID],
+			Harness:          resolved.Harness,
+			StructuredResult: resolved.StructuredResult,
+			FollowUps:        resolved.FollowUps,
 		})
 	}
 	// Stable order. The engine sorts by id anyway, but an unstable one
@@ -140,6 +193,77 @@ func (d *Detector) Detect(ctx context.Context, allow []string) []Info {
 	// actual change.
 	sort.Slice(out, func(i, j int) bool { return out[i].Id < out[j].Id })
 	return out
+}
+
+// ResolveSpec returns the spec for one app id with its harness resolved
+// against the binary this machine actually has.
+//
+// The app-session runner needs that answer at the moment it starts a
+// session, and it must be the SAME answer the registration carried --
+// two implementations of "which Codex is this" could disagree, and
+// nothing on the machine would say which one lied. So this shares
+// Detect's cache rather than re-deriving anything.
+//
+// ok=false means "do not start a session": the id is outside the closed
+// set, or the binary is not on PATH. The two are deliberately one answer,
+// because they are one answer to the only question the caller has.
+func (d *Detector) ResolveSpec(ctx context.Context, id string) (Spec, bool) {
+	spec, ok := SpecFor(strings.TrimSpace(id))
+	if !ok {
+		return Spec{}, false
+	}
+	path, err := d.lookPath(spec.Binary)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return Spec{}, false
+	}
+	return d.resolveHarness(ctx, spec, path), true
+}
+
+// resolveHarness returns spec with its harness fields settled for the
+// binary at path.
+//
+// A probe that fails for ANY reason -- no such subcommand, a timeout, a
+// binary that will not execute -- leaves the floor in place. The two
+// directions of that error do not cost the same: driving an
+// app-server-capable Codex through the mcp-server tools loses usage
+// numbers and structured answers, while driving an old Codex through a
+// protocol it does not have kills the session at Start, after the engine
+// has already committed a turn to this machine.
+func (d *Detector) resolveHarness(ctx context.Context, spec Spec, path string) Spec {
+	upgraded, probe, ok := spec.harnessUpgrade()
+	if !ok {
+		return spec
+	}
+	if !d.harnessUpgraded(ctx, spec.ID, path, probe) {
+		return spec
+	}
+	return upgraded
+}
+
+// harnessUpgraded runs the probe, or reuses its cached verdict.
+func (d *Detector) harnessUpgraded(ctx context.Context, id, path string, probe []string) bool {
+	stamp := binaryStamp(path)
+	ttl := d.VersionTTL
+	if ttl <= 0 {
+		ttl = DefaultVersionTTL
+	}
+
+	d.mu.Lock()
+	if entry, ok := d.harnessCache[id]; ok && entry.stamp == stamp && d.now().Sub(entry.at) < ttl {
+		d.mu.Unlock()
+		return entry.upgraded
+	}
+	d.mu.Unlock()
+
+	upgraded := d.runProbe(ctx, path, probe) == nil
+
+	d.mu.Lock()
+	if d.harnessCache == nil {
+		d.harnessCache = make(map[string]harnessEntry, len(Specs()))
+	}
+	d.harnessCache[id] = harnessEntry{upgraded: upgraded, stamp: stamp, at: d.now()}
+	d.mu.Unlock()
+	return upgraded
 }
 
 // version returns the app's own version string, cached against the

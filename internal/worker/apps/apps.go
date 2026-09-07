@@ -28,7 +28,11 @@
 // reason for this package to invent any.
 package apps
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
+)
 
 // The app ids the engine can drive. Closed set, mirrored from
 // component/worker/apps.go in the engine repo.
@@ -46,6 +50,44 @@ const (
 	SubscriptionPresent = "present"
 )
 
+// The harness words: which protocol the cockpit drives an app through.
+//
+// They are mirrored by hand from internal/worker/harness rather than
+// imported. This package is the one that puts the word on the wire, and
+// an inventory that only compiles when the process drivers do stops being
+// reportable exactly when something is wrong with them.
+// TestHarnessWordsMirrorTheWire pins the spelling; a rename on one side
+// alone compiles everywhere and fails at the only moment that matters --
+// the session's Start, with "no client for harness <word>".
+//
+// TWO OF THEM ARE CODEX, and that is the reason the engine must READ this
+// word rather than infer it from the app id. A Codex old enough to lack
+// `app-server` is still perfectly drivable through `codex mcp-server`,
+// with a thread id in place of usage; a Codex that has the app-server
+// gives up structured results and real accounting. Nothing off this
+// machine can tell which one is installed here, so a descriptor derived
+// from the id would be right on roughly half the fleet and would fail on
+// the other half only after a turn had been committed to it.
+// The words are ALIASED from internal/worker/harness rather than
+// re-spelled here, and that is the one place this package does not follow
+// its own mirroring convention. Mirroring exists for strings that live in
+// the ENGINE repo, where importing is not possible; harness is in this
+// module, so a copy here would be two definitions that a rename can pull
+// apart in silence -- the detector would report a word, the runner would
+// answer to a different one, and every session for that app would fail at
+// Start with "no client for harness".
+const (
+	// HarnessClaudeHeadless is `claude -p` with --resume, one process
+	// per turn.
+	HarnessClaudeHeadless = harness.HarnessClaudeHeadless
+	// HarnessCodexAppServer is `codex app-server`, JSON-RPC over stdio.
+	HarnessCodexAppServer = harness.HarnessCodexAppServer
+	// HarnessCodexMCP is `codex mcp-server`, the codex / codex-reply
+	// tool pair over stdio MCP. The fallback, and the floor: a Codex
+	// that cannot be driven this way cannot be driven at all.
+	HarnessCodexMCP = harness.HarnessCodexMCP
+)
+
 // MaxFieldLen bounds each reported string. The engine truncates at 200
 // on its side; matching it here means an operator reading the portal sees
 // the same value the cockpit logged, rather than a longer one that got
@@ -58,12 +100,39 @@ const MaxFieldLen = 200
 // before the engine will route to this machine. Allowed is this machine's
 // own policy.yaml verdict; SignedIn is the app's auth state as the
 // cockpit can observe it without spending the user's tokens to ask.
+//
+// THE DESCRIPTOR IS NOT ON THE WIRE YET, and that is a fact about the
+// wire rather than an omission here. Register's AppInfo carries five
+// fields -- id, version, signed_in, subscription, allowed -- and no
+// harness descriptor; engine epic memql#5096 adds one. Until
+// .github/memql-pin carries that merge there is no field for
+// appinventory.go's appsToProto to map the three below into, and
+// inventing one would not compile. When the pin moves, the mapping is
+// three assignments in appsToProto beside the five that are already
+// there. The live consumer meanwhile is on this machine: the app-session
+// runner picks the protocol from ResolveSpec's answer, which is the same
+// answer Detect reports here.
 type Info struct {
 	Id           string
 	Version      string
 	SignedIn     bool
 	Subscription string
 	Allowed      bool
+	// Harness is the protocol word for the harness that can drive this
+	// app ON THIS MACHINE, resolved against the installed binary rather
+	// than assumed from the id.
+	Harness string
+	// StructuredResult reports whether that harness can return a final
+	// answer against a schema. False is the fail-closed answer: the
+	// engine simply does not send this machine a structured call, which
+	// costs a door. A false TRUE costs a parse failure in the engine's
+	// structured path three layers away, naming nothing here.
+	StructuredResult bool
+	// FollowUps reports whether that harness can send a second prompt
+	// into the session it already opened. False means every turn is a
+	// fresh conversation, which the engine can work with; claiming it
+	// falsely turns a follow-up into a stranger with no context.
+	FollowUps bool
 }
 
 // Spec is everything the cockpit needs to detect and drive one app.
@@ -80,11 +149,27 @@ type Spec struct {
 	// the label, so pre-reducing it here would throw away the patch
 	// level the portal shows.
 	VersionArgs []string
-	// StreamsJSON reports whether the headless run emits newline-
-	// delimited JSON the engine can map to progress events. When false
-	// the runner sends plain stdout as narration and never synthesises
-	// event chunks out of it.
-	StreamsJSON bool
+	// StreamsJSON USED TO BE HERE. It answered one question -- "may the
+	// runner try to parse this app's stdout as newline-delimited JSON?"
+	// -- for a classifier that no longer exists: the harness reads each
+	// app's own protocol and labels every chunk itself. A flag kept
+	// past its only reader is a flag the next person has to work out
+	// the meaning of before they can ignore it.
+	//
+	// Harness is the protocol word the app-session runner drives this
+	// app through. What Specs() carries is the FLOOR -- the harness that
+	// works on every machine that has the binary at all. A machine whose
+	// own binary offers a better one earns it through harnessUpgrade;
+	// putting the better one here instead would have a cockpit advertise
+	// a protocol nothing on that machine speaks.
+	Harness string
+	// StructuredResult reports whether Harness can return a final answer
+	// against a schema, and FollowUps whether it can send a second
+	// prompt into the session it already opened. Both belong to the
+	// HARNESS rather than to the app: the two Codex harnesses do not
+	// answer them the same way, so they move together with the word.
+	StructuredResult bool
+	FollowUps        bool
 }
 
 // Specs returns the closed set, in stable id order.
@@ -95,16 +180,58 @@ func Specs() []Spec {
 			Binary: "claude",
 			// `claude --version` prints e.g. "2.1.4 (Claude Code)".
 			VersionArgs: []string{"--version"},
-			StreamsJSON: true,
+			// Claude Code has exactly one protocol, so there is nothing
+			// to probe: `-p --output-format stream-json` with
+			// `--json-schema` for the answer and `--resume` for the next
+			// turn. Probing for it would fork a subprocess on every beat
+			// to re-read what is written here.
+			Harness:          HarnessClaudeHeadless,
+			StructuredResult: true,
+			FollowUps:        true,
 		},
 		{
 			ID:     IDCodex,
 			Binary: "codex",
 			// `codex --version` prints e.g. "codex-cli 0.9.1".
 			VersionArgs: []string{"--version"},
-			StreamsJSON: false,
+			// The FLOOR, not the preference. Every Codex has the
+			// mcp-server tool pair; only a recent one has the
+			// app-server, and harnessUpgrade is what finds out.
+			// StructuredResult is false here because the tool pair
+			// returns a transcript rather than an answer against a
+			// schema -- the engine reads the absence as "do not send
+			// this machine a structured call", which is a shut door and
+			// recoverable, where the over-claim is a parse failure it
+			// cannot attribute to anything.
+			Harness:          HarnessCodexMCP,
+			StructuredResult: false,
+			FollowUps:        true,
 		},
 	}
+}
+
+// harnessUpgrade returns the spec this app becomes when the binary on
+// THIS machine answers probe successfully, and ok=false for an app whose
+// harness is a constant and has nothing to ask.
+//
+// The upgraded word and the command that earns it live together, in this
+// file, beside the floor they replace. Splitting them -- the word here
+// and the probe in detect.go -- is how a probe ends up wired to the wrong
+// answer, which reports a harness the binary does not have: the one
+// failure this entire descriptor exists to prevent.
+func (s Spec) harnessUpgrade() (upgraded Spec, probe []string, ok bool) {
+	switch s.ID {
+	case IDCodex:
+		// `codex app-server --help` exits non-zero on a Codex that has
+		// no such subcommand, and printing its help is the cheapest
+		// question that distinguishes the two Codexes without starting
+		// a session.
+		s.Harness = HarnessCodexAppServer
+		s.StructuredResult = true
+		s.FollowUps = true
+		return s, []string{"app-server", "--help"}, true
+	}
+	return s, nil, false
 }
 
 // SpecFor returns the spec for an app id.
@@ -123,38 +250,23 @@ func IsKnownID(id string) bool {
 	return ok
 }
 
-// RunArgs builds the argv for a headless, autonomous run of prompt.
+// RunArgs and AttachArgs USED TO BE HERE, and they are gone rather than
+// kept for compatibility (memql-cockpit#386).
 //
-// This is the `run` kind: no human is attached, the engine reads the
-// output, and the process must terminate on its own.
-func (s Spec) RunArgs(prompt string) []string {
-	switch s.ID {
-	case IDClaudeCode:
-		// -p is Claude Code's headless "print" mode. stream-json gives
-		// the structured events the engine maps to progress; without
-		// --verbose that format is refused by the CLI.
-		return []string{"-p", prompt, "--output-format", "stream-json", "--verbose"}
-	case IDCodex:
-		// `codex exec` is the non-interactive form.
-		return []string{"exec", prompt}
-	}
-	return nil
-}
-
-// AttachArgs builds the argv that resumes the app's OWN session named by
-// ref, streaming it the way a run streams.
+// Every headless argv is now built by the harness that speaks the app's
+// protocol -- internal/worker/harness -- because the argv and the parser
+// that reads what comes back are one decision. Splitting them is what
+// produced the bug this deletion also removes: RunArgs put the prompt
+// straight after `-p`, and Claude Code's `--mcp-config` is VARIADIC, so
+// a prompt following it was swallowed as a second config path; and `-p`
+// is a boolean with the prompt as a trailing positional, so a prompt
+// that began with a dash was read as an unknown option. claudeArgv ends
+// its flags with `--` for exactly that reason. Leaving these behind "in
+// case something calls them" would have left both bugs behind with them,
+// in the copy nobody was maintaining.
 //
-// Returns nil when the app has no resume mechanism, which the runner
-// turns into a named failure rather than a silent headless run.
-func (s Spec) AttachArgs(ref string) []string {
-	switch s.ID {
-	case IDClaudeCode:
-		return []string{"--resume", ref, "--output-format", "stream-json", "--verbose"}
-	case IDCodex:
-		return []string{"exec", "resume", ref}
-	}
-	return nil
-}
+// InteractiveArgs STAYS: the `open` kind hands the app to a HUMAN with
+// the prompt loaded, and that is not a harness turn.
 
 // InteractiveArgs builds the argv that hands the app to a HUMAN with the
 // prompt loaded -- the `open` kind. The workspace is the process's cwd, so

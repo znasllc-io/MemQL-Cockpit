@@ -33,6 +33,9 @@ const modelsProbeTimeout = 15 * time.Second
 func handleModels(args []string) {
 	fs := flag.NewFlagSet("worker models", flag.ExitOnError)
 	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml")
+	var pull, allow repeatedFlag
+	fs.Var(&pull, "pull", "pull this model id into the local runtime; repeatable")
+	fs.Var(&allow, "allow", "add this model id to models.allow in policy.yaml; repeatable")
 	_ = fs.Parse(args)
 
 	policyPath := filepath.Join(filepath.Dir(*configPath), "policy.yaml")
@@ -40,6 +43,28 @@ func handleModels(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
+	}
+
+	// THE ACTS RUN BEFORE THE REPORT, and the report is then the state
+	// they left behind rather than the one they found. A command that
+	// pulled a model and printed an inventory probed a second earlier
+	// would tell the operator their pull did nothing.
+	//
+	// The probe below is deliberately NOT given the timeout a pull runs
+	// under: a multi-gigabyte pull is minutes to hours of legitimate
+	// work, and the caller's own interrupt is the only sensible deadline
+	// for it (inference.Pull carries no client timeout for the same
+	// reason).
+	if len(pull) > 0 || len(allow) > 0 {
+		s := newInferenceSetup(*configPath, nil, false, "")
+		if code := runModelActs(context.Background(), s, cleanModelIDs(pull), cleanModelIDs(allow)); code != SetupExitOK {
+			os.Exit(code)
+		}
+		// models.allow may have just changed, and the report has to
+		// read what is on disk now.
+		if reloaded, err := tools.LoadPolicy(policyPath); err == nil {
+			policy = reloaded
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), modelsProbeTimeout)
@@ -135,20 +160,48 @@ func modelVerdict(m models.Info, floor models.FloorVerdict) string {
 // over for a structured prompt, and "structured output: not advertised"
 // is the sentence that explains a machine which is in the catalog and
 // still never picked.
+//
+// IT ENUMERATES THE ATTRIBUTES BY HAND, and the list therefore has to be
+// kept level with models.Attributes -- this file's own promise is that
+// what it prints is what the cluster would be told, and it shipped for
+// one release without params, quant or tools, which are exactly the
+// three the engine ranks and routes on. The failure is silent in both
+// directions: the operator reads a complete-looking line and concludes
+// their machine claims nothing about size, while the label beside it
+// claims a size all along.
+//
+// Size and quantization lead, because they are what an operator matches
+// against `ollama list` -- the parameter COUNT rides the label for the
+// engine's numeric ranking, and this is the spelling a person compares.
 func attributeLine(a models.Attributes) string {
 	parts := []string{}
+	if a.Params > 0 {
+		parts = append(parts, humanParams(a.Params))
+	} else {
+		parts = append(parts, "size not advertised")
+	}
+	if q := strings.TrimSpace(a.Quant); q != "" {
+		parts = append(parts, q)
+	} else {
+		parts = append(parts, "quantization not advertised")
+	}
 	if a.ContextWindow > 0 {
-		parts = append(parts, fmt.Sprintf("context %d", a.ContextWindow))
+		parts = append(parts, fmt.Sprintf("%d context", a.ContextWindow))
 	} else {
 		parts = append(parts, "context not advertised")
+	}
+	if a.Embeddings {
+		parts = append(parts, "embeddings")
+	}
+	if a.Tools {
+		parts = append(parts, "tools")
+	} else {
+		parts = append(parts, "tools: not advertised")
 	}
 	if a.StructuredOutput {
 		parts = append(parts, "structured output")
 	} else {
 		parts = append(parts, "structured output: not advertised")
-	}
-	if a.Embeddings {
-		parts = append(parts, "embeddings")
 	}
 	if a.MaxConcurrent > 0 {
 		parts = append(parts, fmt.Sprintf("max %d concurrent", a.MaxConcurrent))
@@ -163,7 +216,12 @@ func whyNothing(inv models.Inventory, policyPath string) string {
 		return inv.Floor.Reason
 	}
 	if len(inv.Models) == 0 {
-		return "No model runtime answered. Install Ollama, or declare an OpenAI-compatible endpoint under models.runtimes in " + policyPath + "."
+		// The fix is now ONE COMMAND rather than a shopping list. It
+		// installs the runtime this platform can actually serve from,
+		// pulls a model, and writes models.allow -- which is the
+		// sequence an operator following the old sentence got wrong
+		// most often, by installing Ollama and stopping there.
+		return "No model runtime answered. Run `memql worker setup --inference` to install one and pull a model, or declare an OpenAI-compatible endpoint under models.runtimes in " + policyPath + "."
 	}
 	return "Every model found is blocked. Add the ones this machine should serve to models.allow in " + policyPath + ", then send the worker a SIGHUP."
 }

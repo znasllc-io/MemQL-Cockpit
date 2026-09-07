@@ -11,13 +11,18 @@ The canonical record is the engine's
 is the half that happens on the machine: what has to be true before it offers
 anything, what it tells the cluster, and what to check when it offers nothing.
 
-The one command worth knowing first:
+Two commands are worth knowing first:
 
 ```bash
+memql worker setup --inference
 memql worker models
 ```
 
-It prints exactly what this machine would advertise, or the reason it would
+The first turns a bare machine into an inference machine: it checks the
+hardware floor, installs the model runtime this platform can actually serve
+from (after printing the exact commands and asking), pulls the default
+models, writes `models.allow`, and signals the running worker. The second
+prints exactly what this machine would advertise, or the reason it would
 advertise nothing.
 
 ---
@@ -55,12 +60,56 @@ reason named.
 work). `/api/tags` says what is installed; `/api/show` says what each one can
 do.
 
+Getting it there used to be five manual steps — install, start, pull, pull,
+edit `policy.yaml` — of which an operator following the old instructions
+reliably did the first one and stopped. It is now one command:
+
 ```bash
-brew install ollama          # or https://ollama.com/download
-ollama serve
-ollama pull llama3.1:8b      # the operational class: 7–8B instruct
-ollama pull nomic-embed-text # if embeddings should run locally
+memql worker setup --inference
 ```
+
+It prints what it is about to do before it does it, asks before changing
+anything on the machine, shows byte counts while it pulls, and ends by
+printing what the cluster will see. Nothing in it runs `sudo`: where a fix
+needs root, the command is printed for **you** to run and is labelled as
+such.
+
+| Flag | What it does |
+|---|---|
+| `--model <id>` | Pull this model instead of the defaults. Repeatable. Hugging Face ids work unchanged: `hf.co/<owner>/<repo>` and `hf.co/<owner>/<repo>:<quant>` are resolved by Ollama itself. |
+| `--non-interactive` | Never ask. A runtime install it would have asked about is refused with **exit 3** and nothing is installed. |
+| `--runtime docker\|native` | Override the runtime this platform would choose. A combination the platform cannot serve is **refused**, not ignored. |
+
+The runtime it installs is fixed by the platform, and the reason is the
+hardware floor:
+
+- **macOS (Apple Silicon)** — Ollama natively, through Homebrew
+  (`brew install ollama`, `brew services start ollama`). Docker is not
+  offered: a container has no access to the GPU there, so Ollama in a
+  container would serve from the CPU and this machine would not be
+  advertised at all.
+- **Linux (discrete GPU)** — the `ollama/ollama` image with the GPU passed
+  through, published on the **loopback only** and restarted unless stopped.
+  Without the NVIDIA container toolkit (or the ROCm device nodes) it refuses
+  and names the package, because a container that cannot reach the GPU is
+  the CPU case again.
+
+Afterwards, a single model at a time:
+
+```bash
+memql worker models --pull qwen2.5:7b     # fetch it; changes no policy
+memql worker models --allow qwen2.5:7b    # offer it, and signal the worker
+```
+
+`--pull` deliberately does not write `models.allow`. Pulling spends
+bandwidth and disk; allowing spends this machine's GPU on somebody else's
+prompt, and a command that quietly granted the second would be a policy
+change nobody typed.
+
+The manual route still works and is still supported — `brew install ollama`,
+`ollama serve`, `ollama pull llama3.1:8b` — the command above simply does
+all of it, including the `policy.yaml` edit that the manual route leaves you
+to remember.
 
 **Any OpenAI-compatible endpoint** works too — LM Studio, vLLM, llamafile, and
 Ollama's own `/v1` surface — but it has to be **declared**, because
@@ -83,6 +132,12 @@ models:
     - llama3.1:8b
     - nomic-embed-text
 
+  # Optional. Default TRUE, unlike everything else here: a pull is the
+  # machine's own owner acting on their own machine, and a fleet-wide
+  # silent refusal is a worse failure than a pull somebody did not want.
+  # Set it to false to refuse `--pull` and `setup --inference` outright.
+  pull: true
+
   # Optional: OpenAI-compatible endpoints, and what they can do.
   runtimes:
     - name: lmstudio
@@ -93,10 +148,22 @@ models:
           context_window: 32768
           structured_output: true
           max_concurrent: 2
+          # Ranked and routed on. UNDECLARED IS ABSENT for all three:
+          # an unstated size sorts last rather than claiming zero, and
+          # an unstated `tools` keeps the model out of tool turns.
+          params: 7620000000     # the COUNT, not "7.6B" -- ranked numerically
+          quant: Q4_K_M          # verbatim, as `ollama list` spells it
+          tools: true            # this runtime can carry a tool-calling turn
 ```
 
+`params`, `quant` and `tools` are spelled here exactly as the **label**
+spells them, unlike `context_window` and `structured_output`: you compare
+`quant=Q4_K_M` on the Fleet page against this file, whereas `ctx` and
+`structured` are abbreviations nobody would guess from a policy.yaml.
+
 `SIGHUP` reloads it — `kill -HUP $(pgrep -f 'memql worker run')` — so a newly
-pulled model becomes offerable without a restart.
+pulled model becomes offerable without a restart. `memql worker setup
+--inference` and `memql worker models --allow` send it for you.
 
 A model that is present but **not** listed is still reported, marked blocked.
 That is what lets the portal say "present, blocked" instead of rendering it
@@ -112,11 +179,26 @@ channel — as labels the engine's fleet router selects on:
 
 ```
 capability   MODEL
-label        model:llama3.1:8b   = ctx=131072,structured=1,max=2
-label        model:nomic-embed-text = ctx=2048,embeddings=1,max=4
+label        model:llama3.1:8b   = ctx=131072,structured=1,max=2,params=8030000000,quant=Q4_K_M,tools=1
+label        model:nomic-embed-text = ctx=2048,embeddings=1,max=4,params=137000000,quant=F16
 label        runtime:ollama
 concurrency  MODEL = 6
 ```
+
+`memql worker models` prints those exact strings, and beside each one the
+same facts spelled for a person — `8B, Q4_K_M, 131072 context, tools,
+structured output, max 2 concurrent` — so an operator comparing this machine
+against the Fleet page is comparing one rendering, not two that can disagree.
+The absences are named there too: a model with `tools: not advertised` is
+skipped for every turn that carries tools, and that sentence is the whole
+explanation for a machine that is in the catalog and never picked.
+
+`params` is the parameter **count** rather than the string a model card
+prints, because the engine ranks on it numerically and "70B" sorts before
+"8.0B" as text. `quant` is free text and is the only attribute that could
+forge another one, so a level carrying a `,` or an `=` is dropped whole
+rather than escaped — it gates nothing, and losing it costs a tiebreak where
+emitting it would cost the integrity of every attribute beside it.
 
 The value is a flat `k=v` list rather than JSON because labels are
 `map[string]string` end to end — the concept, the wire, the Fleet page — and a
@@ -169,6 +251,24 @@ model call is in flight, and never twice inside two minutes. A model finishing
 its pull will not kill an hour-long app session, and a runtime flapping up and
 down will not turn this worker into one that reconnects forever.
 
+A `SIGHUP` is the one thing that shortens the wait, and it shortens exactly
+two parts of it. The handler reloads `policy.yaml` — so the machine's own
+answer to "may I serve this model" changes at once — and then asks for an
+**immediate re-advertise**, which drops the 90-second discovery cache (a
+model pulled a moment ago is not in a probe taken a minute before it) and
+waives the two-minute floor **once**, waking the loop instead of waiting for
+the next 60-second tick. What it does **not** waive is the busy guard: a
+reconnect that killed a running model call or an hour-old app session is a
+worse outcome than a label that is a minute stale, and somebody watching a
+pull is not a reason to throw away somebody else's work. The request survives
+that wait.
+
+So the honest sentence after a pull is "the cluster will see it shortly",
+never "it is available now" — which is what `memql worker setup --inference`
+prints. Without the re-advertise request the reload would change the file and
+nothing else, and the model would stay invisible for up to the full two
+minutes plus a tick.
+
 ---
 
 ## Serving a call
@@ -211,18 +311,48 @@ in the order the causes actually occur:
 | What it prints | What to do |
 |---|---|
 | `Hardware floor: NOT met — …` | Nothing, on this machine. It stays a full worker. |
-| `Runtimes: none found.` | Install Ollama and `ollama serve`, or declare an endpoint under `models.runtimes`. |
-| `present, BLOCKED` | Add the model to `models.allow`, then `SIGHUP`. |
+| `Runtimes: none found.` | Run `memql worker setup --inference`, or declare an endpoint under `models.runtimes`. |
+| `present, BLOCKED` | `memql worker models --allow <id>`, which writes `models.allow` and signals the worker. |
 | `declared runtime … did not answer` | The endpoint is down. Its models are held back deliberately — advertising them would send prompts to a server that is not there. |
 | `declared but not offered` | The endpoint is up but is not currently serving that model id. |
 | labels printed, still absent in the portal | The machine is registered but offline, or the change has not cost a reconnect yet. Give it a minute; the worker will not interrupt work in flight to re-advertise. |
 
+And what `memql worker setup --inference` prints when it stops:
+
+| What it prints | What it means, and what to do |
+|---|---|
+| `Docker is installed but cannot pass this machine's NVIDIA GPU into a container` | Docker is there and the container toolkit is not, so a container would serve from the CPU — which is what the hardware floor exists to prevent, so the setup refuses rather than build one. Install `nvidia-container-toolkit`, run `nvidia-ctk runtime configure --runtime=docker`, restart Docker, then run the setup again. Those three need root: **the cockpit prints them for you to run and never runs one itself.** The AMD case names `amdgpu-dkms` and `/dev/kfd` instead — there is no "ROCm container toolkit" to install. Exit **4**. |
+| `This machine will not pull a model: models.pull is false in …/policy.yaml` | The pull switch is off in this machine's own policy. It defaults to **true** — a pull is the machine's owner acting on their own machine — so somebody set it deliberately. Remove the key or set it to `true`. Exit **4**. |
+| `Nothing was installed: --non-interactive cannot answer that question.` | A runtime install was needed and a scripted run may not approve one. Nothing was changed. Run the same command **without** `--non-interactive`, in a terminal, or run the printed commands yourself. Exit **3** — which is what the installers' `--inference` watches for, so they can print the interactive command for you. |
+| the pull finished, the closing block listed the model, and the portal still shows nothing | **Not a failure, and not due yet.** Model labels are bound at `Register`, so the cluster sees a newly allowed model only after the worker reconnects. The `SIGHUP` the setup sends arms that reconnect at once, but it still waits for any tool call, app session or model call in flight. A minute or two on an idle machine; longer on a busy one. Nothing is lost — the request survives the wait. |
+
 **A model is offered but never picked.** Read its attribute line. A model with
 `structured output: not advertised` is passed over for every planner,
-conductor and suggest prompt; one with `context not advertised` meets no
-context floor. Both are the fail-closed rule working as intended — the fix is
-a runtime that reports the capability, or a declared runtime where you state
-it.
+conductor and suggest prompt; one with `tools: not advertised` is skipped for
+every turn that carries tools; one with `context not advertised` meets no
+context floor. All three are the fail-closed rule working as intended — the
+fix is a runtime that reports the capability, or a declared runtime where you
+state it. `size not advertised` is the mild one: `params` gates nothing, it
+only ranks, and a model that states no size sorts **last** rather than being
+excluded.
+
+---
+
+## From the install line
+
+The portal's "Add machine" flow appends `--inference` to the one-line install
+command when the machine is meant to run local models. Both installers pass
+it through: after `worker.yaml` is written and the service is running, they
+run `memql worker setup --inference --non-interactive`.
+
+They **never fail the install over it.** A machine that paired fine and could
+not set up local models is still a working worker — shell, filesystem, HTTP,
+computer use, local apps, backup — and aborting over the one capability it
+could not add would take away the eight it already has. So a non-zero exit is
+reported and the install carries on, with one case answered specially: **exit
+3** means a runtime install a scripted run may not approve, so the installer
+prints the interactive command for the person who is standing at that
+terminal right now.
 
 ---
 

@@ -30,6 +30,13 @@ const (
 	// CodeSchemaUnsupported: a response schema arrived for a model this
 	// machine never advertised structured output for.
 	CodeSchemaUnsupported = "schema_unsupported"
+	// CodeToolsUnsupported: the call offered tools to a model this
+	// machine never advertised tool calling for. It is separate from
+	// CodeSchemaUnsupported because the FIX is separate -- structured
+	// output and tool calling are two attributes on the label and two
+	// lines in models.allow, and a report that conflated them would send
+	// the operator to the wrong one.
+	CodeToolsUnsupported = "tools_unsupported"
 	// CodeDuplicateRequest: a request id already live on this worker.
 	CodeDuplicateRequest = "duplicate_request"
 	// CodeRuntimeError: the local runtime failed the call.
@@ -341,6 +348,9 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 		return models.Info{}, refuse(CodeSchemaUnsupported,
 			fmt.Sprintf("model %q does not advertise structured output on this machine", info.ID))
 	}
+	if end := toolsRefusal(info, toolsFromStart(start)); end != nil {
+		return models.Info{}, end
+	}
 	if kind == KindEmbedding && !info.Embeddings {
 		return models.Info{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("model %q does not advertise embeddings on this machine", info.ID))
@@ -384,6 +394,26 @@ func machineCap(inv models.Inventory) int {
 	return total
 }
 
+// toolsRefusal is the tool-calling admission gate. A call that offers
+// tools to a model this machine never advertised `tools=1` for is refused
+// HERE, before any request is built, so the runtime is never handed a
+// catalogue it would silently ignore -- a runtime that ignores one
+// answers in prose, and the caller then reads prose where it was waiting
+// for a call. That failure surfaces wherever the tool result was due and
+// names nothing on this machine.
+//
+// It is a function rather than three lines inside resolve so that it can
+// be exercised DIRECTLY. The wire cannot carry a tool catalogue yet (see
+// toolsFromStart), so a gate reachable only through resolve would be a
+// gate no test could put tools past.
+func toolsRefusal(info models.Info, tools []Tool) *memqlv1.ModelCallEnd {
+	if len(tools) == 0 || info.Tools {
+		return nil
+	}
+	return refuse(CodeToolsUnsupported,
+		fmt.Sprintf("model %q does not advertise tool calling on this machine", info.ID))
+}
+
 func refuse(code, message string) *memqlv1.ModelCallEnd {
 	return &memqlv1.ModelCallEnd{
 		FinishReason: FinishError,
@@ -423,6 +453,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 			Messages: messagesFrom(start.GetMessages()),
 			Params:   paramsFrom(start.GetParams()),
 			Schema:   start.GetResponseFormatSchema(),
+			Tools:    toolsFromStart(start),
 		}, stream.emit)
 	}
 
@@ -446,6 +477,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 	// that misses exactly the runaway it exists to catch.
 	end.Usage = usageProto(res.Usage)
 	end.Embeddings = embeddingsProto(res.Embeddings)
+	attachToolCalls(end, res.ToolCalls)
 
 	if err := sender.SendModelCallEnd(end); err != nil {
 		m.logger.Warn("failed to send model call end", "request_id", c.requestID, "error", err)
@@ -578,15 +610,64 @@ func (s *deltaStream) send(content string, keepalive bool) error {
 
 // -----------------------------------------------------------------------------
 // Wire conversions
+//
+// THE TOOL SEAMS. Tool calling is live through the rest of this package
+// -- both clients send a catalogue and decode what comes back, and
+// toolsRefusal turns away a model that cannot do it -- but THE WIRE
+// CARRIES NONE OF IT. ModelCallStart has fields 1 to 11 and none is
+// `tools`; ModelCallMessage is `role` and `content`; ModelCallEnd has
+// fields 1 to 7 and none is a tool-call list; ModelCallDelta is
+// request_id / seq / content / keepalive. Engine epic memql#5096 adds all
+// four, and until this repository's pin crosses that merge there is
+// nothing to map.
+//
+// The mapping is confined to three functions on purpose -- toolsFromStart
+// and messageFrom on the way in, attachToolCalls on the way out -- so
+// that landing the proto is a change to those three and nothing else.
 // -----------------------------------------------------------------------------
+
+// toolsFromStart is the ONE place a ModelCallStart's tool catalogue
+// becomes the runtime envelope's. It returns nil because ModelCallStart
+// has no `tools` field to read: no call reaching this worker can offer a
+// tool, which is also why toolsRefusal is unreachable through resolve
+// today and is tested directly.
+func toolsFromStart(start *memqlv1.ModelCallStart) []Tool {
+	return nil
+}
 
 func messagesFrom(in []*memqlv1.ModelCallMessage) []Message {
 	out := make([]Message, 0, len(in))
 	for _, m := range in {
-		out = append(out, Message{Role: m.GetRole(), Content: m.GetContent()})
+		out = append(out, messageFrom(m))
 	}
 	return out
 }
+
+// messageFrom is the ONE place a ModelCallMessage becomes an envelope
+// Message. Role and content are the WHOLE of that proto message;
+// memql#5096 adds `tool_call_id`, `name` and `tool_calls`, and Message
+// already carries all three for the clients that write them.
+func messageFrom(m *memqlv1.ModelCallMessage) Message {
+	return Message{Role: m.GetRole(), Content: m.GetContent()}
+}
+
+// attachToolCalls is the ONE place a finished call's tool calls would go
+// back on the wire, and it attaches nothing: ModelCallEnd has no
+// tool-call list.
+//
+// The DELTA side is the same gap and one step further away. ModelCallEnd
+// grows a field; ModelCallDelta's incremental arguments would also need
+// Sender to grow a parameter, and Sender is implemented by the worker's
+// Connection in another package. Nothing is lost by that wait: both
+// clients return their tool calls WHOLE on Result -- the
+// OpenAI-compatible one reassembles the fragments itself -- so there is
+// no partial call at this layer to stream even once the field exists.
+//
+// Read this as a wire gap rather than as dropped output: toolsFromStart
+// returns nil, so no runtime is ever offered a tool and none can answer
+// with one. Result.ToolCalls is reached from this package's tests and
+// from here.
+func attachToolCalls(end *memqlv1.ModelCallEnd, calls []ToolCall) {}
 
 func paramsFrom(p *memqlv1.ModelCallParams) Params {
 	if p == nil {

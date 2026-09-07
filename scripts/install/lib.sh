@@ -324,3 +324,60 @@ YAML
     chmod 600 "$path"
     echo "INFO: wrote $path (capabilities: ${capabilities})"
 }
+
+# setup_inference turns the freshly paired machine into an INFERENCE
+# machine: `memql worker setup --inference --non-interactive` installs
+# nothing it was not allowed to, pulls the default models, writes
+# models.allow, and signals the worker.
+#
+# IT NEVER FAILS THE INSTALL, and that is the whole of its error
+# handling. A machine that paired fine and could not set up local models
+# is still a working worker -- shell, filesystem, HTTP, computer use,
+# local apps, backup -- and aborting the install over the one capability
+# it could not add would take away the eight it already has. So every
+# non-zero is REPORTED and the function returns 0.
+#
+# Exit 3 is the one that gets its own answer. It is the capability-script
+# contract's "refused: required confirmation not provided", which here
+# means exactly one thing: a runtime install this machine needs, that
+# --non-interactive is not allowed to approve. Nothing is broken and
+# nothing is missing that the operator has to find -- there was simply
+# nobody to ask -- so the right response is to print the interactive
+# command for the person who is standing at this terminal right now,
+# while they are still looking at it. Exit 4 (a prerequisite is absent,
+# such as a machine below the hardware floor) and exit 5 (something
+# failed) are not that, and telling their operators to run an
+# interactive command would send them to a prompt that refuses them
+# identically.
+#
+# The printed command MUST STAY ONE PHYSICAL LINE. It is meant to be
+# copied out of the terminal, and a bracketed paste of a wrapped command
+# has already cost this project once.
+function setup_inference() {
+    local binary="$1"
+    echo ""
+    echo "INFO: setting this machine up to serve local models"
+    local rc=0
+    "$binary" worker setup --inference --non-interactive || rc=$?
+    case "$rc" in
+        0)
+            return 0
+            ;;
+        3)
+            echo ""
+            echo "INFO: the model runtime is not installed here, and a scripted run"
+            echo "      is not allowed to approve installing it. Run this yourself,"
+            echo "      in this same terminal:"
+            echo ""
+            echo "  ${binary} worker setup --inference"
+            echo ""
+            ;;
+        *)
+            echo "WARN: '${binary} worker setup --inference' exited ${rc}." >&2
+            echo "      This machine is paired and working; it is not offering local" >&2
+            echo "      models. Run the command above without --non-interactive to" >&2
+            echo "      read why." >&2
+            ;;
+    esac
+    return 0
+}

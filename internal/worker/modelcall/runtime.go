@@ -66,9 +66,66 @@ const (
 )
 
 // Message is one turn handed to the model.
+//
+// The last three fields carry a TOOL ROUND TRIP: the assistant turn in
+// which the model asked for a call, and the role="tool" turn that answers
+// it. They are replayed to the runtime rather than summarised into
+// Content, because a model that cannot see its own call has no way to
+// match a result to it and answers as though the tool was never run.
 type Message struct {
 	Role    string
 	Content string
+	// ToolCallID names the assistant tool call a role="tool" turn is the
+	// answer to. Both runtimes spell this one the same way; what they
+	// disagree about is the tool NAME below.
+	ToolCallID string
+	// Name is the tool that produced a role="tool" turn's content.
+	// Ollama reads it from `tool_name` and the OpenAI-compatible surface
+	// from `name`, so the spelling is chosen inside each client and never
+	// here -- a caller that had to know which runtime answered would
+	// carry that fork into every layer above.
+	Name string
+	// ToolCalls are the calls an assistant turn asked for.
+	ToolCalls []ToolCall
+}
+
+// ToolCall is one call the model asked for -- as it came back from the
+// runtime, and as it goes back in on the assistant turn of a round trip.
+//
+// ArgumentsJSON is a STRING of JSON rather than a decoded map, and that
+// normalisation is the reason this type exists at all: Ollama's
+// /api/chat returns tool-call arguments as a JSON OBJECT while every
+// OpenAI-compatible runtime returns them as a STRING. Storing the text
+// means each client re-shapes the arguments exactly once, on the way in
+// and on the way out, and nothing above this package ever asks which
+// runtime answered.
+type ToolCall struct {
+	// ID correlates this call with the role="tool" message that answers
+	// it. It is passed through EMPTY when the runtime minted none --
+	// Ollama's native surface usually does -- rather than filled in here:
+	// an id this side invented would match nothing the model ever said,
+	// and the pairing is done on this exact string.
+	ID string
+	// Name is the tool the model chose.
+	Name string
+	// ArgumentsJSON is the arguments object as JSON TEXT, unparsed.
+	ArgumentsJSON string
+}
+
+// Tool is one tool offered to the model for this call.
+//
+// ParametersJSON is the tool's JSON Schema FORWARDED VERBATIM. Nothing in
+// this package parses it, re-marshals it or validates it, and that is
+// deliberate: the schema belongs to the caller, and a round trip through
+// a Go map sorts every key, drops what encoding/json does not model and
+// reformats the numbers -- each of which changes what the model is told
+// it may call. The damage surfaces as the model calling the tool wrongly,
+// three layers away, naming nothing here. It is the same rule
+// ChatRequest.Schema already follows for the response schema.
+type Tool struct {
+	Name           string
+	Description    string
+	ParametersJSON string
 }
 
 // Params are the generation knobs. Each optional knob carries an explicit
@@ -93,6 +150,11 @@ type ChatRequest struct {
 	Params   Params
 	// Schema is a JSON Schema for structured output. Nil means free text.
 	Schema []byte
+	// Tools are the tools offered to the model on this turn. Empty means
+	// none is offered, and no `tools` key is sent -- which is not the
+	// same request as offering an empty list, and some runtimes answer
+	// the two differently.
+	Tools []Tool
 }
 
 // EmbedRequest is one embedding call.
@@ -121,6 +183,14 @@ type Result struct {
 	// input order.
 	Embeddings [][]float32
 	Usage      Usage
+	// ToolCalls are the calls the model asked for, COMPLETE and in the
+	// order it asked. A caller never sees a partial arguments string:
+	// Ollama emits each call whole, and the OpenAI-compatible client
+	// reassembles the streamed fragments before returning. A call whose
+	// stream was cut mid-arguments reports none at all rather than a
+	// fragment, because a fragment would be dispatched as if the model
+	// had finished writing it.
+	ToolCalls []ToolCall
 }
 
 // emitFunc receives one piece of generated text. Returning an error stops

@@ -52,6 +52,7 @@ const (
 // a sync.Once, publishing through a channel, removes the question.
 type child struct {
 	cmd    *exec.Cmd
+	stdin  io.WriteCloser
 	stdout io.ReadCloser
 	stderr io.ReadCloser
 
@@ -62,24 +63,53 @@ type child struct {
 	killOnce sync.Once
 }
 
-// startChild launches argv in dir with the session's extra environment.
+// startChild launches argv in dir with the session's extra environment
+// and the child's stdin CLOSED.
 //
 // The child inherits the worker's environment plus extraEnv, because an
 // app run needs the user's PATH, HOME and app credentials to work at all.
 // The session's own additions (CODEX_HOME) come last so they win.
 func startChild(dir string, argv []string, extraEnv []string) (*child, error) {
+	return startChildStdin(dir, argv, extraEnv, false)
+}
+
+// startChildStdin is startChild with the stdin decision stated out loud.
+//
+// WHO IS ALLOWED TO TYPE AT AN APP. The rule this preserves is not "a
+// child never gets a stdin"; it is that the ENGINE'S STREAM never
+// reaches one. An app a remote caller can type at is a much larger trust
+// question than an app handed a prompt and left to run, and nothing in
+// this package forwards a chunk, a control or a credential into a
+// child's input. A local JSON-RPC client that owns BOTH ends of a pipe
+// it opened is not that: it is the protocol. `codex app-server` and
+// `codex mcp-server` speak JSON-RPC 2.0 over the child's stdio, so for
+// them a closed stdin is not a safety property -- it is a client with no
+// way to say anything, and the session dies at the handshake.
+//
+// So the pipe is OPT-IN and the default stays closed, because the
+// default's failure mode is the useful one: a prompt-on-stdin app whose
+// stdin is closed fails fast, where the same app holding an open pipe
+// nobody will ever write to hangs until the wall-clock limit and reports
+// nothing at all.
+func startChildStdin(dir string, argv []string, extraEnv []string, stdin bool) (*child, error) {
 	if len(argv) == 0 {
 		return nil, errors.New("app session: empty command")
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), extraEnv...)
-	// The app is autonomous; nothing is going to type at it. A closed
-	// stdin makes a prompt-on-stdin app fail fast instead of hanging
-	// forever waiting for input that will never come.
+	// nil is the closed default: /dev/null, immediate EOF.
 	cmd.Stdin = nil
 	applyProcessGroup(cmd)
 
+	c := &child{cmd: cmd, exited: make(chan struct{})}
+	if stdin {
+		w, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, fmt.Errorf("app session: stdin: %w", err)
+		}
+		c.stdin = w
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("app session: stdout: %w", err)
@@ -88,10 +118,11 @@ func startChild(dir string, argv []string, extraEnv []string) (*child, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app session: stderr: %w", err)
 	}
+	c.stdout, c.stderr = stdout, stderr
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("app session: start %s: %w", argv[0], err)
 	}
-	return &child{cmd: cmd, stdout: stdout, stderr: stderr, exited: make(chan struct{})}, nil
+	return c, nil
 }
 
 // wait reaps the process and returns its exit error. Safe to call from

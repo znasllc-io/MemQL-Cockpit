@@ -74,7 +74,10 @@ Worker-machine installers (binary + service + worker.yaml in one step) live in
 `scripts/install/` — the MemQL Portal's Fleet page composes the exact
 one-liner for you when you add a machine. Their `--computeruse` flag installs
 the prebuilt computer-use binary from the same release; building it from
-source (below) remains the alternative.
+source (below) remains the alternative. Their `--inference` flag runs
+`memql worker setup --inference --non-interactive` once the worker is up, and
+never fails the install over it — a machine that paired fine and could not set
+up local models is still a working worker.
 
 ## Commands
 
@@ -86,6 +89,11 @@ memql creds <subcommand>          Inspect / migrate the credential store
 memql worker pair <code>          Redeem a pairing code, write worker.yaml, run
 memql worker run                  Run the worker (what the service invokes)
 memql worker setup                Computer-use permission pre-flight (TCC / X11)
+memql worker setup --inference    Turn this machine into an inference machine:
+                                  install a model runtime, pull the models,
+                                  write models.allow, signal the worker
+memql worker models               What local models this machine offers, or why
+                                  it offers none (--pull / --allow change it)
 memql worker config | consent     Show config / manage consent
 memql lint [path]                 Validate a .memql file or DSL tree
 memql setup project [flags]       Stamp a new product workspace from the template
@@ -93,7 +101,24 @@ memql --version                   Version + build variant
 ```
 
 `memql worker setup --non-interactive` reports missing permissions with honest
-exit codes and never prompts — for scripted installs.
+exit codes and never prompts — for scripted installs. The codes are the
+capability-script contract's: 2 bad invocation, 3 refused because a required
+confirmation could not be asked for, 4 a prerequisite is absent, 5 something
+failed.
+
+One command takes a qualifying machine from bare to serving:
+
+```bash
+memql worker setup --inference
+```
+
+It checks the hardware floor, installs the runtime this platform can serve
+from (macOS: Ollama natively; Linux: the container with the GPU passed
+through) after printing the exact commands and asking, pulls `llama3.1:8b`
+and `nomic-embed-text` with byte counts on screen, writes `models.allow`, and
+signals the running worker. Nothing in it runs `sudo` — where a fix needs
+root, the command is printed for you. Details:
+[docs/local-models.md](docs/local-models.md).
 
 ## Build
 

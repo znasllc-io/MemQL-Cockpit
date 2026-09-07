@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -25,7 +26,8 @@ type openAIChatChunk struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string                `json:"content"`
+			ToolCalls []openAIToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -33,6 +35,89 @@ type openAIChatChunk struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
 		CompletionTokens int64 `json:"completion_tokens"`
 	} `json:"usage"`
+}
+
+// openAIToolCallDelta is one FRAGMENT of a tool call on the stream.
+// Every field but `index` is optional and arrives whenever the server
+// chooses to send it: the id on the first fragment, or several fragments
+// later; the name once; the arguments a few characters at a time, split
+// wherever the tokeniser happened to split them.
+type openAIToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// toolCallAccumulator reassembles the tool calls an OpenAI-compatible
+// stream sends in pieces.
+//
+// THE INDEX IS THE ONLY USABLE KEY, and this is the single most
+// breakable thing in the file. A server sends
+// {"index":0,"id":"call_a","function":{"name":"x"}} on one chunk and
+// {"index":0,"function":{"arguments":"{\"a\":"}} on the next, so the id
+// is missing from most fragments and the name from nearly all of them;
+// two parallel calls are index 0 and index 1 and their fragments
+// interleave freely. Keying on anything else -- position in the array,
+// the last id seen, the name -- concatenates two different calls'
+// arguments into ONE STRING THAT STILL PARSES, and the tool is then
+// dispatched with arguments the model never asked for. Nothing
+// downstream can detect that.
+type toolCallAccumulator struct {
+	byIndex map[int]*toolCallParts
+}
+
+type toolCallParts struct {
+	id   string
+	name string
+	args strings.Builder
+}
+
+func (a *toolCallAccumulator) add(d openAIToolCallDelta) {
+	if a.byIndex == nil {
+		a.byIndex = make(map[int]*toolCallParts)
+	}
+	p := a.byIndex[d.Index]
+	if p == nil {
+		p = &toolCallParts{}
+		a.byIndex[d.Index] = p
+	}
+	// Each field is written only when the fragment CARRIED one, which is
+	// why these are guarded rather than plain assignments: every
+	// argument fragment repeats the index and omits the id and the name,
+	// so an unguarded assignment erases what the header fragment
+	// established and the finished call goes out anonymous.
+	if d.ID != "" {
+		p.id = d.ID
+	}
+	if d.Function.Name != "" {
+		p.name = d.Function.Name
+	}
+	p.args.WriteString(d.Function.Arguments)
+}
+
+// result returns the finished calls in INDEX order -- the order the
+// server assigned, and therefore the order the model asked in. Map
+// iteration would reshuffle a parallel call set on every run, which
+// reads downstream as the model changing its mind between identical
+// generations.
+func (a *toolCallAccumulator) result() []ToolCall {
+	if len(a.byIndex) == 0 {
+		return nil
+	}
+	indexes := make([]int, 0, len(a.byIndex))
+	for i := range a.byIndex {
+		indexes = append(indexes, i)
+	}
+	sort.Ints(indexes)
+	out := make([]ToolCall, 0, len(indexes))
+	for _, i := range indexes {
+		p := a.byIndex[i]
+		out = append(out, ToolCall{ID: p.id, Name: p.name, ArgumentsJSON: p.args.String()})
+	}
+	return out
 }
 
 func (c *openAIClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc) (Result, error) {
@@ -56,6 +141,9 @@ func (c *openAIClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 			},
 		}
 	}
+	if len(req.Tools) > 0 {
+		body["tools"] = openAITools(req.Tools)
+	}
 
 	resp, err := c.post(ctx, "/chat/completions", body)
 	if err != nil {
@@ -64,6 +152,7 @@ func (c *openAIClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 	defer resp.Body.Close()
 
 	out := Result{FinishReason: FinishStop}
+	var tools toolCallAccumulator
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	sawTerminator := false
@@ -90,6 +179,9 @@ func (c *openAIClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 					return out, err
 				}
 			}
+			for _, frag := range choice.Delta.ToolCalls {
+				tools.add(frag)
+			}
 			if choice.FinishReason != "" {
 				out.FinishReason = openAIFinishReason(choice.FinishReason)
 			}
@@ -108,6 +200,14 @@ func (c *openAIClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 	if !sawTerminator {
 		return out, fmt.Errorf("openai-compatible: stream ended without [DONE]")
 	}
+	// The tool calls are attached ONLY on the clean path, and the two
+	// error returns above deliberately leave them behind. A stream cut
+	// mid-arguments holds half a JSON object in the accumulator, and
+	// handing that up as a call the model asked for would have the
+	// caller dispatch a tool with arguments the model never finished
+	// writing. Reporting none is the honest answer for a call that also
+	// reports an error.
+	out.ToolCalls = tools.result()
 	return out, nil
 }
 
@@ -180,10 +280,66 @@ func (c *openAIClient) post(ctx context.Context, path string, body any) (*http.R
 	return resp, nil
 }
 
-func openAIMessages(in []Message) []map[string]string {
-	out := make([]map[string]string, 0, len(in))
+// openAIMessages maps the envelope's turns onto the chat-completions
+// message shape.
+//
+// The tool on a role="tool" turn is named `name` here, where Ollama calls
+// the same thing `tool_name` -- see ollamaMessages for the failure the
+// split spelling prevents.
+func openAIMessages(in []Message) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
 	for _, m := range in {
-		out = append(out, map[string]string{"role": m.Role, "content": m.Content})
+		msg := map[string]any{"role": m.Role, "content": m.Content}
+		if m.ToolCallID != "" {
+			msg["tool_call_id"] = m.ToolCallID
+		}
+		if m.Name != "" {
+			msg["name"] = m.Name
+		}
+		if len(m.ToolCalls) > 0 {
+			msg["tool_calls"] = openAIToolCallsOut(m.ToolCalls)
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+// openAIToolCallsOut replays an assistant turn's tool calls.
+//
+// `arguments` goes back as a STRING -- the JSON text, quoted -- which is
+// the whole reason ToolCall stores text rather than a decoded object: the
+// same stored value leaves here as a string and leaves the Ollama client
+// as raw JSON, and neither client has to re-marshal what the model wrote.
+func openAIToolCallsOut(in []ToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, c := range in {
+		out = append(out, map[string]any{
+			"id":   c.ID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      c.Name,
+				"arguments": c.ArgumentsJSON,
+			},
+		})
+	}
+	return out
+}
+
+// openAITools renders the offered tools for the request. The schema is
+// forwarded verbatim as json.RawMessage, and an empty one omits the key
+// -- both for the reasons spelled out on ollamaTools, which this mirrors
+// because the request shape is the same on both surfaces.
+func openAITools(in []Tool) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, t := range in {
+		fn := map[string]any{"name": t.Name}
+		if t.Description != "" {
+			fn["description"] = t.Description
+		}
+		if params := strings.TrimSpace(t.ParametersJSON); params != "" {
+			fn["parameters"] = json.RawMessage(params)
+		}
+		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
 }
@@ -206,6 +362,13 @@ func applyOpenAIParams(body map[string]any, p Params) {
 	}
 }
 
+// openAIFinishReason maps this surface's finish reason onto the
+// envelope's closed set. "tool_calls" lands on FinishStop along with
+// everything unrecognised, and deliberately: the generation FINISHED, its
+// output simply happens to be a call rather than prose. The envelope has
+// no separate reason for that, and inventing one here would be a wire
+// change the engine cannot read -- it would arrive as an unknown finish
+// reason on a call that succeeded.
 func openAIFinishReason(reason string) string {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
 	case "length":

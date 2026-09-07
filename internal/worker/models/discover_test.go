@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func metFloor() FloorVerdict { return FloorVerdict{Met: true, Detail: "test"} }
@@ -77,10 +79,20 @@ func TestProbeOllama_FullAttributes(t *testing.T) {
 	if got.ContextWindow != 131072 || !got.StructuredOutput || got.Embeddings || got.MaxConcurrent != 2 {
 		t.Errorf("attributes = %+v", got.Attributes)
 	}
+	if !got.Tools {
+		t.Error("a model reporting the tools capability must advertise tools")
+	}
+	// This stub's /api/tags carries no `details` block, which is what an
+	// older Ollama looks like. Size and quantization are then ABSENT
+	// rather than zero -- ollama_test.go's recorded fixture is where they
+	// are present.
+	if got.Params != 0 || got.Quant != "" {
+		t.Errorf("nothing in this listing states a size: %+v", got.Attributes)
+	}
 	if !got.Allowed {
 		t.Error("an allowed model must be marked allowed")
 	}
-	if want := "ctx=131072,structured=1,max=2"; inv.Labels()["model:llama3.1:8b"] != want {
+	if want := "ctx=131072,structured=1,max=2,tools=1"; inv.Labels()["model:llama3.1:8b"] != want {
 		t.Errorf("label = %q, want %q", inv.Labels()["model:llama3.1:8b"], want)
 	}
 }
@@ -103,10 +115,10 @@ func TestProbeOllama_CapabilitiesFailClosed(t *testing.T) {
 	for _, m := range inv.Models {
 		byID[m.ID] = m
 	}
-	if got := byID["plain:7b"]; got.StructuredOutput {
-		t.Error("a model without the tools capability must not claim structured output")
+	if got := byID["plain:7b"]; got.StructuredOutput || got.Tools {
+		t.Error("a model without the tools capability must claim neither tools nor structured output")
 	}
-	if got := byID["nomic-embed-text"]; !got.Embeddings || got.StructuredOutput {
+	if got := byID["nomic-embed-text"]; !got.Embeddings || got.StructuredOutput || got.Tools {
 		t.Errorf("embeddings model = %+v", got.Attributes)
 	}
 	// A show that failed still leaves the model SERVABLE for free text --
@@ -115,7 +127,7 @@ func TestProbeOllama_CapabilitiesFailClosed(t *testing.T) {
 	if !ok {
 		t.Fatal("a model whose /api/show failed must still be reported")
 	}
-	if m.ContextWindow != 0 || m.StructuredOutput || m.Embeddings {
+	if m.ContextWindow != 0 || m.StructuredOutput || m.Embeddings || m.Tools {
 		t.Errorf("an unreadable show must leave every capability absent: %+v", m.Attributes)
 	}
 	if m.MaxConcurrent == 0 {
@@ -223,6 +235,7 @@ func TestProbeDeclared_AttributesRideThrough(t *testing.T) {
 			BaseURL: api.URL,
 			Models: []DeclaredModel{{
 				ID: "qwen2.5-7b-instruct", ContextWindow: 32768, StructuredOutput: true, MaxConcurrent: 3,
+				Params: 7620000000, Quant: " Q4_K_M ", Tools: true,
 			}},
 		}},
 	})
@@ -235,6 +248,111 @@ func TestProbeDeclared_AttributesRideThrough(t *testing.T) {
 	}
 	if got.ContextWindow != 32768 || !got.StructuredOutput || got.MaxConcurrent != 3 {
 		t.Errorf("declared attributes did not ride through: %+v", got.Attributes)
+	}
+	// The three that arrived with this epic. They are asserted through
+	// the LABEL rather than the struct because the struct is only half
+	// the trip: probeDeclared can carry a field the renderer omits, and
+	// the label is what the engine actually reads.
+	//
+	// Whitespace is in the fixture on purpose. An operator's policy.yaml
+	// quant is hand-typed, and a stray space would render `quant= Q4_K_M`
+	// -- which the engine's parser trims back to the same value, but
+	// which makes the label bytes differ from an otherwise identical
+	// machine's and rewrites the registration row on every reconnect.
+	if got.Params != 7620000000 || got.Quant != "Q4_K_M" || !got.Tools {
+		t.Errorf("declared params/quant/tools did not ride through: %+v", got.Attributes)
+	}
+	const wantLabel = "ctx=32768,structured=1,max=3,params=7620000000,quant=Q4_K_M,tools=1"
+	if label := got.Attributes.String(); label != wantLabel {
+		t.Errorf("label = %q, want %q", label, wantLabel)
+	}
+}
+
+// TestProbeDeclared_ADeclarationDoesNotDeleteToolSupport.
+//
+// resolveDuplicates lets a declared entry win WHOLESALE over the Ollama
+// probe, which is what makes declaring a model against Ollama's own /v1
+// endpoint the documented way to overrule the capability heuristic. That
+// escape hatch is only safe while a declaration can STATE tool support:
+// if probeDeclared dropped the field, using the hatch to correct one
+// attribute would silently remove another, and the model would stop being
+// eligible for tool turns for a reason nothing on the machine reports.
+func TestProbeDeclared_ADeclarationDoesNotDeleteToolSupport(t *testing.T) {
+	api := openAIStub(t, []string{"llama3.1:8b"})
+	dead, _ := ollamaStub(t, nil, nil)
+	dead.Close()
+
+	inv := discovererFor(dead.URL, nil).Probe(context.Background(), Request{
+		Allow: []string{"llama3.1:8b"},
+		Runtimes: []DeclaredRuntime{{
+			Name:    "ollama-openai",
+			BaseURL: api.URL,
+			Models:  []DeclaredModel{{ID: "llama3.1:8b", StructuredOutput: true, Tools: true}},
+		}},
+	})
+	if len(inv.Models) != 1 {
+		t.Fatalf("Models = %+v", inv.Models)
+	}
+	if !inv.Models[0].Tools {
+		t.Errorf("a declaration that states tools must keep them: %+v", inv.Models[0].Attributes)
+	}
+}
+
+// TestDeclaredModel_YAMLKeysAndFailClosedDefaults pins the policy.yaml
+// spelling of what an operator states about a non-Ollama runtime.
+//
+// The declaration is the ONLY source of these for such a runtime: an
+// OpenAI-compatible /v1/models returns ids and nothing else, so a size, a
+// quantization level and tool support that are not written down cannot be
+// observed at all. The keys are pinned because a typo in one is SILENT --
+// yaml drops a key no field claims without a word, so `quantisation:` in
+// a policy.yaml is a file the operator edited, a machine that advertises
+// nothing new, and no message anywhere to connect the two.
+//
+// The three new keys are spelled as the LABEL spells them, deliberately:
+// an operator comparing `quant=Q4_K_M` on the Fleet page against their
+// policy.yaml reads one word in both places. context_window and
+// structured_output are spelled long instead because their label keys
+// (`ctx`, `structured`) are abbreviations nobody would guess from the
+// file.
+//
+// Declaring a field is only half of it. probeDeclared (openai.go) is what
+// turns a declaration into the advertised Attributes, so a field added
+// here without a line there parses cleanly and is dropped on the floor --
+// which looks exactly like an operator who mistyped the key.
+func TestDeclaredModel_YAMLKeysAndFailClosedDefaults(t *testing.T) {
+	const declaration = `
+name: lmstudio
+base_url: http://127.0.0.1:1234/v1
+models:
+  - id: qwen2.5-7b-instruct
+    context_window: 32768
+    structured_output: true
+    max_concurrent: 2
+    params: 7620000000
+    quant: Q4_K_M
+    tools: true
+  - id: states-nothing
+`
+	var rt DeclaredRuntime
+	if err := yaml.Unmarshal([]byte(declaration), &rt); err != nil {
+		t.Fatalf("the declaration did not parse: %v", err)
+	}
+	if len(rt.Models) != 2 {
+		t.Fatalf("models = %+v", rt.Models)
+	}
+	stated := rt.Models[0]
+	if stated.Params != 7620000000 || stated.Quant != "Q4_K_M" || !stated.Tools {
+		t.Errorf("declared params/quant/tools = %+v", stated)
+	}
+	if stated.ContextWindow != 32768 || !stated.StructuredOutput || stated.MaxConcurrent != 2 {
+		t.Errorf("the existing keys must keep parsing: %+v", stated)
+	}
+	// Undeclared is ABSENT, never a zero this side made up. The engine
+	// sorts a model that does not state its size last (D5); a params of 0
+	// invented here would be this machine claiming a size it never read.
+	if silent := rt.Models[1]; silent.Params != 0 || silent.Quant != "" || silent.Tools {
+		t.Errorf("an operator who stated nothing must claim nothing: %+v", silent)
 	}
 }
 
@@ -402,5 +520,40 @@ func TestProbe_DuplicateIdAcrossRuntimes(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(inv.ProbeNotes, " "), "offered by both") {
 		t.Errorf("the shadowed entry must be reported, not silently dropped: %v", inv.ProbeNotes)
+	}
+}
+
+// TestResolvedOllamaBaseURL_IsTheSameAnswerTheProbeUses.
+//
+// The pull path in internal/worker/inference asks this instead of reading
+// OLLAMA_HOST for itself, so the two must be one answer. A second reading
+// that drifted would put a pulled model somewhere the discoverer never
+// looks -- and the operator would watch a pull succeed and the model
+// never appear in the fleet, with nothing anywhere connecting the two.
+func TestResolvedOllamaBaseURL_IsTheSameAnswerTheProbeUses(t *testing.T) {
+	cases := map[string]string{
+		"":                       DefaultOllamaBaseURL,
+		"127.0.0.1:9999":         "http://127.0.0.1:9999",
+		"http://box.local:11434": "http://box.local:11434",
+		"box.local":              "http://box.local:11434",
+	}
+	for host, want := range cases {
+		d := &Discoverer{Getenv: func(k string) string {
+			if k == "OLLAMA_HOST" {
+				return host
+			}
+			return ""
+		}}
+		if got := d.ResolvedOllamaBaseURL(); got != want {
+			t.Errorf("OLLAMA_HOST=%q -> %q, want %q", host, got, want)
+		}
+		if got, internal := d.ResolvedOllamaBaseURL(), d.ollamaBaseURL(); got != internal {
+			t.Errorf("the exported answer %q differs from the probe's %q", got, internal)
+		}
+	}
+	// The explicit override still wins, which is what tests set.
+	d := &Discoverer{OllamaBaseURL: "http://elsewhere:1234/"}
+	if got := d.ResolvedOllamaBaseURL(); got != "http://elsewhere:1234" {
+		t.Errorf("override -> %q", got)
 	}
 }

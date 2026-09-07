@@ -1,9 +1,13 @@
 package worker
 
 import (
+	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
 func offeredModel(id string, attrs models.Attributes) models.Info {
@@ -197,4 +201,125 @@ func TestAdvertisedFingerprint(t *testing.T) {
 	if advertisedFingerprint(nil) != "" {
 		t.Error("no models must fingerprint as the empty string")
 	}
+}
+
+// countingDiscoverer stands in for models.Discoverer so the cache can be
+// exercised without Ollama on the box -- and so a developer machine that
+// HAS Ollama cannot make these pass for the wrong reason.
+type countingDiscoverer struct {
+	mu    sync.Mutex
+	calls int
+	inv   models.Inventory
+}
+
+func (c *countingDiscoverer) Discover(ctx context.Context, req models.Request) models.Inventory {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return c.inv
+}
+
+func (c *countingDiscoverer) serve(inv models.Inventory) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.inv = inv
+}
+
+func (c *countingDiscoverer) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// testInventory builds the real reporter over a fake discoverer and a
+// clock the test moves by hand: the TTL is 90 seconds of WALL clock, and
+// a test that waited it out would spend 90 seconds of CI.
+func testInventory(d *countingDiscoverer, now *time.Time) *policyModelInventory {
+	return &policyModelInventory{
+		discoverer: d,
+		policy:     tools.DefaultPolicy(),
+		ttl:        DefaultModelInventoryTTL,
+		now:        func() time.Time { return *now },
+	}
+}
+
+// TestModelInventory_CachesWithinItsTTL. Discovery is one HTTP call to
+// list what is installed plus one per model to ask what it can do, and it
+// is taken on every registration, every refresh check and every model
+// call that resolves a model.
+func TestModelInventory_CachesWithinItsTTL(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	d := &countingDiscoverer{}
+	d.serve(servingInventory(offeredModel("llama3.1:8b", models.Attributes{ContextWindow: 8192, MaxConcurrent: 1})))
+	inv := testInventory(d, &clock)
+
+	for i := 0; i < 3; i++ {
+		if got := len(inv.Models(context.Background()).Advertised()); got != 1 {
+			t.Fatalf("read %d advertised %d models", i, got)
+		}
+		clock = clock.Add(10 * time.Second)
+	}
+	if d.count() != 1 {
+		t.Errorf("discovery ran %d times inside the TTL, want once", d.count())
+	}
+	clock = clock.Add(DefaultModelInventoryTTL)
+	inv.Models(context.Background())
+	if d.count() != 2 {
+		t.Errorf("discovery ran %d times, want a fresh probe once the TTL expired", d.count())
+	}
+}
+
+// TestModelInventory_InvalidateMakesTheCacheHonestAboutAPull.
+//
+// This is the silent failure the whole method exists for. A model pulled
+// a moment ago is not in a cache taken 30 seconds before it, so a
+// re-advertise triggered immediately after a pull would re-register the
+// OLD label set: the reconnect happens, the person watching sees nothing
+// appear, and the pull reads as one that did nothing.
+func TestModelInventory_InvalidateMakesTheCacheHonestAboutAPull(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	d := &countingDiscoverer{}
+	d.serve(servingInventory(offeredModel("llama3.1:8b", models.Attributes{ContextWindow: 8192, MaxConcurrent: 1})))
+	inv := testInventory(d, &clock)
+
+	before := advertisedFingerprint(inv.Models(context.Background()).Labels())
+
+	// The pull lands, and the allow list already names it.
+	d.serve(servingInventory(
+		offeredModel("llama3.1:8b", models.Attributes{ContextWindow: 8192, MaxConcurrent: 1}),
+		offeredModel("nomic-embed-text", models.Attributes{ContextWindow: 2048, Embeddings: true, MaxConcurrent: 4}),
+	))
+	clock = clock.Add(time.Second)
+
+	// Without the invalidation the cache would still be inside its TTL
+	// and would answer with the set from before the pull. Assert that,
+	// so the next reader knows what Invalidate is buying.
+	if got := advertisedFingerprint(inv.Models(context.Background()).Labels()); got != before {
+		t.Fatalf("the cache answered a fresh set without being asked to: %q", got)
+	}
+
+	inv.Invalidate()
+	after := advertisedFingerprint(inv.Models(context.Background()).Labels())
+	if after == before {
+		t.Fatal("Invalidate did not force a fresh probe: a pull would look like it did nothing")
+	}
+	if d.count() != 2 {
+		t.Errorf("discovery ran %d times, want two: the first read and the forced re-probe, with the read between them served from the cache", d.count())
+	}
+
+	// And the fresh result is cached in its turn: invalidating is a
+	// one-shot, not a switch that turns the cache off.
+	clock = clock.Add(time.Second)
+	inv.Models(context.Background())
+	if d.count() != 2 {
+		t.Errorf("discovery ran %d times after the re-probe, want the result cached again", d.count())
+	}
+}
+
+// TestModelInventory_InvalidateIsSafeOnANilReceiver. The runner calls
+// this from the pull path, where the inventory is nil in any build that
+// reports no models at all.
+func TestModelInventory_InvalidateIsSafeOnANilReceiver(t *testing.T) {
+	var p *policyModelInventory
+	p.Invalidate()
 }

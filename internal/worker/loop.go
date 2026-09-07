@@ -37,7 +37,9 @@ const (
 	// modelRefreshInterval is how often the offered set is re-checked.
 	modelRefreshInterval = 60 * time.Second
 	// modelReadvertiseMinInterval floors the gap between two
-	// model-triggered reconnects.
+	// model-triggered reconnects. RequestImmediateReadvertise is its one
+	// exception, and the only one: see that method for why a pull
+	// somebody is watching does not wait it out.
 	modelReadvertiseMinInterval = 2 * time.Minute
 )
 
@@ -59,6 +61,19 @@ type Runner struct {
 	active          sync.WaitGroup
 	activeCalls     atomic.Int64
 	lastReadvertise atomic.Int64
+
+	// pendingReadvertise is the one-shot floor bypass armed by
+	// RequestImmediateReadvertise, and readvertiseNow is how that
+	// request wakes the heartbeat loop instead of waiting up to
+	// modelRefreshInterval for the next tick. Buffered with room for
+	// ONE: a burst of pulls is one evaluation, not one reconnect each.
+	pendingReadvertise atomic.Bool
+	readvertiseNow     chan struct{}
+
+	// now is the clock the re-advertise guards read. Injectable because
+	// the floor is two minutes of WALL clock, and a test that waited it
+	// out would spend two minutes of every CI run.
+	now func() time.Time
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -108,6 +123,11 @@ func NewRunner(opts Options) (*Runner, error) {
 		heartbeat: hb,
 		metrics:   opts.Metrics,
 		closed:    make(chan struct{}),
+		// Room for one. A nil channel would be safe (both the send and
+		// the receive sit in a select), but it would make every request
+		// wait for the refresh ticker, which is the wait this exists to
+		// remove.
+		readvertiseNow: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -242,6 +262,13 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 			return
 		case <-refresh.C:
 			r.maybeReadvertiseModels(ctx, conn)
+		case <-r.readvertiseNow:
+			// A pull just finished with somebody watching. Evaluating
+			// here rather than at the next refresh tick is the
+			// difference between a model that appears now and one that
+			// appears in up to a minute -- and a minute of nothing
+			// happening reads as a pull that failed.
+			r.maybeReadvertiseModels(ctx, conn)
 		case <-t.C:
 			// The inventory is re-taken on every beat rather than
 			// captured at connect. The engine applies an inventory
@@ -268,7 +295,8 @@ func (r *Runner) modelInventory(ctx context.Context) models.Inventory {
 }
 
 // maybeReadvertiseModels ends the stream when what this machine offers
-// has changed, so the reconnect re-registers with the new labels.
+// has changed, so the reconnect re-registers with the new labels. It
+// reports whether it did.
 //
 // Three guards, each closing a different failure:
 //
@@ -280,22 +308,39 @@ func (r *Runner) modelInventory(ctx context.Context) models.Inventory {
 //   - Nothing happens twice inside modelReadvertiseMinInterval. A runtime
 //     flapping between up and down would otherwise turn this worker into
 //     one that reconnects forever, which is worse than a stale label.
-func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) {
+//
+// The THIRD guard, and only the third, has an exception: a one-shot
+// request from RequestImmediateReadvertise. It is spent by the reconnect
+// it asks for and by nothing else. An early return leaves it armed --
+// busy, or labels that have not changed YET because the policy reload
+// naming the new model landed a moment after the request -- so the next
+// evaluation still gets the bypass, rather than the machine that was
+// mid-call being the one that waits out the floor.
+func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) bool {
 	if r == nil || r.modelsInv == nil || conn == nil {
-		return
+		return false
 	}
 	current := advertisedFingerprint(r.modelInventory(ctx).Labels())
 	if current == conn.ModelFingerprint {
-		return
+		return false
 	}
 	if r.busy() {
 		r.logger.Debug("model inventory changed; deferring re-advertisement until this worker is idle")
-		return
+		return false
 	}
-	now := time.Now()
+	now := r.clock()
 	last := r.lastReadvertise.Load()
 	if last != 0 && now.Sub(time.Unix(0, last)) < modelReadvertiseMinInterval {
-		return
+		// Swap rather than Load: the bypass must be consumed by the one
+		// reconnect it paid for. Left armed, it would sit there and let
+		// a flapping runtime through the floor at some unrelated later
+		// moment.
+		if !r.pendingReadvertise.Swap(false) {
+			return false
+		}
+		r.logger.Info("a watched model pull changed this machine's model set; re-advertising without waiting out the floor")
+	} else {
+		r.pendingReadvertise.Store(false)
 	}
 	r.lastReadvertise.Store(now.UnixNano())
 	r.logger.Info("local model inventory changed; reconnecting to re-advertise",
@@ -305,6 +350,67 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) {
 	// which returns and lets Run reconnect. There is no lighter way to
 	// re-register: the engine binds labels at the handshake.
 	conn.Close()
+	return true
+}
+
+// RequestImmediateReadvertise says the local model set just changed and
+// SOMEBODY IS WATCHING -- the caller pulled a model, on purpose, in
+// front of a person who pressed a button.
+//
+// Two things happen, and they are one call because a caller that did
+// only the first would ship the bug this method exists to prevent:
+//
+//  1. The cached inventory is dropped. Discovery is cached for
+//     DefaultModelInventoryTTL, and a model pulled a moment ago is not in
+//     a probe taken a minute before it. Re-advertising without this
+//     spends a reconnect to re-register the labels from BEFORE the pull:
+//     the reconnect happens, nothing changes, and the pull reads to the
+//     person watching as one that did nothing.
+//  2. The two-minute floor is waived for the next evaluation, once. Two
+//     minutes of a model that does not appear is indistinguishable from
+//     a failed pull, and the person is looking at the screen.
+//
+// The BUSY guard is NOT waived, deliberately. A reconnect that kills a
+// running model call or an hour-old app session is worse than a label
+// that is a minute stale, and somebody watching a pull is not a reason
+// to throw away somebody else's work. The request survives that wait.
+//
+// WHO CALLS IT, and from where. Only something inside THIS process can,
+// and the cockpit's own pull path runs in another one: `memql worker
+// models --pull` and `memql worker setup --inference` reach the running
+// worker through the SIGHUP they already send after writing
+// models.allow, and the handler in cli.go asks for this after reloading
+// the policy -- a reloaded allow list that nobody re-advertised is a
+// model the cluster still cannot see. The engine's ModelPullStart arm
+// will call it directly. That last is a statement about the wire rather
+// than a plan: ModelPullStart / ModelPullProgress / ModelPullEnd are not
+// in the pinned proto (engine epic memql#5103), so the arm does not
+// exist and is deliberately not written here.
+func (r *Runner) RequestImmediateReadvertise() {
+	if r == nil {
+		return
+	}
+	r.pendingReadvertise.Store(true)
+	if r.modelsInv != nil {
+		r.modelsInv.Invalidate()
+	}
+	select {
+	case r.readvertiseNow <- struct{}{}:
+	default:
+		// Already woken and not yet evaluated, or no loop running (the
+		// worker is reconnecting). Either way the arm above is what
+		// carries the request; a second token would only buy a second
+		// evaluation of the same answer.
+	}
+}
+
+// clock reads the injectable time source, defaulting to time.Now for
+// every runner but the ones tests build.
+func (r *Runner) clock() time.Time {
+	if r != nil && r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 // busy reports whether this worker has work a reconnect would interrupt.

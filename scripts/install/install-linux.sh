@@ -59,6 +59,11 @@ Options:
     --name <name>             Worker name (default: hostname -s)
     --computeruse                     Install the computer-use variant. Wayland only
                               registers HEADLESS; X11 enables the COMPUTERUSE capability.
+    --inference               Also set this machine up to serve local models:
+                              install a model runtime, pull the default models,
+                              and write models.allow. A runtime install this
+                              cannot approve unattended is reported with the
+                              command for you to run; the install still succeeds.
     --user-local              Install under \$HOME/.memql/bin instead of
                               /usr/local/bin. Use when sudo isn't
                               available (CI, restricted environments).
@@ -81,6 +86,7 @@ function parse_args() {
     FORCE="no"
     INSTALL_SERVICE="yes"
     INSTALL_MODE="system"  # default: sudo-gated /usr/local/bin (#66)
+    INFERENCE="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -88,6 +94,7 @@ function parse_args() {
             --cluster)       CLUSTER_URL="$2"; shift 2 ;;
             --name)          NAME="$2"; shift 2 ;;
             --computeruse)           FLAVOUR="computeruse"; shift ;;
+            --inference)     INFERENCE="yes"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
             --force)         FORCE="yes"; shift ;;
@@ -244,6 +251,14 @@ function main() {
     install_binary
     write_config
     install_systemd_unit
+    # AFTER the unit, not before: `worker setup --inference` ends by
+    # signalling the running worker to re-read policy.yaml, and a worker
+    # that is not running yet is one it can only report it could not
+    # find. Its own refusals never fail this install -- see
+    # setup_inference.
+    if [[ "$INFERENCE" == "yes" ]]; then
+        setup_inference "$INSTALLED_BINARY"
+    fi
 
     cat << EOF
 

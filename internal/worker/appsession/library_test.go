@@ -264,3 +264,90 @@ func TestArtifactName_KeepsTheLocation(t *testing.T) {
 		t.Error("two files with the same basename collapsed to one artifact name")
 	}
 }
+
+// TestLibraryStatusError_401SaysWhatIsActuallyWrong pins the sentence a 401
+// produces, because that sentence is the whole deliverable of
+// memql-cockpit#371 and its previous version sent people to the wrong place.
+//
+// The assertions are on WORDS rather than on a byte-exact string. What must
+// survive a rewrite is that the operator is pointed at renewal and away from
+// the class reading that memql#4863 retired; the exact phrasing is allowed to
+// improve without a test failure that teaches nothing.
+func TestLibraryStatusError_401SaysWhatIsActuallyWrong(t *testing.T) {
+	err := libraryStatusError("input", "v1:library:artifact:abc", &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Status:     "401 Unauthorized",
+	})
+	if err == nil {
+		t.Fatal("a 401 must be an error")
+	}
+	got := err.Error()
+
+	for _, want := range []string{
+		"401",
+		"v1:library:artifact:abc",
+		"expired",
+		"renew_credential",
+		"app_session",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the 401 sentence must mention %q; got:\n%s", want, got)
+		}
+	}
+
+	// The retired reading. Before memql#4863 the app-session back-channel
+	// was minted as class="service_account" and the Library's byte routes
+	// pinned that class off, so a 401 meant "wrong class" and the sentence
+	// said "expired or malformed" -- wrong on both counts. Naming
+	// "malformed" again would resurrect a diagnosis nobody can act on: the
+	// engine's verify path is JWKS-only, so a malformed bearer and an
+	// expired one are indistinguishable from here anyway.
+	if strings.Contains(got, "malformed") {
+		t.Errorf("the 401 sentence must not claim the bearer is malformed; got:\n%s", got)
+	}
+}
+
+// TestLibraryStatusError_AuthAndAuthorizationStayApart. A 403 is the owning
+// user's access, not a login failure, and folding the two together is how an
+// operator ends up re-running `memql login` against a working session.
+func TestLibraryStatusError_AuthAndAuthorizationStayApart(t *testing.T) {
+	forbidden := libraryStatusError("input", "id", &http.Response{
+		StatusCode: http.StatusForbidden,
+		Status:     "403 Forbidden",
+	}).Error()
+	if strings.Contains(forbidden, "renew_credential") {
+		t.Errorf("a 403 must not be reported as a credential problem; got:\n%s", forbidden)
+	}
+	if !strings.Contains(forbidden, "403") {
+		t.Errorf("a 403 must name its status; got:\n%s", forbidden)
+	}
+
+	notFound := libraryStatusError("input", "id", &http.Response{
+		StatusCode: http.StatusNotFound,
+		Status:     "404 Not Found",
+	}).Error()
+	if strings.Contains(notFound, "renew_credential") {
+		t.Errorf("a 404 must not be reported as a credential problem; got:\n%s", notFound)
+	}
+}
+
+// TestPushReportsA401TheSameWayAPullDoes. A run pulls its inputs at the start
+// and pushes its output at the end, which can be an hour apart -- long enough
+// for one credential to expire between them. Reporting the second half of that
+// single event as a bare "401 Unauthorized" made it look like a different
+// problem from the first.
+func TestPushReportsA401TheSameWayAPullDoes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	lib := NewLibrary(srv.URL, "token", srv.Client())
+	_, err := lib.PushBytes(context.Background(), []byte("hello"), "out.txt")
+	if err == nil {
+		t.Fatal("a 401 on push must be an error")
+	}
+	if !strings.Contains(err.Error(), "renew_credential") {
+		t.Errorf("push must point at renewal the way pull does; got:\n%s", err)
+	}
+}

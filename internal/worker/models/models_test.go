@@ -13,8 +13,23 @@ import "testing"
 // apps.go already does with the engine's app id set: mirror, and name the
 // source.
 //
-// Sources: `ModelCapability`, `ModelLabelPrefix` and `RuntimeLabelPrefix`
-// in memql component/worker/modelcall.go.
+// Sources, read at the pinned sha 5c4f6ae9679e97609c115ec484ed1aa16edebd7a:
+// memql component/worker/modelcall.go:399 (ModelCapability), :428
+// (ModelLabelPrefix), :434 (RuntimeLabelPrefix); memql
+// integrations/agent/worker/model_routing.go:98-103 (the attribute key
+// const block: ctx, structured, embeddings, max).
+//
+// params, quant and tools are pinned here even though the engine at that
+// pin parses NONE of them, and that inversion is the point: the cockpit
+// ships the spelling FIRST (the engine half is memql#5096, unmerged when
+// this landed), so for those three this test is the DEFINITION the
+// engine's ModelAttributes must match rather than a transcription of it.
+// The spellings come from the design record -- D5 for params=<count> and
+// quant=<level>, D6 and D11 for tools. A synonym invented here is free to
+// write and costs the whole feature silently: the engine's parser skips a
+// key it does not know, so a mismatch raises nothing anywhere -- it is a
+// fleet that never ranks by size and never routes a tool turn, with
+// nothing logged on either side.
 func TestWireContract(t *testing.T) {
 	if Capability != "MODEL" {
 		t.Errorf("Capability = %q, engine says %q", Capability, "MODEL")
@@ -30,6 +45,20 @@ func TestWireContract(t *testing.T) {
 	}
 	if got := RuntimeLabel(KindOpenAICompatible); got != "runtime:openai-compatible" {
 		t.Errorf("RuntimeLabel = %q, want %q", got, "runtime:openai-compatible")
+	}
+
+	for _, tc := range []struct{ got, want, source string }{
+		{attrContext, "ctx", "model_routing.go:99"},
+		{attrStructured, "structured", "model_routing.go:100"},
+		{attrEmbeddings, "embeddings", "model_routing.go:101"},
+		{attrMax, "max", "model_routing.go:102"},
+		{attrParams, "params", "design D5"},
+		{attrQuant, "quant", "design D5"},
+		{attrTools, "tools", "design D6 and D11"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("attribute key = %q, %s says %q", tc.got, tc.source, tc.want)
+		}
 	}
 }
 
@@ -47,11 +76,27 @@ func TestAttributesString(t *testing.T) {
 		in   Attributes
 		want string
 	}{
-		{"everything", Attributes{ContextWindow: 131072, StructuredOutput: true, Embeddings: true, MaxConcurrent: 2},
-			"ctx=131072,structured=1,embeddings=1,max=2"},
+		{"everything", Attributes{ContextWindow: 131072, StructuredOutput: true, Embeddings: true, MaxConcurrent: 2,
+			Params: 8000000000, Quant: "Q4_K_M", Tools: true},
+			"ctx=131072,structured=1,embeddings=1,max=2,params=8000000000,quant=Q4_K_M,tools=1"},
+		// The plan's worked example, character for character
+		// (docs/superpowers/plans/2026-09-06-fleet-inference-and-app-door.md,
+		// PR 1 Task 1 "Interfaces"). The key ORDER is part of the
+		// contract, not a rendering detail: the engine reads the value as
+		// a set, but the cockpit re-sends it on every reconnect, and a
+		// value whose order drifted would rewrite the registration row
+		// for no change.
+		{"the plan's example", Attributes{ContextWindow: 131072, StructuredOutput: true, MaxConcurrent: 2,
+			Params: 8000000000, Quant: "Q4_K_M", Tools: true},
+			"ctx=131072,structured=1,max=2,params=8000000000,quant=Q4_K_M,tools=1"},
 		{"context only", Attributes{ContextWindow: 8192}, "ctx=8192"},
 		{"embeddings model", Attributes{ContextWindow: 512, Embeddings: true, MaxConcurrent: 4},
 			"ctx=512,embeddings=1,max=4"},
+		// Size without capability. params and quant are ORDERING signals
+		// (D5), not gates, so a model can be the biggest on the fleet and
+		// still be ineligible for every prompt that needs a capability.
+		{"size but nothing claimed", Attributes{Params: 70000000000, Quant: "Q4_0"},
+			"params=70000000000,quant=Q4_0"},
 		// The fail-closed direction, rendered: a model this machine can
 		// say nothing about produces an EMPTY value, not a value full of
 		// zeroes and falses. The engine reads both the same way; the
@@ -70,6 +115,54 @@ func TestAttributesString(t *testing.T) {
 	}
 }
 
+// TestAttributesRoundTrip drives the round trip from the STRUCT side, so
+// the two halves are pinned without a hand-written literal in between.
+//
+// It is what says the cockpit and the engine can be reasoned about as one
+// encoding: whatever a probe puts in Attributes is what a reader of the
+// label gets back, and a field added to the struct without a key, or with
+// a key String emits and ParseAttributes ignores, fails here rather than
+// in a fleet that silently stopped ranking by size.
+func TestAttributesRoundTrip(t *testing.T) {
+	for _, in := range []Attributes{
+		{},
+		{ContextWindow: 131072, StructuredOutput: true, Embeddings: true, MaxConcurrent: 6,
+			Params: 8030261248, Quant: "Q4_K_M", Tools: true},
+		{Params: 1500000000, Quant: "F16"},
+		{Params: 405000000000, Quant: "IQ2_XXS", Tools: true, MaxConcurrent: 1},
+		{ContextWindow: 2048, Embeddings: true, Params: 137000000, Quant: "F16", MaxConcurrent: 4},
+	} {
+		rendered := in.String()
+		if got := ParseAttributes(rendered); got != in {
+			t.Errorf("ParseAttributes(%q) = %+v, want %+v", rendered, got, in)
+		}
+		if again := ParseAttributes(rendered).String(); again != rendered {
+			t.Errorf("re-rendering %q produced %q; the label must be byte-stable", rendered, again)
+		}
+	}
+}
+
+// TestAttributesString_QuantCannotForgeAnAttribute.
+//
+// quant is the ONLY free-text attribute in a delimiter-separated list, so
+// it is the only one that can forge a second attribute out of a runtime's
+// string. A value carrying a comma or an '=' is dropped WHOLE rather than
+// escaped or truncated: quant gates nothing, so losing it costs an
+// ordering tiebreak, while emitting it costs the integrity of every
+// attribute standing beside it.
+func TestAttributesString_QuantCannotForgeAnAttribute(t *testing.T) {
+	for _, q := range []string{"Q4_K_M,max=999", "Q4=K", "Q4\nK", "Q4\tK", "", "   "} {
+		if got := (Attributes{ContextWindow: 4096, Quant: q}).String(); got != "ctx=4096" {
+			t.Errorf("quant %q rendered as %q; an unsafe quant must be dropped whole", q, got)
+		}
+	}
+	// Interior whitespace survives, because it cannot forge anything and
+	// dropping it would lose a level an operator can read.
+	if got := (Attributes{Quant: "Q4 K M"}).String(); got != "quant=Q4 K M" {
+		t.Errorf("String() = %q, want the level kept", got)
+	}
+}
+
 // TestParseAttributes_FailsClosed. Every unreadable input costs
 // eligibility rather than granting it -- the direction that turns a
 // garbled label into "this machine is not picked for structured prompts"
@@ -77,7 +170,10 @@ func TestAttributesString(t *testing.T) {
 func TestParseAttributes_FailsClosed(t *testing.T) {
 	for _, in := range []string{
 		"ctx=notanumber,structured=maybe,embeddings=perhaps,max=lots",
-		"ctx=-1,max=0",
+		"params=notanumber,quant=,tools=maybe",
+		"params=8e9",  // the label carries a COUNT, never a human string
+		"params=8.0B", // likewise: the conversion happens on this side
+		"ctx=-1,max=0", "params=-1", "params=0",
 		"garbage",
 		"",
 		"structured", // no '=' at all
@@ -91,11 +187,22 @@ func TestParseAttributes_FailsClosed(t *testing.T) {
 		if !ParseAttributes("structured=" + yes).StructuredOutput {
 			t.Errorf("structured=%s should parse true", yes)
 		}
+		if !ParseAttributes("tools=" + yes).Tools {
+			t.Errorf("tools=%s should parse true", yes)
+		}
 	}
 	for _, no := range []string{"0", "false", "no", "on", "enabled", "sure"} {
 		if ParseAttributes("structured=" + no).StructuredOutput {
 			t.Errorf("structured=%s must NOT parse true", no)
 		}
+		if ParseAttributes("tools=" + no).Tools {
+			t.Errorf("tools=%s must NOT parse true", no)
+		}
+	}
+	// A quant that String would never emit is not accepted back either,
+	// so the set of levels that survive a round trip is closed.
+	if got := ParseAttributes("quant=Q4=K").Quant; got != "" {
+		t.Errorf("quant = %q, want it refused: String cannot have emitted it", got)
 	}
 }
 
@@ -150,14 +257,21 @@ func TestLabels_ShapeAndRuntimes(t *testing.T) {
 	inv := Inventory{
 		Floor: FloorVerdict{Met: true},
 		Models: []Info{
-			offered("llama3.1:8b", Attributes{ContextWindow: 131072, StructuredOutput: true, MaxConcurrent: 1}),
+			offered("llama3.1:8b", Attributes{ContextWindow: 131072, StructuredOutput: true, MaxConcurrent: 1,
+				Params: 8000000000, Quant: "Q4_K_M", Tools: true}),
 			{ID: "qwen2.5-7b", Kind: KindOpenAICompatible, Runtime: "lmstudio", Allowed: true,
 				Attributes: Attributes{ContextWindow: 32768, StructuredOutput: true, MaxConcurrent: 1}},
 		},
 	}
 	labels := inv.Labels()
-	if got := labels["model:llama3.1:8b"]; got != "ctx=131072,structured=1,max=1" {
+	if got := labels["model:llama3.1:8b"]; got != "ctx=131072,structured=1,max=1,params=8000000000,quant=Q4_K_M,tools=1" {
 		t.Errorf("model label = %q", got)
+	}
+	// The declared entry claimed no size, and says so by omission rather
+	// than by zeroes: D5 sorts a model that does not state its size LAST,
+	// and params=0 would be a claim that it has none.
+	if got := labels["model:qwen2.5-7b"]; got != "ctx=32768,structured=1,max=1" {
+		t.Errorf("declared model label = %q", got)
 	}
 	if _, ok := labels["runtime:ollama"]; !ok {
 		t.Error("missing runtime:ollama")

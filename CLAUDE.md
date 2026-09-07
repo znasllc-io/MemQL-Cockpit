@@ -105,11 +105,15 @@ memql-cockpit/
 │   │                       (shell, fs, http; computeruse adds screenshot /
 │   │                       mouse / keyboard / window via RobotGo);
 │   │                       apps/ (local-app detection) + appsession/
-│   │                       (the app-session runner) -- see Local apps;
+│   │                       (the app-session runner) + harness/ (the
+│   │                       per-app protocol clients) -- see Local apps;
 │   │                       models/ (runtime discovery + the hardware
 │   │                       floor) + modelcall/ (the ModelCall server)
-│   │                       -- see Local models; backup/ (the watched-folder
-│   │                       sweeper) -- see Watched-folder backup
+│   │                       -- see Local models; inference/ (runtime
+│   │                       install, model pull, models.allow) -- see
+│   │                       Setting a machine up; backup/ (the
+│   │                       watched-folder sweeper) -- see Watched-folder
+│   │                       backup
 │   ├── lint/               `memql lint` — author-facing DSL validator
 │   └── setupproject/       `memql setup project` — stamps a memql-project
 │                           workspace (stdin prompts when flags are absent)
@@ -120,7 +124,9 @@ memql-cockpit/
 ├── deploy/systemd/         memql-worker.service template (user systemd)
 ├── docs/                   computer-use.md, local-apps.md,
 │                           local-models.md, watched-folders.md;
-│                           docs/superpowers/specs/ designs
+│                           docs/superpowers/specs/ designs (the plans
+│                           beside them are deleted by the PR that
+│                           finishes them; the specs are the record)
 └── .github/memql-pin       THE pin. Single source of truth
 ```
 
@@ -156,6 +162,31 @@ machine side.
   `AppSessionStart / Chunk / Control / End`, kinds `run` / `open` / `attach`,
   plus the MCP config writer, the Library pull/push, and the platform launch
   paths.
+- **`internal/worker/harness`** drives each app through its OWN protocol
+  (memql#5096's cockpit half): `claude-headless`, `codex-app-server`, and
+  `codex-mcp` as the fallback. It replaced a parser for terminal output.
+
+**A SESSION IS A SEQUENCE OF TURNS**, and that shape is forced rather than
+chosen: neither app offers a process you can keep feeding. Claude Code is one
+prompt per process resumed by `session_id`; Codex takes one turn per
+app-server request. An `AppSessionControl` with `action="message"` starts the
+next turn. It also makes credential renewal honest -- the replacement lands
+when the next process starts, rather than pretending to reach a running one.
+
+**THE HARNESS IS PER MACHINE, NOT PER APP ID.** Two harnesses answer to
+`codex`, and only this machine can run `codex app-server --help` to find out
+which. `apps.Specs()` carries the FLOOR (`codex-mcp`); `Detector.ResolveSpec`
+is what upgrades it, and the session runner must use that rather than
+`apps.SpecFor` or it drives every Codex through the fallback. Codex's MCP
+config travels as `CODEX_HOME` in the environment and Claude Code's as
+`--mcp-config`; getting that backwards leaves one of them with no tools and
+no error.
+
+**`codex mcp-server` reports no usage and cannot constrain output**, and both
+are reported as absent rather than guessed -- its own token events are
+documented as "accumulated, estimated, or replayed", and its tool schema is
+`additionalProperties: false`, so an invented output-schema argument is
+REFUSED rather than ignored.
 
 Four rules here are load-bearing, and each is the kind that fails silently:
 
@@ -233,6 +264,89 @@ present but unlisted is REPORTED as blocked rather than omitted. Usage
 rides on `ModelCallEnd` exactly as the runtime reported it -- silence stays
 silence, which the engine records as billing "unknown".
 
+**The label carries `params`, `quant` and `tools` as well as `ctx`,
+`structured`, `embeddings` and `max`** -- the engine ranks a fleet on size
+(parameters descending, then context) and skips a machine whose runtime
+cannot carry a tool turn. `params` is a COUNT, not Ollama's `"8.0B"`,
+because "70B" sorts before "8.0B" as text. Both are ORDERING signals:
+`Satisfies` does not read them and a model that states no size is still
+served, it just sorts last -- silence never makes a model the strongest.
+`quant` is the only free-text value in a comma-and-equals delimited label,
+so a level carrying either character is dropped whole rather than escaped
+(`quantSafe`); without that, a runtime string could forge a second
+attribute the machine never claimed.
+
+**The engine parses none of the three at the current pin.** memql#5096
+has not merged, so this repository is DEFINING those keys and
+`TestWireContract` says so rather than pretending to transcribe. That is
+safe only in this direction, because the engine's parser skips a key it
+does not know -- which is also why a synonym invented on either side
+raises nothing anywhere and is simply a fleet that never ranks by size.
+
+
+## Setting a machine up to run models (epic memql-cockpit#387)
+
+`memql worker setup --inference` takes a machine from bare to advertising a
+model: floor check, runtime installed if absent, models pulled with
+progress, `models.allow` written, worker signalled.
+`internal/worker/inference/`, plus `--inference` on both installers.
+The engine half is epic memql#5103. Operator doc:
+[docs/local-models.md](docs/local-models.md).
+
+**`Decide` is a PURE FUNCTION of `Host`.** Every platform question is
+answered into the struct by build-tagged files, so the decision is
+table-testable on fixtures with no build tags and no real machine -- and
+every path is asserted on the exact SENTENCE it prints, which makes
+changing the words a thing somebody does on purpose. Those sentences are
+the entire product for a person who is blocked.
+
+**Docker on Linux, native Ollama on Apple Silicon, and never sudo.** A
+container has no GPU access on macOS, so Ollama there would serve on the
+CPU -- which is what the hardware floor exists to prevent. The cockpit
+RUNS no sudo command; it may PRINT one for the person, and the copy says
+which is which. There is no ROCm equivalent of the NVIDIA container
+toolkit: for AMD the device nodes are the passthrough and the missing
+piece is `amdgpu-dkms`, so reaching for a symmetric package name produces
+a refusal naming something nobody can install.
+
+**The pull is `POST /api/pull`, NOT `ollama pull`**, and the design
+record's plan naming a subprocess was wrong on the platform its own D1
+chose: a Linux machine set up by this command runs the runtime in a
+CONTAINER and has no `ollama` on PATH at all. The HTTP route also gives
+exact byte counts where the CLI gives a TTY progress bar. **A 200 is not
+success** -- Ollama emits `pulling manifest` before it fetches anything,
+so a failure arrives inside an already-started 200 body, the same trap
+`/memql/query` sets. Absence of the closing `{"status":"success"}` is
+failure too, because the other direction advertises a half-pulled model.
+`Completed`/`Total` are PER LAYER and restart for each blob.
+
+**`Allow` is a targeted textual edit, not a YAML round trip.** yaml.v3
+load-modify-save re-indents sequences, drops blank lines and re-quotes
+scalars; the parse decides only what and where. Where it cannot edit
+textually it REFUSES and names the line, rather than reformatting an
+operator's commented `policy.yaml` behind their back.
+
+**`models.pull` is default-TRUE**, the opposite of `models.allow` beside
+it, and the field is a `*bool` for that reason -- a plain bool reads an
+absent key as false and would have switched pulls off on every
+`policy.yaml` already on disk. Allowing a model spends this machine's GPU
+on somebody else's prompt; pulling one is its owner acting on their own
+machine.
+
+**A SIGHUP reloads policy; it does not make the model visible.** Labels
+bind at `Register`, so visibility needs a reconnect --
+`Runner.RequestImmediateReadvertise` arms a one-shot bypass of the
+two-minute floor and invalidates the 90-second inventory cache in the same
+call, because a re-advertise that re-registered the pre-pull labels looks
+exactly like a pull that did nothing. It never bypasses the BUSY guard: a
+reconnect that interrupts a running model call is worse than a stale
+label. Never print "your model is available now".
+
+**The `ModelPull*` wire does not exist yet** (memql#5103). Everything its
+dispatch arm would call is live and reachable through
+`memql worker models --pull`; no arm was written for a message type that
+is not there.
+
 
 ## Watched-folder backup (memql#4841)
 
@@ -249,10 +363,18 @@ that is the complexity cliff this sits on the safe side of, and a test asserts
 the sweeper sends no destructive call at all.
 
 **The credential is the SIGNED-IN USER'S, and it has to be.** The Library's
-HTTP routes resolve an actor only for a `class="user"` (or classless) bearer;
-the engine pins every machine class off that surface deliberately. So the
-`mql_wkr_` token this process authenticates its STREAM with cannot reach
-`/artifacts`, and neither can a PAT (PATs verify only on the identity node).
+HTTP routes gate on the actor RESOLVING TO A USER -- the upload path stamps
+`ownerUserId` from `actor.userId`, so a credential with no user behind it has
+nowhere to put the bytes. The `mql_wkr_` token this process authenticates its
+STREAM with is one of those: it names a machine, is admitted on WorkerService
+and nowhere else, and no HTTP middleware reads it. Neither can a PAT (PATs
+verify only on the identity node). **The rule is not "class must be `user`"** --
+since memql#4863 an app session's back-channel is `class="app_session"` whose
+`sub` is the owning user's id, and `/artifacts` admits it, which is what makes
+`appsession`'s Library pull and push work; the classes that stay off the
+surface are the ones naming a MACHINE. The sweeper runs as the person anyway,
+and for its own reason: a folder backup is that person's files moving and must
+not wait on a delegated run's short-lived credential existing.
 A machine that is paired but not signed in backs nothing up, which is the
 ordinary state of a fresh worker and must not be a startup failure --
 `backupBearer` returns nil and the manager is a working no-op. The sign-in is
