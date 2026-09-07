@@ -88,6 +88,17 @@ const (
 	attrParams     = "params"
 	attrQuant      = "quant"
 	attrTools      = "tools"
+
+	// The four MODALITY keys (engine memql#5137, record D4). Same
+	// situation as the three above and one step further out: the engine
+	// half has not merged, so this repository is DEFINING these
+	// spellings rather than transcribing them. A misspelling costs a
+	// fleet that never routes a vision turn and raises nothing
+	// anywhere, which is why TestWireContract pins all four.
+	attrVision   = "vision"
+	attrAudioIn  = "audioin"
+	attrAudioOut = "audioout"
+	attrImageGen = "imagegen"
 )
 
 // Attributes is what this machine claims about ONE model.
@@ -140,6 +151,34 @@ type Attributes struct {
 	// runtime can carry a tool call" one claim that no single source
 	// actually establishes.
 	Tools bool
+
+	// The four modalities (engine memql#5137, record D4). Each is
+	// false unless a RUNTIME PROBE confirmed it, and the package's
+	// fail-closed rule bites hardest here: three of the four have no
+	// capability any runtime reports, so the honest answer for them on
+	// a bare Ollama is silence, and the operator's declaration under a
+	// declared runtime is the only source that can say otherwise.
+	//
+	// A modality inferred from a model NAME would be the worst version
+	// of this. "kokoro" in an id is not a runtime that answered, and a
+	// machine advertising audioout on that basis takes a speech call it
+	// cannot serve -- with the failure landing on somebody else's
+	// prompt, three layers from here.
+
+	// Vision reports that the model accepts image parts. The one
+	// modality Ollama answers directly: `vision` is a capability in
+	// /api/show, beside `tools` and `embedding`.
+	Vision bool
+	// AudioIn reports that the model accepts audio input (speech to
+	// text). No Ollama capability corresponds to it, so it is declared
+	// or absent.
+	AudioIn bool
+	// AudioOut reports that the model produces audio (text to speech).
+	// Served by a Kokoro runtime rather than by Ollama, so it arrives
+	// with the runtime that answers for it.
+	AudioOut bool
+	// ImageGen reports that the model generates images.
+	ImageGen bool
 }
 
 // String renders the label value the engine parses. Keys are emitted in a
@@ -147,7 +186,7 @@ type Attributes struct {
 // inventory always produces byte-identical labels -- an unstable rendering
 // would rewrite the registration row on every reconnect for no change.
 func (a Attributes) String() string {
-	parts := make([]string, 0, 7)
+	parts := make([]string, 0, 11)
 	if a.ContextWindow > 0 {
 		parts = append(parts, fmt.Sprintf("%s=%d", attrContext, a.ContextWindow))
 	}
@@ -168,6 +207,27 @@ func (a Attributes) String() string {
 	}
 	if a.Tools {
 		parts = append(parts, attrTools+"=1")
+	}
+	// The modalities go LAST and in this order, and both matter: the
+	// same inventory has to render byte-identically every time or the
+	// registration row is rewritten on every reconnect for no change.
+	//
+	// FALSE IS ABSENT, not `vision=0`. The engine reads a missing key
+	// as absent, so emitting a zero would make "this machine says no"
+	// and "this machine did not say" the same string on the wire --
+	// which is the one distinction the whole fail-closed design rests
+	// on.
+	if a.Vision {
+		parts = append(parts, attrVision+"=1")
+	}
+	if a.AudioIn {
+		parts = append(parts, attrAudioIn+"=1")
+	}
+	if a.AudioOut {
+		parts = append(parts, attrAudioOut+"=1")
+	}
+	if a.ImageGen {
+		parts = append(parts, attrImageGen+"=1")
 	}
 	return strings.Join(parts, ",")
 }
@@ -240,6 +300,14 @@ func ParseAttributes(value string) Attributes {
 			}
 		case attrTools:
 			a.Tools = parseAdvertisedBool(v)
+		case attrVision:
+			a.Vision = parseAdvertisedBool(v)
+		case attrAudioIn:
+			a.AudioIn = parseAdvertisedBool(v)
+		case attrAudioOut:
+			a.AudioOut = parseAdvertisedBool(v)
+		case attrImageGen:
+			a.ImageGen = parseAdvertisedBool(v)
 		}
 	}
 	return a

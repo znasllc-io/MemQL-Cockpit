@@ -96,6 +96,14 @@ func (d *Discoverer) probeDeclared(ctx context.Context, rt DeclaredRuntime) ([]I
 				Params: m.Params,
 				Quant:  strings.TrimSpace(m.Quant),
 				Tools:  m.Tools,
+				// The four modalities, same wholesale-win reasoning:
+				// three of them have no probe anywhere, so a declared
+				// entry dropped here is a modality that can never be
+				// advertised by any route at all.
+				Vision:   m.Vision,
+				AudioIn:  m.AudioIn,
+				AudioOut: m.AudioOut,
+				ImageGen: m.ImageGen,
 			},
 		})
 	}

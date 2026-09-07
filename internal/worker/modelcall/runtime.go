@@ -39,13 +39,57 @@ package modelcall
 import (
 	"context"
 	"time"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
 
 // Kinds, mirrored from memql component/worker/modelcall.go.
 const (
 	KindChat      = "chat"
 	KindEmbedding = "embedding"
+
+	// The four MODALITY kinds (engine memql#5137, record D4).
+	//
+	// The kind selector needs no proto change -- ModelCallStart.kind is
+	// a plain string, so these four travel today. What does NOT exist
+	// is anywhere to put their payloads: at the pin ModelCallMessage is
+	// {role, content} with no image parts, ModelCallDelta and
+	// ModelCallEnd carry only strings, and embedding_input is []string.
+	// So the kinds are admitted and the payload is refused by name --
+	// see payloadFor and CodePayloadUnavailable.
+	//
+	// This repository DEFINES these four strings, the same way it
+	// defines the four label flags: memql#5137 has not merged, so there
+	// is nothing upstream to transcribe.
+	KindVision     = "vision"
+	KindTranscribe = "transcribe"
+	KindSpeak      = "speak"
+	KindImage      = "image"
 )
+
+// modalityKinds maps each modality kind to the label flag a machine
+// must have advertised before it will serve one, and to the operator
+// word for it.
+//
+// A SINGLE TABLE, because the three things must agree: the kind the
+// router sends, the flag the label carries, and the sentence the
+// refusal prints. Three switch statements would be three places for a
+// modality to be half-added.
+var modalityKinds = map[string]struct {
+	Advertised func(models.Attributes) bool
+	Word       string
+}{
+	KindVision:     {func(a models.Attributes) bool { return a.Vision }, "vision"},
+	KindTranscribe: {func(a models.Attributes) bool { return a.AudioIn }, "transcription"},
+	KindSpeak:      {func(a models.Attributes) bool { return a.AudioOut }, "speech"},
+	KindImage:      {func(a models.Attributes) bool { return a.ImageGen }, "image generation"},
+}
+
+// ServedKinds lists every kind this worker admits, in a stable order,
+// for the refusal that has to name them.
+func ServedKinds() []string {
+	return []string{KindChat, KindEmbedding, KindVision, KindTranscribe, KindSpeak, KindImage}
+}
 
 // Finish reasons, mirrored from the same file.
 const (
@@ -87,6 +131,16 @@ type Message struct {
 	Name string
 	// ToolCalls are the calls an assistant turn asked for.
 	ToolCalls []ToolCall
+	// Images are the pictures a vision turn carries (memql#5137).
+	//
+	// A turn with images renders its content as an ARRAY of parts
+	// rather than a string, which is the only shape an
+	// OpenAI-compatible server accepts one in. The field is on the
+	// message rather than beside it so the mapping stays one function
+	// with one shape -- a second parameter threaded through
+	// openAIMessages would have to be kept in step with the slice it
+	// indexes, and a mismatch there attaches an image to the wrong turn.
+	Images []ImagePart
 }
 
 // ToolCall is one call the model asked for -- as it came back from the

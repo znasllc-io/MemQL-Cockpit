@@ -1,6 +1,9 @@
 package models
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestWireContract pins the mirrored constants as LITERALS.
 //
@@ -55,6 +58,15 @@ func TestWireContract(t *testing.T) {
 		{attrParams, "params", "design D5"},
 		{attrQuant, "quant", "design D5"},
 		{attrTools, "tools", "design D6 and D11"},
+		// The four modalities. NOT transcribed from the engine, because
+		// there is nothing upstream to transcribe: memql#5137 has not
+		// merged, so this repository is defining these four spellings
+		// and the engine's parser will have to match them. The source
+		// column says so rather than pretending otherwise.
+		{attrVision, "vision", "open-weight-defaults D4 -- DEFINED HERE, engine memql#5137 pending"},
+		{attrAudioIn, "audioin", "open-weight-defaults D4 -- DEFINED HERE, engine memql#5137 pending"},
+		{attrAudioOut, "audioout", "open-weight-defaults D4 -- DEFINED HERE, engine memql#5137 pending"},
+		{attrImageGen, "imagegen", "open-weight-defaults D4 -- DEFINED HERE, engine memql#5137 pending"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("attribute key = %q, %s says %q", tc.got, tc.source, tc.want)
@@ -281,5 +293,92 @@ func TestLabels_ShapeAndRuntimes(t *testing.T) {
 	}
 	if got := inv.RuntimeKinds(); len(got) != 2 || got[0] != KindOllama || got[1] != KindOpenAICompatible {
 		t.Errorf("RuntimeKinds() = %v", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// The four modalities (engine memql#5137, record D4)
+// -----------------------------------------------------------------------------
+
+// The full label, every key, in emission order. This is the string the
+// engine's parser has to read, and it is asserted whole rather than key
+// by key: the ORDER is part of the contract, because an inventory that
+// rendered differently between two runs would rewrite every machine's
+// registration row on every reconnect for no change.
+func TestModalityLabelRendersInEmissionOrder(t *testing.T) {
+	full := Attributes{
+		ContextWindow: 8192, StructuredOutput: true, Embeddings: true,
+		MaxConcurrent: 4, Params: 9_000_000_000, Quant: "Q4_K_M", Tools: true,
+		Vision: true, AudioIn: true, AudioOut: true, ImageGen: true,
+	}
+	want := "ctx=8192,structured=1,embeddings=1,max=4,params=9000000000,quant=Q4_K_M," +
+		"tools=1,vision=1,audioin=1,audioout=1,imagegen=1"
+	if got := full.String(); got != want {
+		t.Fatalf("label =\n  %q\nwant\n  %q", got, want)
+	}
+	if got := ParseAttributes(want); got != full {
+		t.Fatalf("round trip lost data:\n  %+v\nwant\n  %+v", got, full)
+	}
+}
+
+// FALSE IS ABSENT. There is no vision=0: the engine reads a missing key
+// as absent, so emitting a zero would make "this machine says no" and
+// "this machine did not say" the same string on the wire.
+func TestModalityFlagsAreOmittedWhenFalse(t *testing.T) {
+	got := Attributes{ContextWindow: 8192, Tools: true}.String()
+	for _, key := range []string{"vision", "audioin", "audioout", "imagegen"} {
+		if strings.Contains(got, key) {
+			t.Fatalf("%q appeared in a label that claims none of them: %q", key, got)
+		}
+	}
+}
+
+// Each flag is INDEPENDENT. A model that sees is not thereby a model
+// that speaks, and a bug that set them together would advertise three
+// modalities on the strength of one probe.
+func TestModalityFlagsAreIndependent(t *testing.T) {
+	for _, tc := range []struct {
+		attrs Attributes
+		want  string
+	}{
+		{Attributes{Vision: true}, "vision=1"},
+		{Attributes{AudioIn: true}, "audioin=1"},
+		{Attributes{AudioOut: true}, "audioout=1"},
+		{Attributes{ImageGen: true}, "imagegen=1"},
+	} {
+		if got := tc.attrs.String(); got != tc.want {
+			t.Fatalf("%+v rendered %q, want exactly %q", tc.attrs, got, tc.want)
+		}
+	}
+}
+
+// An unrecognised spelling costs eligibility rather than granting it,
+// the same one-way permissiveness every other flag has.
+func TestModalityFlagsParseFailClosed(t *testing.T) {
+	got := ParseAttributes("vision=maybe,audioin=0,audioout=no,imagegen=off")
+	if got.Vision || got.AudioIn || got.AudioOut || got.ImageGen {
+		t.Fatalf("a modality was granted by an unrecognised value: %+v", got)
+	}
+	// And the spellings that DO count, matching parseAdvertisedBool.
+	on := ParseAttributes("vision=1,audioin=true,audioout=yes,imagegen=y")
+	if !on.Vision || !on.AudioIn || !on.AudioOut || !on.ImageGen {
+		t.Fatalf("a documented truthy spelling was rejected: %+v", on)
+	}
+}
+
+// THE FINGERPRINT MOVES. Every machine reconnects once on rollout --
+// the cost record D8 accepts, and the thing to expect on deploy rather
+// than read as an incident.
+func TestModalityFlagsChangeTheLabel(t *testing.T) {
+	before := Attributes{ContextWindow: 8192, Tools: true}.String()
+	for _, after := range []Attributes{
+		{ContextWindow: 8192, Tools: true, Vision: true},
+		{ContextWindow: 8192, Tools: true, AudioIn: true},
+		{ContextWindow: 8192, Tools: true, AudioOut: true},
+		{ContextWindow: 8192, Tools: true, ImageGen: true},
+	} {
+		if after.String() == before {
+			t.Fatalf("%+v renders identically to a model claiming no modality", after)
+		}
 	}
 }

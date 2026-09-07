@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,8 +26,29 @@ const (
 	CodeModelNotOffered = "model_not_offered"
 	// CodeConcurrencyExceeded: the model is offered but at its cap.
 	CodeConcurrencyExceeded = "model_concurrency_exceeded"
-	// CodeUnsupportedKind: neither chat nor embedding.
+	// CodeUnsupportedKind: not a kind this worker serves at all.
 	CodeUnsupportedKind = "unsupported_kind"
+	// CodeModalityUnsupported: the kind is one this worker serves and
+	// the model never advertised the modality it needs.
+	//
+	// SEPARATE FROM CodeUnsupportedKind because the fixes are
+	// different: an unknown kind is a version skew between the engine
+	// and this cockpit, where an unadvertised modality is a stale
+	// routing decision or a policy change -- and the refusal report
+	// lists every machine considered and why, so two causes that send
+	// an operator to different places get two codes.
+	CodeModalityUnsupported = "modality_unsupported"
+	// CodePayloadUnavailable: the kind is served and the call carried
+	// no payload for it.
+	//
+	// THIS IS THE PROTO SEAM (memql#5137). At the pin there is nowhere
+	// on ModelCallStart to put an image or audio bytes, so a modality
+	// call that reached this worker would have arrived empty. It is
+	// REFUSED rather than served as a text call: a machine that
+	// answered a vision request with a completion that never saw the
+	// image would report success for a generation about nothing, and
+	// nothing downstream could detect it.
+	CodePayloadUnavailable = "payload_unavailable"
 	// CodeSchemaUnsupported: a response schema arrived for a model this
 	// machine never advertised structured output for.
 	CodeSchemaUnsupported = "schema_unsupported"
@@ -326,9 +348,11 @@ func limitsFrom(l *memqlv1.ModelCallLimits) callLimits {
 // running on somebody's hardware.
 func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCallStart) (models.Info, *memqlv1.ModelCallEnd) {
 	kind := start.GetKind()
-	if kind != KindChat && kind != KindEmbedding {
+	modality, isModality := modalityKinds[kind]
+	if kind != KindChat && kind != KindEmbedding && !isModality {
 		return models.Info{}, refuse(CodeUnsupportedKind,
-			fmt.Sprintf("this worker serves %q and %q; the call asked for %q", KindChat, KindEmbedding, kind))
+			fmt.Sprintf("this worker serves %s; the call asked for %q",
+				strings.Join(quoteAll(ServedKinds()), ", "), kind))
 	}
 
 	var inv models.Inventory
@@ -354,6 +378,22 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 	if kind == KindEmbedding && !info.Embeddings {
 		return models.Info{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("model %q does not advertise embeddings on this machine", info.ID))
+	}
+	if isModality {
+		// The advertised flag gates the call, exactly as the structured
+		// and tools flags above do and for the same reason: the router
+		// only sends a modality to a machine that advertised it, so
+		// arriving here without one is a stale advertisement, and
+		// serving it anyway would defeat the gating that put the call
+		// here.
+		if !modality.Advertised(info.Attributes) {
+			return models.Info{}, refuse(CodeModalityUnsupported,
+				fmt.Sprintf("model %q does not advertise %s on this machine", info.ID, modality.Word))
+		}
+		// And the payload, which the wire cannot carry yet.
+		if _, ok := payloadFor(start); !ok {
+			return models.Info{}, refuse(CodePayloadUnavailable, modalityUnavailableSentence(modality.Word))
+		}
 	}
 
 	m.mu.Lock()

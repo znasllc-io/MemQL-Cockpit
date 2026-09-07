@@ -69,6 +69,26 @@ type DeclaredModel struct {
 	// they are two independent claims; a runtime that serves a schema and
 	// refuses tool calls is an ordinary thing to own.
 	Tools bool `yaml:"tools"`
+
+	// The four MODALITIES (engine memql#5137, record D4).
+	//
+	// THREE OF THE FOUR HAVE NO PROBE AT ALL, and a declaration is the
+	// only way they can ever be true. Ollama reports a `vision`
+	// capability and reports nothing about audio in, audio out or image
+	// generation -- so an operator running a Kokoro speech runtime or a
+	// transcription endpoint states it here, and a machine that states
+	// nothing offers nothing. That is the fail-closed direction, and
+	// the alternative was never "probe harder": it was guessing from a
+	// model id, which advertises a modality on the strength of a name
+	// and fails on somebody else's prompt.
+	//
+	// Spelled as the LABEL spells them, like params/quant/tools and
+	// unlike context_window: an operator comparing `audioout=1` on the
+	// Fleet page against this file reads one word in both places.
+	Vision   bool `yaml:"vision"`
+	AudioIn  bool `yaml:"audio_in"`
+	AudioOut bool `yaml:"audio_out"`
+	ImageGen bool `yaml:"image_gen"`
 }
 
 // Request is what discovery is asked to consider.
