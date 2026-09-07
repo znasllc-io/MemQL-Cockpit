@@ -1,7 +1,6 @@
 package appsession
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,7 +11,7 @@ import (
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
-	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 )
 
 // chunks.go owns everything that leaves the session: the ordered chunks,
@@ -48,35 +47,14 @@ func (s *session) openTranscript(workspace string) error {
 	return nil
 }
 
-// emitStdout returns the stdout emitter for one app.
-//
-// For an app whose headless mode emits newline-delimited JSON, a line
-// that parses as an object goes out as an `event` chunk -- the engine
-// maps those to progress events -- and anything else goes out as plain
-// stdout narration.
-//
-// It never synthesises an event out of parsed narration. A live view that
-// is confidently wrong about what the agent did is worse than a plain
-// one: the plain one is obviously prose, and the wrong one is indexed,
-// rendered as structure, and believed.
-func (s *session) emitStdout(spec apps.Spec) func(string, []byte) error {
-	if !spec.StreamsJSON {
-		return s.emitChunk
-	}
-	return func(_ string, data []byte) error {
-		trimmed := bytes.TrimSpace(data)
-		if len(trimmed) == 0 {
-			return nil
-		}
-		if trimmed[0] == '{' && json.Valid(trimmed) {
-			s.recordUsage(trimmed)
-			return s.emitChunk(StreamEvent, data)
-		}
-		return s.emitChunk(StreamStdout, data)
-	}
-}
-
 // emitChunk records one piece of output and sends it.
+//
+// THE CLASSIFICATION IS THE HARNESS'S. What used to stand here was a
+// "does this line parse as JSON" test over raw stdout, which was a
+// parser for a format nobody promised to keep; the harness reads each
+// app's own protocol and hands over a chunk already labelled `event`,
+// `text`, `tool`, `stdout` or `stderr`. Reclassifying anything here
+// would put a second opinion in front of the first one.
 //
 // The seq is taken ONCE, before the first send attempt, and reused on
 // every retry. The engine drops out-of-order and duplicate chunks rather
@@ -84,6 +62,12 @@ func (s *session) emitStdout(spec apps.Spec) func(string, []byte) error {
 // it produces a gap the reader cannot see and a record that no longer
 // matches what the app printed.
 func (s *session) emitChunk(stream string, data []byte) error {
+	return s.emit(stream, data, true)
+}
+
+// emit is emitChunk with the transcript cap made a decision rather than
+// an assumption. See emitUncapped.
+func (s *session) emit(stream string, data []byte, capped bool) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -103,7 +87,7 @@ func (s *session) emitChunk(stream string, data []byte) error {
 		}
 	}
 
-	if s.transcriptCapReached(int64(len(clean))) {
+	if capped && s.transcriptCapReached(int64(len(clean))) {
 		return nil
 	}
 
@@ -160,48 +144,56 @@ func (s *session) transcriptCapReached(n int64) bool {
 	return true
 }
 
-// resultEvent is the subset of an app's own final event this reads.
+// emitUncapped sends a chunk that limits.max_transcript_bytes must not
+// swallow.
 //
-// Only what the app STATED. Nothing here is computed from token counts,
-// model names or elapsed time: the engine records known=false as billing
-// "unknown", which is honest, and a synthesised number would be recorded
-// as measured in a ledger somebody bills from.
-type resultEvent struct {
-	Type      string  `json:"type"`
-	CostUSD   float64 `json:"total_cost_usd"`
-	SessionId string  `json:"session_id"`
-	Usage     *struct {
-		InputTokens  int64 `json:"input_tokens"`
-		OutputTokens int64 `json:"output_tokens"`
-	} `json:"usage"`
+// The cap bounds the TRANSCRIPT -- the running narration the engine
+// keeps on the session row, whose complete form is pushed as an artifact
+// anyway. A turn's structured ANSWER is not narration: it is the thing
+// the caller asked for, it is a few hundred bytes, and losing it because
+// the app was chatty would look exactly like an app that answered
+// nothing. So the one chunk that carries a result is exempt, and nothing
+// else is.
+func (s *session) emitUncapped(stream string, data []byte) error {
+	return s.emit(stream, data, false)
 }
 
-// recordUsage captures what the app said about its own spend.
-func (s *session) recordUsage(line []byte) {
-	var ev resultEvent
-	if err := json.Unmarshal(line, &ev); err != nil {
-		return
-	}
-	if strings.TrimSpace(ev.SessionId) != "" {
-		s.usageMu.Lock()
-		s.appRef = ev.SessionId
-		s.usageMu.Unlock()
-	}
-	if ev.Type != "result" {
-		return
-	}
-	if ev.Usage == nil && ev.CostUSD == 0 {
-		// A result event that reported no numbers is not a report.
-		return
-	}
-	usage := &memqlv1.AppSessionUsage{CostUsd: ev.CostUSD, Known: true}
-	if ev.Usage != nil {
-		usage.InputTokens = ev.Usage.InputTokens
-		usage.OutputTokens = ev.Usage.OutputTokens
-	}
+// recordTurn folds one turn's result into what the End will carry.
+//
+// Called once per turn, in the loop, before the next one starts, so
+// there is no interleaving to reason about beyond the lock.
+func (s *session) recordTurn(res harness.TurnResult) {
 	s.usageMu.Lock()
-	s.usage = usage
-	s.usageMu.Unlock()
+	defer s.usageMu.Unlock()
+
+	if ref := strings.TrimSpace(res.AppSessionRef); ref != "" {
+		// The app's own session id, so a later kind=attach resumes THIS
+		// conversation. A harness that lost it would have quietly turned
+		// a conversation into a series of strangers.
+		s.appRef = ref
+	}
+
+	// The LAST turn's answer, replacing rather than merging. A follow-up
+	// that answered in prose must not inherit the previous turn's
+	// structured result: the End describes the turn that just ended, and
+	// carrying an older answer forward would report an answer to a
+	// question nobody asked.
+	s.result = res.ResultJSON
+
+	if !res.Usage.Known {
+		s.usageGaps++
+		return
+	}
+	if s.usage == nil {
+		s.usage = &memqlv1.AppSessionUsage{}
+	}
+	// SUMMED across turns, because the End reports the session and the
+	// session is every turn in it. Taking only the last one would
+	// under-report a five-turn conversation by four turns, in a ledger
+	// somebody bills from.
+	s.usage.InputTokens += res.Usage.InputTokens
+	s.usage.OutputTokens += res.Usage.OutputTokens
+	s.usage.CostUsd += res.Usage.CostUSD
 }
 
 // reportedUsage returns what the app told us, or an explicit
@@ -211,13 +203,24 @@ func (s *session) recordUsage(line []byte) {
 // deliberately rather than left nil: it is the difference between "this
 // run was free" and "nobody knows what this run cost", and only one of
 // those is true.
+//
+// ONE SILENT TURN MAKES THE WHOLE SESSION UNKNOWN. A sum missing a turn
+// is not a smaller measurement, it is an under-measurement recorded as a
+// measurement -- the same failure as an estimate, arrived at politely.
+// The counts still travel, because they cost nothing and the engine
+// ignores them when known is false.
 func (s *session) reportedUsage() *memqlv1.AppSessionUsage {
 	s.usageMu.Lock()
 	defer s.usageMu.Unlock()
-	if s.usage != nil {
-		return s.usage
+	if s.usage == nil {
+		return &memqlv1.AppSessionUsage{Known: false}
 	}
-	return &memqlv1.AppSessionUsage{Known: false}
+	return &memqlv1.AppSessionUsage{
+		InputTokens:  s.usage.InputTokens,
+		OutputTokens: s.usage.OutputTokens,
+		CostUsd:      s.usage.CostUsd,
+		Known:        s.usageGaps == 0,
+	}
 }
 
 // pushOutputs uploads what the run produced plus the full transcript, and
@@ -287,6 +290,50 @@ func (s *session) pushOutputs(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// structuredResultChunk is the body of the final `event` chunk that
+// carries a turn's structured answer. See resultEventType for why the
+// answer travels this way and why the type word is namespaced.
+type structuredResultChunk struct {
+	Type      string          `json:"type"`
+	SessionID string          `json:"session_id"`
+	Result    json.RawMessage `json:"result"`
+}
+
+// sendStructuredResult is THE SEAM for AppSessionEnd.result.
+//
+// One place holds the last turn's structured answer and one place emits
+// it, so when memql#5096 lands the field the change is to assign it on
+// the End here and stop emitting the chunk -- not to hunt for the value
+// through the runner.
+//
+// It goes out BEFORE the End and after everything else, which makes it
+// the session's last chunk: a chunk sent after the End is a chunk the
+// engine has nowhere to put.
+func (s *session) sendStructuredResult() {
+	s.usageMu.Lock()
+	result := s.result
+	s.usageMu.Unlock()
+	if len(result) == 0 {
+		// No schema was asked for, or the app did not answer against
+		// one. Nothing is synthesised: an empty object here reads
+		// downstream as "the app answered nothing", which bills and
+		// retries differently from "the app answered in prose".
+		return
+	}
+	body, err := json.Marshal(structuredResultChunk{
+		Type:      resultEventType,
+		SessionID: s.id,
+		Result:    json.RawMessage(result),
+	})
+	if err != nil {
+		s.logger.Warn("the turn's structured result could not be encoded for the transcript", "error", err)
+		return
+	}
+	if err := s.emitUncapped(StreamEvent, append(body, '\n')); err != nil {
+		s.logger.Warn("the turn's structured result could not be sent", "error", err)
+	}
+}
+
 // sendEnd closes the session on the wire, exactly once.
 //
 // exit_code is the app's REAL code. The engine reads a non-zero exit as a
@@ -294,6 +341,8 @@ func (s *session) pushOutputs(ctx context.Context) ([]string, error) {
 // worse, to a 0 -- misfiles the outcome in a record that is read back
 // later by people deciding whether the thing worked.
 func (s *session) sendEnd(code int, message string, artifacts []string) {
+	s.sendStructuredResult()
+
 	s.usageMu.Lock()
 	ref := s.appRef
 	s.usageMu.Unlock()

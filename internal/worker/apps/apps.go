@@ -149,11 +149,13 @@ type Spec struct {
 	// the label, so pre-reducing it here would throw away the patch
 	// level the portal shows.
 	VersionArgs []string
-	// StreamsJSON reports whether the headless run emits newline-
-	// delimited JSON the engine can map to progress events. When false
-	// the runner sends plain stdout as narration and never synthesises
-	// event chunks out of it.
-	StreamsJSON bool
+	// StreamsJSON USED TO BE HERE. It answered one question -- "may the
+	// runner try to parse this app's stdout as newline-delimited JSON?"
+	// -- for a classifier that no longer exists: the harness reads each
+	// app's own protocol and labels every chunk itself. A flag kept
+	// past its only reader is a flag the next person has to work out
+	// the meaning of before they can ignore it.
+	//
 	// Harness is the protocol word the app-session runner drives this
 	// app through. What Specs() carries is the FLOOR -- the harness that
 	// works on every machine that has the binary at all. A machine whose
@@ -178,7 +180,6 @@ func Specs() []Spec {
 			Binary: "claude",
 			// `claude --version` prints e.g. "2.1.4 (Claude Code)".
 			VersionArgs: []string{"--version"},
-			StreamsJSON: true,
 			// Claude Code has exactly one protocol, so there is nothing
 			// to probe: `-p --output-format stream-json` with
 			// `--json-schema` for the answer and `--resume` for the next
@@ -193,7 +194,6 @@ func Specs() []Spec {
 			Binary: "codex",
 			// `codex --version` prints e.g. "codex-cli 0.9.1".
 			VersionArgs: []string{"--version"},
-			StreamsJSON: false,
 			// The FLOOR, not the preference. Every Codex has the
 			// mcp-server tool pair; only a recent one has the
 			// app-server, and harnessUpgrade is what finds out.
@@ -250,38 +250,23 @@ func IsKnownID(id string) bool {
 	return ok
 }
 
-// RunArgs builds the argv for a headless, autonomous run of prompt.
+// RunArgs and AttachArgs USED TO BE HERE, and they are gone rather than
+// kept for compatibility (memql-cockpit#386).
 //
-// This is the `run` kind: no human is attached, the engine reads the
-// output, and the process must terminate on its own.
-func (s Spec) RunArgs(prompt string) []string {
-	switch s.ID {
-	case IDClaudeCode:
-		// -p is Claude Code's headless "print" mode. stream-json gives
-		// the structured events the engine maps to progress; without
-		// --verbose that format is refused by the CLI.
-		return []string{"-p", prompt, "--output-format", "stream-json", "--verbose"}
-	case IDCodex:
-		// `codex exec` is the non-interactive form.
-		return []string{"exec", prompt}
-	}
-	return nil
-}
-
-// AttachArgs builds the argv that resumes the app's OWN session named by
-// ref, streaming it the way a run streams.
+// Every headless argv is now built by the harness that speaks the app's
+// protocol -- internal/worker/harness -- because the argv and the parser
+// that reads what comes back are one decision. Splitting them is what
+// produced the bug this deletion also removes: RunArgs put the prompt
+// straight after `-p`, and Claude Code's `--mcp-config` is VARIADIC, so
+// a prompt following it was swallowed as a second config path; and `-p`
+// is a boolean with the prompt as a trailing positional, so a prompt
+// that began with a dash was read as an unknown option. claudeArgv ends
+// its flags with `--` for exactly that reason. Leaving these behind "in
+// case something calls them" would have left both bugs behind with them,
+// in the copy nobody was maintaining.
 //
-// Returns nil when the app has no resume mechanism, which the runner
-// turns into a named failure rather than a silent headless run.
-func (s Spec) AttachArgs(ref string) []string {
-	switch s.ID {
-	case IDClaudeCode:
-		return []string{"--resume", ref, "--output-format", "stream-json", "--verbose"}
-	case IDCodex:
-		return []string{"exec", "resume", ref}
-	}
-	return nil
-}
+// InteractiveArgs STAYS: the `open` kind hands the app to a HUMAN with
+// the prompt loaded, and that is not a harness turn.
 
 // InteractiveArgs builds the argv that hands the app to a HUMAN with the
 // prompt loaded -- the `open` kind. The workspace is the process's cwd, so

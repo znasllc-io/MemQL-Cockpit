@@ -134,3 +134,41 @@ func TestSpec_HarnessUpgrade_NamesTheProbeAndTheAnswer(t *testing.T) {
 		t.Errorf("the upgrade altered identity: %+v -> %+v", spec, upgraded)
 	}
 }
+
+// TestSpec_InteractiveArgsSurviveTheHarnesses.
+//
+// RunArgs and AttachArgs were DELETED when the harnesses took over the
+// headless argv (memql-cockpit#386), and this is the one that stayed:
+// the `open` kind hands the app to a HUMAN with the prompt loaded, which
+// is not a harness turn and has no protocol to speak. A later tidy-up
+// that removed it alongside the other two would leave `open` with no way
+// to pass the prompt at all -- and an `open` that launched the app with
+// an empty first turn looks, to the person watching the window, exactly
+// like one that worked.
+func TestSpec_InteractiveArgsSurviveTheHarnesses(t *testing.T) {
+	for _, id := range []string{IDClaudeCode, IDCodex} {
+		spec, ok := SpecFor(id)
+		if !ok {
+			t.Fatalf("%s is not in the closed set", id)
+		}
+		args := spec.InteractiveArgs("write the release notes")
+		if len(args) == 0 {
+			t.Errorf("%s: the open kind has no argv to load the prompt with", id)
+			continue
+		}
+		found := false
+		for _, a := range args {
+			if a == "write the release notes" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: the prompt is not in the argv: %v", id, args)
+		}
+		// An empty prompt yields no argv, so the launcher opens the app
+		// with nothing rather than with an empty first turn.
+		if got := spec.InteractiveArgs("  "); len(got) != 0 {
+			t.Errorf("%s: a blank prompt produced argv %v", id, got)
+		}
+	}
+}

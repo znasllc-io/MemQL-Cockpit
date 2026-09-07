@@ -7,6 +7,16 @@
 // emits output the whole way, so the shape has to be a stream: start,
 // chunks while it works, control from the server, one end.
 //
+// A SESSION IS A SEQUENCE OF TURNS (memql-cockpit#386, design D2/D7).
+// The run and attach kinds no longer fork an argv and read the terminal;
+// they drive the app through its OWN protocol, via
+// internal/worker/harness, and a `message` control starts the next turn
+// in the conversation the previous one opened. That is what makes a
+// follow-up a continuation rather than a stranger, and what turns three
+// guesses -- what the app said, what it spent, which session to resume --
+// into three facts. The `open` kind is untouched: handing an app to a
+// human is not a harness turn.
+//
 // Three invariants run through the file, each because getting it wrong is
 // silently destructive rather than loudly broken:
 //
@@ -41,6 +51,7 @@ import (
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 )
 
 // Session kinds, from AppSessionStart.kind.
@@ -51,21 +62,107 @@ const (
 )
 
 // Chunk streams, from AppSessionChunk.stream.
+//
+// ALIASED from internal/worker/harness rather than re-spelled, because
+// the harness sink is now where four of the five come from: two
+// definitions of one word are two things a rename can pull apart in
+// silence, and the symptom would be an engine mapping a chunk stream it
+// has never heard of.
+//
+// The proto's comment names only "stdout", "stderr" and "event", and
+// `text` and `tool` are new here (memql#5096 is the engine's half). They
+// are safe to send ahead of it: the engine's chunk path copies
+// `stream` through verbatim (component/worker/server.go
+// handleAppSessionChunk), its transcript collector appends EVERY chunk
+// whatever the word (component/worker/runner.go), and its live view
+// renders anything that is not "event" as narration
+// (integrations/agent/worker/cockpitapp.go). So a cockpit that is ahead
+// of its engine loses the finer split, not the words themselves --
+// which is the direction that costs a reader nothing.
 const (
-	StreamStdout = "stdout"
-	StreamStderr = "stderr"
-	StreamEvent  = "event"
+	StreamStdout = harness.StreamStdout
+	StreamStderr = harness.StreamStderr
+	StreamEvent  = harness.StreamEvent
+	StreamText   = harness.StreamText
+	StreamTool   = harness.StreamTool
 )
 
 // Control actions, from AppSessionControl.action.
 const (
 	ActionCancel          = "cancel"
 	ActionRenewCredential = "renew_credential"
+	// ActionMessage starts the NEXT turn of a session that is already
+	// running one (design D7). The action is a plain string on the wire,
+	// so this word needs no proto change at all -- only the prompt it
+	// carries does, which is what controlPrompt is for.
+	ActionMessage = "message"
 )
 
 // transcriptRel is where the full transcript accumulates during a run,
 // inside the session scaffolding so it is removed with it.
 const transcriptRel = ".memql-session/transcript.log"
+
+// maxQueuedFollowUps bounds the follow-ups waiting for a turn to end.
+//
+// The queue is fed by the network and drained by an app that takes
+// minutes per turn, so an unbounded one is a hole a chatty caller could
+// dig in somebody's laptop. Refusing past the bound is LOUD (a log line
+// and a chunk), because a follow-up that vanished silently is
+// indistinguishable to the person who typed it from one the app ignored.
+const maxQueuedFollowUps = 8
+
+// --- what memql#5096 adds to the wire, and what stands in until it lands
+//
+// Three fields of this feature do not exist on the proto at the pinned
+// engine sha, and each has exactly ONE accessor below rather than a
+// fallback scattered across the call sites. The day the pin carries
+// memql#5096, each becomes a one-line change here and nothing else
+// moves; a fallback written out in two places is how half of it survives
+// the upgrade.
+
+// controlPrompt is the follow-up prompt on AppSessionControl{message}.
+//
+// A WIRE FACT: AppSessionControl carries session_id, action, credential
+// and reason, and nothing else. `action` is a plain string, so the
+// cockpit can honour "message" today -- only the prompt has nowhere to
+// come from. memql#5096 adds `prompt`; until then the text travels in
+// `reason`, which is already free text the engine fills in and the
+// cockpit already carries into the transcript.
+func controlPrompt(c *memqlv1.AppSessionControl) string {
+	return strings.TrimSpace(c.GetReason())
+}
+
+// startResponseSchema is the JSON Schema the engine asked this session's
+// final answer to satisfy.
+//
+// A WIRE FACT of the same kind: AppSessionStart carries session_id, app,
+// kind, prompt, inputs, workspace, credential, mcp_endpoint, limits,
+// run_id, step_id and app_session_ref -- and no schema. memql#5096 adds
+// `response_schema` (design 4.1). Until then every turn runs
+// unconstrained, which is the honest reading of "the engine asked for
+// nothing": a harness that invented a schema would change what the app
+// says, and the answer would be structured because the COCKPIT decided
+// it should be.
+func startResponseSchema(_ *memqlv1.AppSessionStart) string {
+	return ""
+}
+
+// resultEventType names the final `event` chunk that carries a turn's
+// structured answer.
+//
+// A WIRE FACT again: AppSessionEnd carries session_id, exit_code, usage,
+// app_session_ref, produced_artifact_ids and error -- there is no
+// `result` field, and memql#5096 adds one. Until then the answer leaves
+// as an event chunk, which is inside the existing contract rather than
+// invented wire: `stream` is "stdout"/"stderr"/"event" and an event
+// chunk is DEFINED as a JSON body the engine maps to a progress event.
+//
+// The type word is NAMESPACED because that same stream carries the APP's
+// own events verbatim, and Claude Code's last stream-json line is
+// literally {"type":"result",...}. A bare "result" here would be
+// indistinguishable from the app's own, to every later reader of a
+// transcript nobody can re-derive.
+const resultEventType = "memql.app_session.result"
 
 // Sender is the worker's side of the stream, as this package needs it.
 type Sender interface {
@@ -97,6 +194,17 @@ type Options struct {
 	// path outside its own -- the engine is naming a directory on
 	// somebody else's machine.
 	CheckWorkspace func(path string) error
+	// Detector resolves WHICH HARNESS drives an app on this machine.
+	//
+	// It is a field rather than a package call because the answer is a
+	// property of the installed binary: two Codexes answer to the id
+	// `codex`, and only a probe of the one on this machine says which.
+	// Nil builds a detector here, so the worker's wiring keeps working
+	// unchanged; passing the SAME detector the app inventory reports
+	// with is better still, because then the harness word a session
+	// drives and the harness word the registration advertised come from
+	// one cache and cannot be a probe apart.
+	Detector *apps.Detector
 }
 
 // Manager owns every live session on this machine.
@@ -117,6 +225,9 @@ func NewManager(opts Options) *Manager {
 	}
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = &http.Client{Timeout: libraryTimeout}
+	}
+	if opts.Detector == nil {
+		opts.Detector = &apps.Detector{}
 	}
 	m := &Manager{opts: opts, logger: logger, sessions: map[string]*session{}}
 	if swept := Sweep(opts.StateDir); swept > 0 {
@@ -148,6 +259,11 @@ func (m *Manager) Start(ctx context.Context, sender Sender, start *memqlv1.AppSe
 		manager: m,
 		logger:  m.logger.With("session_id", id, "app", start.GetApp(), "kind", start.GetKind()),
 		cancel:  cancel,
+		// Closed until a turn loop opens it. A session that is not
+		// driving turns -- the open kind, or one that failed before it
+		// started -- must REFUSE a follow-up rather than swallow it into
+		// a queue nothing will ever drain.
+		turnsClosed: true,
 	}
 
 	m.mu.Lock()
@@ -185,6 +301,8 @@ func (m *Manager) Control(ctl *memqlv1.AppSessionControl) {
 		s.cancelReason(ctl.GetReason())
 	case ActionRenewCredential:
 		s.renew(ctl.GetCredential())
+	case ActionMessage:
+		s.followUp(controlPrompt(ctl))
 	default:
 		s.logger.Warn("unknown app session control action", "action", ctl.GetAction())
 	}
@@ -252,10 +370,24 @@ type session struct {
 	// push at the end carries what the run PRODUCED.
 	before map[string]fileStamp
 
+	// turnMu guards the follow-up queue and the latch that closes it.
+	turnMu sync.Mutex
+	// pending are follow-up prompts waiting for the turn in flight.
+	pending []string
+	// turnsClosed latches when no further turn will be taken, so a
+	// follow-up that arrives a moment too late is REFUSED with a reason
+	// rather than queued into a loop that has already exited.
+	turnsClosed bool
+
 	// usage is what the app reported about itself, if anything.
 	usageMu sync.Mutex
 	usage   *memqlv1.AppSessionUsage
-	appRef  string
+	// usageGaps counts turns that reported no spend at all. One is
+	// enough to make the session's total unknown -- see reportedUsage.
+	usageGaps int
+	appRef    string
+	// result is the LAST turn's structured answer, when it produced one.
+	result []byte
 }
 
 // run drives the whole session and is the only place End is sent.
@@ -292,7 +424,7 @@ func (s *session) run(ctx context.Context) {
 // execute resolves the session and runs it, returning the app's real exit
 // code. A code of -1 means no process ran.
 func (s *session) execute(ctx context.Context) (int, error) {
-	spec, err := s.resolveApp()
+	spec, err := s.resolveApp(ctx)
 	if err != nil {
 		return -1, err
 	}
@@ -353,19 +485,48 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	case KindOpen:
 		return s.runOpen(ctx, spec, workspace)
 	case KindAttach:
-		return s.runHeadless(ctx, spec, workspace, spec.AttachArgs(s.start.GetAppSessionRef()), true)
+		ref := strings.TrimSpace(s.start.GetAppSessionRef())
+		if ref == "" {
+			return -1, errors.New("app session: kind=attach with no app_session_ref names no run to resume")
+		}
+		if strings.TrimSpace(s.start.GetPrompt()) == "" {
+			// Attaching is now RESUMING AND SPEAKING, because that is
+			// the only thing either protocol offers: neither Claude
+			// Code's headless mode nor Codex's app-server has a "watch
+			// the run somebody else started" primitive. A turn with
+			// nothing to say would spend the owner's subscription to
+			// ask the app nothing, so it is refused by name instead.
+			return -1, fmt.Errorf("app session: kind=attach resumes %q and sends it a turn, "+
+				"so it needs a prompt; there is no way to stream a run already in flight",
+				s.start.GetAppSessionRef())
+		}
+		return s.runTurns(ctx, spec, workspace, ref)
 	case KindRun, "":
-		return s.runHeadless(ctx, spec, workspace, spec.RunArgs(s.start.GetPrompt()), false)
+		return s.runTurns(ctx, spec, workspace, "")
 	default:
 		return -1, fmt.Errorf("app session: unknown kind %q", s.start.GetKind())
 	}
 }
 
-// resolveApp checks the app is one this machine will run.
-func (s *session) resolveApp() (apps.Spec, error) {
+// resolveApp checks the app is one this machine will run, and settles
+// WHICH HARNESS drives it here.
+//
+// The harness comes from the Detector's ResolveSpec rather than from the
+// static apps.SpecFor, and that is the whole point: SpecFor carries the
+// FLOOR, the protocol that works on every machine with the binary at
+// all, so trusting it would drive every Codex in the fleet through
+// `codex mcp-server` -- losing usage numbers and structured answers on
+// every machine whose Codex has the app-server. ResolveSpec is also the
+// same answer the registration advertised, so the engine cannot route a
+// protocol here that the session then declines to speak.
+//
+// The order of the three refusals is deliberate: the closed set first
+// (it names the app), then policy (a refusal the operator owns, and no
+// reason to fork a probe for an app this machine will not run), then
+// PATH.
+func (s *session) resolveApp(ctx context.Context) (apps.Spec, error) {
 	id := strings.TrimSpace(s.start.GetApp())
-	spec, ok := apps.SpecFor(id)
-	if !ok {
+	if !apps.IsKnownID(id) {
 		return apps.Spec{}, fmt.Errorf("app session: this cockpit has no runner for app %q", id)
 	}
 	allowed := s.manager.opts.Allowed
@@ -376,6 +537,14 @@ func (s *session) resolveApp() (apps.Spec, error) {
 		// word, and it is checked where it is enforced rather than
 		// trusted from a round trip.
 		return apps.Spec{}, fmt.Errorf("app session: %q is not in this machine's policy.yaml apps.allow", id)
+	}
+	spec, ok := s.manager.opts.Detector.ResolveSpec(ctx, id)
+	if !ok {
+		// ResolveSpec answers false for "outside the closed set" and for
+		// "not on PATH" alike; the first is already excluded above, so
+		// this is the second. Name it, because a LaunchAgent's PATH is
+		// not the operator's shell PATH and that is the usual cause.
+		return apps.Spec{}, fmt.Errorf("app session: %q is allowed here but is not on this worker's PATH", id)
 	}
 	return spec, nil
 }
@@ -421,55 +590,194 @@ func (s *session) pullInputs(ctx context.Context, workspace string) error {
 	return nil
 }
 
-// runHeadless runs the app with no human attached -- the run and attach
-// kinds.
-func (s *session) runHeadless(ctx context.Context, spec apps.Spec, workspace string, argv []string, isAttach bool) (int, error) {
-	if len(argv) == 0 {
-		if isAttach {
-			// Say which app, and say it is the app's limitation rather
-			// than a cockpit bug -- and do NOT quietly start a fresh
-			// run, which would look like a resume and be a new session.
-			return -1, fmt.Errorf("app session: %s has no resume mechanism this cockpit can drive, "+
-				"so kind=attach cannot be honoured for app_session_ref %q", spec.ID, s.start.GetAppSessionRef())
-		}
-		return -1, fmt.Errorf("app session: no run command for app %q", spec.ID)
-	}
-	if isAttach && strings.TrimSpace(s.start.GetAppSessionRef()) == "" {
-		return -1, errors.New("app session: kind=attach with no app_session_ref names no run to resume")
-	}
-
-	s.mu.Lock()
-	env := s.mcp.Env()
-	s.mu.Unlock()
-
-	full := append([]string{spec.Binary}, argv...)
-	c, err := startChild(workspace, full, env)
+// runTurns drives the session as a sequence of turns through the app's
+// own harness -- the run and attach kinds.
+//
+// TURNS ARE STRICTLY SEQUENTIAL, and this loop is where that is decided.
+// The harness clients refuse a concurrent Turn rather than queueing one
+// (Claude Code's is the clearest case: two processes resuming a single
+// session id both append to the one transcript on disk and neither sees
+// the other's turn, so the conversation silently forgets half of
+// itself), and a refusal reaching the ENGINE would be the wrong answer
+// to the wrong question -- the engine has no way to know a turn is in
+// flight, because chunks are asynchronous and there is no reply to a
+// control. So a follow-up QUEUES here and the queue is drained one turn
+// at a time. Dropping it instead would lose a prompt a person typed,
+// with nothing anywhere saying it had been lost.
+//
+// The session ends when a turn finishes and the queue is empty, which is
+// the behaviour a session had before follow-ups existed: the engine
+// waits on an End, and a cockpit that held every session open until it
+// was cancelled would park every run for its whole wall-clock ceiling.
+func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resumeRef string) (int, error) {
+	h, err := harness.New(spec.Harness)
 	if err != nil {
-		return -1, err
+		// The set of harness words is closed; this is a descriptor and a
+		// runner that disagree, which is worth naming loudly because the
+		// engine has already committed a turn to this machine.
+		return -1, fmt.Errorf("app session: %s: %w", spec.ID, err)
 	}
+
+	// Codex's MCP configuration travels as CODEX_HOME in the
+	// ENVIRONMENT; Claude Code's travels as the --mcp-config PATH. Both
+	// come from the one mcpConfig this session wrote, and both are set
+	// here for whichever harness is driving: getting this wrong is
+	// silent, because an app with no MemQL server configured runs
+	// perfectly well and simply cannot reach a single tool.
+	hspec := harness.Spec{
+		Binary:         spec.Binary,
+		Workspace:      workspace,
+		Env:            s.mcpEnv(),
+		MCPConfigPath:  s.mcpConfigPath(),
+		ResponseSchema: startResponseSchema(s.start),
+		ResumeRef:      resumeRef,
+		Launch:         s.launcher(),
+	}
+	if err := h.Start(ctx, hspec); err != nil {
+		// Close on the FAILED start too: the app-server harnesses fork
+		// in Start, so a handshake that failed can still have left a
+		// process holding the machine.
+		_ = h.Close()
+		return -1, s.turnFailure(ctx, err)
+	}
+	defer func() { _ = h.Close() }()
+
+	// Every chunk the app produces arrives here already classified by
+	// the harness, which reads the app's own protocol. This replaces the
+	// "does this line parse as JSON" test that used to stand in for it.
+	sink := harness.SinkFunc(func(stream string, data []byte) {
+		_ = s.emitChunk(stream, data)
+	})
+
+	s.openFollowUps()
+	prompt := s.start.GetPrompt()
+	for {
+		res, err := h.Turn(ctx, prompt, sink)
+		s.recordTurn(res)
+		// The app's REAL status, unnormalised. A harness whose process
+		// is still alive reports 0 for a protocol-level failure, and
+		// that is not a lie the engine acts on: it files a session with
+		// a non-empty `error` as failed whatever the code
+		// (component/worker/runner.go), so the honest code plus the
+		// honest error is a complete report and an invented one would
+		// not be.
+		code := res.ExitCode
+		if err != nil {
+			if !errors.Is(err, harness.ErrNoStructuredResult) {
+				return code, s.turnFailure(ctx, err)
+			}
+			// The PROCESS succeeded and the SCHEMA did not. Those bill
+			// and retry differently, so this is not a failed run -- but
+			// it is also not silence, or whoever asked for a structured
+			// answer is left wondering where it went.
+			s.logger.Info("the app answered but not against the requested schema")
+			_ = s.emitChunk(StreamStderr,
+				[]byte("[memql] the app answered, but not against the schema this session asked for; "+
+					"no structured result is reported for this turn\n"))
+		}
+		next, ok := s.nextFollowUp()
+		if !ok {
+			return code, s.contextFailure(ctx)
+		}
+		prompt = next
+	}
+}
+
+// turnFailure reports what a turn's failure should end the session with.
+//
+// A cancel and the wall-clock ceiling name THEMSELVES, because what the
+// harness saw is a process that died mid-sentence and its message would
+// send an operator hunting for an app problem that does not exist. Only
+// when the context is fine is the app's own account the real one.
+func (s *session) turnFailure(ctx context.Context, err error) error {
+	if cerr := s.contextFailure(ctx); cerr != nil {
+		return cerr
+	}
+	return err
+}
+
+// followUp queues a `message` control's prompt as the next turn.
+func (s *session) followUp(prompt string) {
+	if prompt == "" {
+		s.logger.Warn("app session message control carried no prompt; ignoring")
+		return
+	}
+	if err := s.queueFollowUp(prompt); err != nil {
+		s.logger.Warn("app session follow-up refused", "error", err)
+		// Into the transcript as well as the log: the log is on a laptop
+		// nobody is reading, and the person who sent the follow-up is
+		// looking at the transcript.
+		_ = s.emitChunk(StreamStderr, []byte("[memql] "+err.Error()+"\n"))
+		return
+	}
+	s.logger.Info("app session follow-up queued as the next turn")
+}
+
+// queueFollowUp accepts a follow-up, or says why it cannot.
+func (s *session) queueFollowUp(prompt string) error {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turnsClosed {
+		return errors.New("this session is no longer taking turns, so the follow-up was not delivered")
+	}
+	if len(s.pending) >= maxQueuedFollowUps {
+		return fmt.Errorf("this session already has %d follow-ups waiting, which is the limit, "+
+			"so this one was not delivered", maxQueuedFollowUps)
+	}
+	s.pending = append(s.pending, prompt)
+	return nil
+}
+
+// openFollowUps lets the queue accept work. Only a running turn loop
+// calls it, because only a running turn loop will ever drain it.
+func (s *session) openFollowUps() {
+	s.turnMu.Lock()
+	s.turnsClosed = false
+	s.turnMu.Unlock()
+}
+
+// nextFollowUp pops the next turn's prompt, or latches the session shut.
+//
+// The pop and the latch are ONE critical section on purpose. Anything
+// less leaves a window in which a follow-up is accepted by a loop that
+// has already decided to exit -- and a queued prompt nothing will ever
+// drain is exactly the silent loss the refusal exists to prevent.
+func (s *session) nextFollowUp() (string, bool) {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if len(s.pending) == 0 {
+		s.turnsClosed = true
+		return "", false
+	}
+	next := s.pending[0]
+	s.pending = s.pending[1:]
+	return next, true
+}
+
+// mcpEnv is the environment the app must run with -- CODEX_HOME for
+// Codex, nothing for Claude Code.
+func (s *session) mcpEnv() []string {
 	s.mu.Lock()
-	s.child = c
+	defer s.mu.Unlock()
+	return s.mcp.Env()
+}
+
+// mcpConfigPath is the file writeMCPConfig laid the bearer down in.
+//
+// It takes the config's OWN lock rather than reading the field directly.
+// Today configPath is written once, before the config is published to
+// the session, so a bare read would be safe -- and would stop being safe
+// the day a layout writes it twice, in a way no test would show.
+func (s *session) mcpConfigPath() string {
+	s.mu.Lock()
+	mcp := s.mcp
 	s.mu.Unlock()
-
-	readersDone := s.pump(c, s.emitStdout(spec), s.emitChunk)
-
-	// The readers finish BEFORE the process is reaped, and that ordering
-	// is not incidental: os/exec closes the pipes it handed out from
-	// inside Wait, so reaping while a reader is still draining truncates
-	// the transcript at whatever byte the race landed on. A record that
-	// is silently short is worse than one that is late.
-	select {
-	case <-readersDone:
-	case <-ctx.Done():
-		// Cancel, the wall-clock limit, or the stream dying. Killing the
-		// PROCESS GROUP is the point -- see process.go. It runs on its
-		// own goroutine so the escalation timer never delays the drain:
-		// a process that takes the SIGTERM EOFs its pipes immediately,
-		// and one that ignores it gets SIGKILLed while this waits.
-		go c.terminate()
-		<-readersDone
+	if mcp == nil {
+		return ""
 	}
-	return exitCode(c.wait()), s.contextFailure(ctx)
+	mcp.mu.Lock()
+	defer mcp.mu.Unlock()
+	return mcp.configPath
 }
 
 // pump starts the stdout and stderr readers and returns a channel closed
@@ -495,11 +803,7 @@ func (s *session) pump(c *child, onStdout, onStderr func(string, []byte) error) 
 
 // runOpen hands the app to the human -- the open kind.
 func (s *session) runOpen(ctx context.Context, spec apps.Spec, workspace string) (int, error) {
-	s.mu.Lock()
-	env := s.mcp.Env()
-	s.mu.Unlock()
-
-	c, note, err := launchOpen(ctx, spec, workspace, s.start.GetPrompt(), env)
+	c, note, err := launchOpen(ctx, spec, workspace, s.start.GetPrompt(), s.mcpEnv())
 	if err != nil {
 		// Immediately, with a reason, and with no fallback to headless:
 		// the user asked to drive it themselves.

@@ -22,7 +22,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
 )
 
-// --- harness ---------------------------------------------------------
+// --- the test rig ----------------------------------------------------
 
 type recordedChunk struct {
 	stream string
@@ -90,6 +90,32 @@ func (f *fakeSender) transcript() string {
 		b.WriteString(c.data)
 	}
 	return b.String()
+}
+
+// readArgv reads the argv a fake app recorded, one argument per line.
+//
+// The argv is worth asserting rather than the app's behaviour because
+// every way it goes wrong is SILENT: an app started without
+// `--mcp-config` runs perfectly and reaches no MemQL tool, and one
+// started without `--resume` holds a fresh conversation that looks
+// exactly like a continued one.
+func readArgv(t *testing.T, path string) []string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the app recorded no argv at %s: %v", path, err)
+	}
+	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+}
+
+// argvValue returns the argument following flag, or "".
+func argvValue(argv []string, flag string) string {
+	for i, a := range argv {
+		if a == flag && i+1 < len(argv) {
+			return argv[i+1]
+		}
+	}
+	return ""
 }
 
 // fakeApp installs a shell script on PATH under the app's binary name.
@@ -186,7 +212,7 @@ func (l *fakeLibrary) seenBearers() []string {
 	return append([]string(nil), l.bearers...)
 }
 
-type harness struct {
+type rig struct {
 	manager   *Manager
 	sender    *fakeSender
 	library   *fakeLibrary
@@ -194,7 +220,7 @@ type harness struct {
 	state     string
 }
 
-func newHarness(t *testing.T, allow ...string) *harness {
+func newRig(t *testing.T, allow ...string) *rig {
 	t.Helper()
 	lib := newFakeLibrary(t)
 	allowed := map[string]bool{}
@@ -204,7 +230,7 @@ func newHarness(t *testing.T, allow ...string) *harness {
 	if len(allow) == 0 {
 		allowed[apps.IDClaudeCode] = true
 	}
-	h := &harness{
+	h := &rig{
 		sender:    newFakeSender(),
 		library:   lib,
 		workspace: t.TempDir(),
@@ -220,7 +246,7 @@ func newHarness(t *testing.T, allow ...string) *harness {
 	return h
 }
 
-func (h *harness) start(t *testing.T, mutate func(*memqlv1.AppSessionStart)) *memqlv1.AppSessionEnd {
+func (h *rig) start(t *testing.T, mutate func(*memqlv1.AppSessionStart)) *memqlv1.AppSessionEnd {
 	t.Helper()
 	start := &memqlv1.AppSessionStart{
 		SessionId:   "sess-test",
@@ -250,7 +276,7 @@ echo 'plain narration from the agent'
 echo '{"type":"result","total_cost_usd":0.25,"usage":{"input_tokens":10,"output_tokens":20},"session_id":"app-run-42"}'
 exit 0
 `)
-	h := newHarness(t)
+	h := newRig(t)
 	end := h.start(t, nil)
 
 	if end.GetExitCode() != 0 {
@@ -322,7 +348,7 @@ exit 0
 // from.
 func TestSession_UsageUnknownWhenTheAppSaysNothing(t *testing.T) {
 	fakeApp(t, "claude", "echo 'did some work'\nexit 0\n")
-	h := newHarness(t)
+	h := newRig(t)
 	end := h.start(t, nil)
 
 	usage := end.GetUsage()
@@ -344,7 +370,7 @@ func TestSession_RealExitCodeIsPassedThrough(t *testing.T) {
 	for _, code := range []int{1, 2, 42} {
 		t.Run(fmt.Sprint(code), func(t *testing.T) {
 			fakeApp(t, "claude", fmt.Sprintf("echo working\nexit %d\n", code))
-			h := newHarness(t)
+			h := newRig(t)
 			end := h.start(t, nil)
 			if int(end.GetExitCode()) != code {
 				t.Errorf("exit_code = %d, want %d verbatim", end.GetExitCode(), code)
@@ -364,7 +390,7 @@ func TestSession_NoConfigSurvivesAnyExitPath(t *testing.T) {
 	for name, script := range cases {
 		t.Run(name, func(t *testing.T) {
 			fakeApp(t, "claude", script)
-			h := newHarness(t)
+			h := newRig(t)
 			h.start(t, nil)
 
 			if found := grepTree(t, h.workspace, testBearer); len(found) > 0 {
@@ -391,7 +417,7 @@ echo started
 sleep 60
 `, marker))
 
-	h := newHarness(t)
+	h := newRig(t)
 	sender := h.sender
 	start := &memqlv1.AppSessionStart{
 		SessionId:   "sess-cancel",
@@ -448,7 +474,7 @@ sleep 60
 // TestSession_MaxDurationEndsTheRun.
 func TestSession_MaxDurationEndsTheRun(t *testing.T) {
 	fakeApp(t, "claude", "echo started\nsleep 60\n")
-	h := newHarness(t)
+	h := newRig(t)
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.SessionId = "sess-duration"
 		s.Limits = &memqlv1.AppSessionLimits{MaxDurationSeconds: 1}
@@ -471,7 +497,7 @@ while [ $i -lt 200 ]; do
 done
 exit 0
 `)
-	h := newHarness(t)
+	h := newRig(t)
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.SessionId = "sess-cap"
 		s.Limits = &memqlv1.AppSessionLimits{MaxTranscriptBytes: 500}
@@ -508,7 +534,7 @@ exit 0
 // than an error, and nothing downstream can tell the difference.
 func TestSession_InputsLandBeforeTheAppStarts(t *testing.T) {
 	fakeApp(t, "claude", "cat spec-1.txt\nexit 0\n")
-	h := newHarness(t)
+	h := newRig(t)
 	h.library.mu.Lock()
 	h.library.inputs["spec-1"] = []byte("the specification body")
 	h.library.mu.Unlock()
@@ -530,7 +556,7 @@ func TestSession_InputsLandBeforeTheAppStarts(t *testing.T) {
 func TestSession_FailedInputEndsTheSessionNamingTheId(t *testing.T) {
 	ran := filepath.Join(t.TempDir(), "the-app-ran")
 	fakeApp(t, "claude", fmt.Sprintf("touch %q\nexit 0\n", ran))
-	h := newHarness(t)
+	h := newRig(t)
 
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.SessionId = "sess-bad-input"
@@ -555,7 +581,7 @@ func TestSession_PullErrorNamesTheRightParty(t *testing.T) {
 	fakeApp(t, "claude", "exit 0\n")
 
 	t.Run("403 is the user's access", func(t *testing.T) {
-		h := newHarness(t)
+		h := newRig(t)
 		h.library.mu.Lock()
 		h.library.pullCode["restricted"] = http.StatusForbidden
 		h.library.mu.Unlock()
@@ -575,7 +601,7 @@ func TestSession_PullErrorNamesTheRightParty(t *testing.T) {
 	// so what is left is an expiry the engine can fix in place. The
 	// assertion moved with the sentence -- see memql-cockpit#371.
 	t.Run("401 points at renewal, not at a broken cockpit", func(t *testing.T) {
-		h := newHarness(t)
+		h := newRig(t)
 		h.library.mu.Lock()
 		h.library.pullCode["stale"] = http.StatusUnauthorized
 		h.library.mu.Unlock()
@@ -595,7 +621,7 @@ func TestSession_PullErrorNamesTheRightParty(t *testing.T) {
 // TestSession_ProducedFilesAndTranscriptArePushed.
 func TestSession_ProducedFilesAndTranscriptArePushed(t *testing.T) {
 	fakeApp(t, "claude", "echo 'result content' > output.txt\nmkdir -p sub && echo nested > sub/deep.txt\nexit 0\n")
-	h := newHarness(t)
+	h := newRig(t)
 	// A file that predates the run must NOT be reported as produced.
 	if err := os.WriteFile(filepath.Join(h.workspace, "preexisting.txt"), []byte("old"), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -642,7 +668,7 @@ func TestSession_ProducedFilesAndTranscriptArePushed(t *testing.T) {
 // credential publishes it everywhere that record reaches.
 func TestSession_BearerNeverReachesAChunk(t *testing.T) {
 	fakeApp(t, "claude", "cat .mcp.json\ncat .mcp.json 1>&2\nexit 0\n")
-	h := newHarness(t)
+	h := newRig(t)
 	end := h.start(t, nil)
 
 	if strings.Contains(h.sender.transcript(), testBearer) {
@@ -661,7 +687,7 @@ func TestSession_BearerNeverReachesAChunk(t *testing.T) {
 // renumbered retry opens a gap rather than closing one.
 func TestSession_RetryDoesNotRenumber(t *testing.T) {
 	fakeApp(t, "claude", "echo one\necho two\necho three\nexit 0\n")
-	h := newHarness(t)
+	h := newRig(t)
 	h.sender.mu.Lock()
 	h.sender.failNext = 1 // the first chunk send fails once
 	h.sender.mu.Unlock()
@@ -691,7 +717,7 @@ func TestSession_RetryDoesNotRenumber(t *testing.T) {
 // from a round trip.
 func TestSession_RefusesAnAppNotInPolicy(t *testing.T) {
 	fakeApp(t, "codex", "exit 0\n")
-	h := newHarness(t, apps.IDClaudeCode)
+	h := newRig(t, apps.IDClaudeCode)
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.SessionId = "sess-denied"
 		s.App = apps.IDCodex
@@ -703,7 +729,7 @@ func TestSession_RefusesAnAppNotInPolicy(t *testing.T) {
 
 // TestSession_RefusesAnUnknownApp.
 func TestSession_RefusesAnUnknownApp(t *testing.T) {
-	h := newHarness(t)
+	h := newRig(t)
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.SessionId = "sess-unknown"
 		s.App = "some-future-app"
@@ -718,7 +744,7 @@ func TestSession_RefusesAnUnknownApp(t *testing.T) {
 // a resume and be a new session.
 func TestSession_AttachRequiresARef(t *testing.T) {
 	fakeApp(t, "claude", "exit 0\n")
-	h := newHarness(t)
+	h := newRig(t)
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.SessionId = "sess-attach-noref"
 		s.Kind = KindAttach
@@ -728,17 +754,22 @@ func TestSession_AttachRequiresARef(t *testing.T) {
 	}
 }
 
-// TestSession_AttachResumesByRef.
+// TestSession_AttachResumesByRef, and the argv the harness builds for it.
+//
+// The three assertions are the three ways this goes silently wrong.
+// Without `--resume <ref>` the "resume" is a brand new conversation that
+// looks identical from the outside. Without `--mcp-config <path>` the
+// app starts perfectly and cannot reach a single MemQL tool. And the
+// prompt has to come after `--`: `--mcp-config` is VARIADIC, so a prompt
+// following it directly is swallowed as a second config path.
 func TestSession_AttachResumesByRef(t *testing.T) {
-	fakeApp(t, "claude", `
-if [ "$1" = "--resume" ] && [ "$2" = "app-earlier-run" ]; then
-  echo '{"type":"result","total_cost_usd":0.1,"session_id":"app-earlier-run"}'
-  exit 0
-fi
-echo "wrong argv: $@" 1>&2
-exit 3
-`)
-	h := newHarness(t)
+	argvFile := filepath.Join(t.TempDir(), "argv")
+	fakeApp(t, "claude", fmt.Sprintf(`
+printf '%%s\n' "$@" > %q
+echo '{"type":"result","total_cost_usd":0.1,"session_id":"app-earlier-run"}'
+exit 0
+`, argvFile))
+	h := newRig(t)
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.SessionId = "sess-attach"
 		s.Kind = KindAttach
@@ -750,6 +781,17 @@ exit 3
 	if end.GetAppSessionRef() != "app-earlier-run" {
 		t.Errorf("app_session_ref = %q", end.GetAppSessionRef())
 	}
+
+	argv := readArgv(t, argvFile)
+	if got := argvValue(argv, "--resume"); got != "app-earlier-run" {
+		t.Errorf("--resume = %q, want the ref the engine named; argv: %v", got, argv)
+	}
+	if got := argvValue(argv, "--mcp-config"); got != filepath.Join(h.workspace, ".mcp.json") {
+		t.Errorf("--mcp-config = %q, want the config this session wrote; argv: %v", got, argv)
+	}
+	if got := argvValue(argv, "--"); got != "do the thing" {
+		t.Errorf("the prompt after -- = %q, want it a positional the option parser cannot eat; argv: %v", got, argv)
+	}
 }
 
 // TestSession_OpenFailsFastWhenTheAppIsMissing. An `open` that cannot
@@ -759,7 +801,7 @@ exit 3
 func TestSession_OpenFailsFastWhenTheAppIsMissing(t *testing.T) {
 	// Nothing named `claude` on PATH.
 	t.Setenv("PATH", t.TempDir())
-	h := newHarness(t)
+	h := newRig(t)
 
 	done := make(chan *memqlv1.AppSessionEnd, 1)
 	go func() {
@@ -789,7 +831,7 @@ func TestSession_OpenFailsFastWhenTheAppIsMissing(t *testing.T) {
 // one session id two processes and two transcripts.
 func TestSession_DuplicateStartIsIgnored(t *testing.T) {
 	fakeApp(t, "claude", "echo once\nsleep 0.4\nexit 0\n")
-	h := newHarness(t)
+	h := newRig(t)
 	start := &memqlv1.AppSessionStart{
 		SessionId:   "sess-dup",
 		App:         apps.IDClaudeCode,
@@ -819,7 +861,7 @@ func TestSession_DuplicateStartIsIgnored(t *testing.T) {
 // running with nothing watching it.
 func TestSession_StopAllEndsLiveSessions(t *testing.T) {
 	fakeApp(t, "claude", "echo started\nsleep 60\n")
-	h := newHarness(t)
+	h := newRig(t)
 	h.manager.Start(context.Background(), h.sender, &memqlv1.AppSessionStart{
 		SessionId:   "sess-stopall",
 		App:         apps.IDClaudeCode,
@@ -854,7 +896,7 @@ func TestSession_StopAllEndsLiveSessions(t *testing.T) {
 func TestSession_RenewRewritesTheConfigAndTheLibraryBearer(t *testing.T) {
 	ready := filepath.Join(t.TempDir(), "ready")
 	fakeApp(t, "claude", fmt.Sprintf("touch %q\nsleep 30\n", ready))
-	h := newHarness(t)
+	h := newRig(t)
 	h.manager.Start(context.Background(), h.sender, &memqlv1.AppSessionStart{
 		SessionId:   "sess-renew",
 		App:         apps.IDClaudeCode,
@@ -904,4 +946,527 @@ func TestSession_RenewRewritesTheConfigAndTheLibraryBearer(t *testing.T) {
 	if !sawRenewed {
 		t.Errorf("the Library calls did not pick up the renewed bearer: %v", h.library.seenBearers())
 	}
+}
+
+// --- turns -----------------------------------------------------------
+
+// waitForChunk blocks until the session has streamed something, which is
+// how a test knows the app is actually up.
+func (h *rig) waitForChunk(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(h.sender.recorded()) > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the app never streamed anything; it did not start")
+}
+
+// twoTurnApp writes a fake `claude` that behaves differently on each
+// turn, records each turn's argv, and holds the FIRST turn open until
+// the test releases a gate file.
+//
+// The gate is what makes the follow-up arrive MID-TURN, which is the
+// case that matters: a control cannot be answered, so the engine has no
+// way to know a turn is in flight, and a cockpit that refused a
+// follow-up for that reason would drop a prompt a person typed.
+func twoTurnApp(t *testing.T, dir string) {
+	t.Helper()
+	fakeApp(t, "claude", fmt.Sprintf(`
+d=%q
+n=$(cat "$d/count" 2>/dev/null || echo 0)
+n=$((n+1))
+printf '%%s' "$n" > "$d/count"
+printf '%%s\n' "$@" > "$d/argv.$n"
+cat .mcp.json > "$d/config.$n" 2>/dev/null
+if [ "$n" = "1" ]; then
+  echo '{"type":"system","subtype":"init","session_id":"app-turn-1"}'
+  i=0
+  while [ ! -f "$d/gate" ] && [ $i -lt 400 ]; do i=$((i+1)); sleep 0.05; done
+  echo '{"type":"result","total_cost_usd":0.25,"usage":{"input_tokens":10,"output_tokens":20},"session_id":"app-turn-1"}'
+  exit 0
+fi
+echo '{"type":"assistant","session_id":"app-turn-1","message":{"content":[{"type":"text","text":"the follow-up answer"},{"type":"tool_use","id":"t1","name":"Read"}]}}'
+echo '{"type":"result","total_cost_usd":0.5,"usage":{"input_tokens":1,"output_tokens":2},"session_id":"app-turn-1"}'
+exit 0
+`, dir))
+}
+
+// TestSession_FollowUpRunsAsTheNextTurn is the two-turn session: a
+// `message` control arriving while turn one is still running starts turn
+// two in the SAME conversation, and the session ends when the queue
+// drains rather than when the first process exits.
+//
+// It also pins the three things that only a second turn can show: the
+// resume ref carried across processes, usage SUMMED over the session
+// rather than taken from the last turn, and the typed chunks the harness
+// produces (`text` for prose a person reads, `tool` for the envelope
+// that carries the tool call).
+func TestSession_FollowUpRunsAsTheNextTurn(t *testing.T) {
+	dir := t.TempDir()
+	twoTurnApp(t, dir)
+	h := newRig(t)
+
+	h.manager.Start(context.Background(), h.sender, &memqlv1.AppSessionStart{
+		SessionId:   "sess-followup",
+		App:         apps.IDClaudeCode,
+		Kind:        KindRun,
+		Prompt:      "the first question",
+		Workspace:   h.workspace,
+		Credential:  testBearer,
+		McpEndpoint: "https://mcp.example.com/mcp",
+	})
+	h.waitForChunk(t)
+
+	// Queued while turn one is in flight, then the gate is released so
+	// turn one can finish. The order is the point: the follow-up is
+	// accepted by a session that is busy, and it is delivered anyway.
+	h.manager.Control(&memqlv1.AppSessionControl{
+		SessionId: "sess-followup",
+		Action:    ActionMessage,
+		Reason:    "and now the follow-up",
+	})
+	if err := os.WriteFile(filepath.Join(dir, "gate"), nil, 0o600); err != nil {
+		t.Fatalf("release the gate: %v", err)
+	}
+
+	end := h.sender.wait(t)
+	if end.GetExitCode() != 0 {
+		t.Fatalf("exit_code = %d (%s); transcript: %s", end.GetExitCode(), end.GetError(), h.sender.transcript())
+	}
+
+	count, err := os.ReadFile(filepath.Join(dir, "count"))
+	if err != nil || string(count) != "2" {
+		t.Fatalf("the app ran %q times, want 2 -- the follow-up did not become a turn (%v)", count, err)
+	}
+
+	// Turn two resumes the conversation turn one opened. Without this
+	// the follow-up is a stranger with no context, which looks identical
+	// from the outside.
+	second := readArgv(t, filepath.Join(dir, "argv.2"))
+	if got := argvValue(second, "--resume"); got != "app-turn-1" {
+		t.Errorf("second turn --resume = %q, want the app's own session id; argv: %v", got, second)
+	}
+	if got := argvValue(second, "--"); got != "and now the follow-up" {
+		t.Errorf("second turn prompt = %q, want the follow-up's text; argv: %v", got, second)
+	}
+	first := readArgv(t, filepath.Join(dir, "argv.1"))
+	if got := argvValue(first, "--resume"); got != "" {
+		t.Errorf("the FIRST turn resumed %q; a run with no app_session_ref starts fresh", got)
+	}
+
+	// Usage is the SESSION's, summed across its turns. Taking only the
+	// last would under-report every conversation in a ledger somebody
+	// bills from.
+	usage := end.GetUsage()
+	if !usage.GetKnown() {
+		t.Fatal("both turns reported usage; known must be true")
+	}
+	if usage.GetInputTokens() != 11 || usage.GetOutputTokens() != 22 || usage.GetCostUsd() != 0.75 {
+		t.Errorf("usage = %+v, want both turns summed (11/22/0.75)", usage)
+	}
+	if end.GetAppSessionRef() != "app-turn-1" {
+		t.Errorf("app_session_ref = %q, want the conversation both turns ran in", end.GetAppSessionRef())
+	}
+
+	// The typed chunks the harness produced: prose as `text`, the
+	// envelope carrying the tool call as `tool`. The old runner had
+	// neither -- everything that parsed as JSON was an `event` and
+	// everything else was narration.
+	var sawText, sawTool bool
+	for _, c := range h.sender.recorded() {
+		switch c.stream {
+		case StreamText:
+			if strings.Contains(c.data, "the follow-up answer") {
+				sawText = true
+			}
+		case StreamTool:
+			if strings.Contains(c.data, "tool_use") {
+				sawTool = true
+			}
+		}
+	}
+	if !sawText {
+		t.Errorf("no `text` chunk carried the assistant's prose: %+v", h.sender.recorded())
+	}
+	if !sawTool {
+		t.Errorf("no `tool` chunk carried the tool call: %+v", h.sender.recorded())
+	}
+}
+
+// TestSession_RenewLandsOnTheNextTurn. Claude Code reads its MCP
+// configuration at STARTUP, so a renewal mid-run cannot reach the
+// process already running -- that is the known limitation of
+// mcpconfig.go. One process per turn is what makes it honest: the
+// replacement bearer is in place before the next turn's process starts,
+// and this proves the app actually reads it there.
+func TestSession_RenewLandsOnTheNextTurn(t *testing.T) {
+	dir := t.TempDir()
+	twoTurnApp(t, dir)
+	h := newRig(t)
+
+	h.manager.Start(context.Background(), h.sender, &memqlv1.AppSessionStart{
+		SessionId:   "sess-renew-turn",
+		App:         apps.IDClaudeCode,
+		Kind:        KindRun,
+		Prompt:      "the first question",
+		Workspace:   h.workspace,
+		Credential:  testBearer,
+		McpEndpoint: "https://mcp.example.com/mcp",
+	})
+	h.waitForChunk(t)
+
+	const next = "eyJhbGciOiJSUzI1NiJ9.renewed-between-turns.sig"
+	h.manager.Control(&memqlv1.AppSessionControl{
+		SessionId:  "sess-renew-turn",
+		Action:     ActionRenewCredential,
+		Credential: next,
+	})
+	h.manager.Control(&memqlv1.AppSessionControl{
+		SessionId: "sess-renew-turn",
+		Action:    ActionMessage,
+		Reason:    "carry on",
+	})
+	if err := os.WriteFile(filepath.Join(dir, "gate"), nil, 0o600); err != nil {
+		t.Fatalf("release the gate: %v", err)
+	}
+	h.sender.wait(t)
+
+	// What the SECOND turn's process read off disk, captured by the fake
+	// before it answered. Reading the file after the session would prove
+	// nothing: it is deleted on the way out.
+	second, err := os.ReadFile(filepath.Join(dir, "config.2"))
+	if err != nil {
+		t.Fatalf("the second turn read no config: %v", err)
+	}
+	if !strings.Contains(string(second), next) {
+		t.Error("the second turn started with the superseded bearer; renewal is supposed to land on the next turn")
+	}
+	if strings.Contains(string(second), testBearer) {
+		t.Error("the superseded bearer survived into the next turn's config")
+	}
+}
+
+// TestSession_FollowUpQueueRefusesRatherThanSwallows.
+//
+// Both refusals exist because the alternative is silent. A follow-up
+// queued into a session whose turn loop has already exited waits forever
+// on a drain that will never come, and one appended to an unbounded
+// queue is a memory hole fed by the network and drained by an app that
+// takes minutes per turn. The queue is opened only by a running loop and
+// latched shut by the same critical section that finds it empty.
+func TestSession_FollowUpQueueRefusesRatherThanSwallows(t *testing.T) {
+	s := &session{turnsClosed: true}
+
+	if err := s.queueFollowUp("too late"); err == nil {
+		t.Fatal("a follow-up for a session that is not taking turns must be refused, not queued")
+	}
+
+	s.openFollowUps()
+	for i := range maxQueuedFollowUps {
+		if err := s.queueFollowUp(fmt.Sprintf("prompt %d", i)); err != nil {
+			t.Fatalf("follow-up %d was refused below the bound: %v", i, err)
+		}
+	}
+	err := s.queueFollowUp("one too many")
+	if err == nil {
+		t.Fatal("the queue is unbounded; it is fed by the network")
+	}
+	if !strings.Contains(err.Error(), "not delivered") {
+		t.Errorf("refusal = %q, want it to say the follow-up did not arrive", err)
+	}
+
+	for i := range maxQueuedFollowUps {
+		got, ok := s.nextFollowUp()
+		if !ok {
+			t.Fatalf("the queue ran dry after %d of %d", i, maxQueuedFollowUps)
+		}
+		if want := fmt.Sprintf("prompt %d", i); got != want {
+			t.Errorf("popped %q, want %q -- turns are a sequence, in order", got, want)
+		}
+	}
+	if _, ok := s.nextFollowUp(); ok {
+		t.Fatal("an empty queue must end the session, not invent a turn")
+	}
+	// Draining latched it shut, in the same critical section that found
+	// it empty: anything less leaves a window where a follow-up is
+	// accepted by a loop that has already decided to exit.
+	if err := s.queueFollowUp("after the drain"); err == nil {
+		t.Fatal("the queue accepted a follow-up after the turn loop had finished with it")
+	}
+}
+
+// TestSession_StructuredResultLeavesAsTheFinalEventChunk pins the seam
+// that stands in for AppSessionEnd.result until memql#5096 lands it.
+//
+// Two properties, and both are about a reader who was not here. The type
+// word is NAMESPACED, because the same stream carries the app's own
+// events and Claude Code's last stream-json line is literally
+// {"type":"result",...}. And the chunk is exempt from
+// limits.max_transcript_bytes, because that limit bounds NARRATION: an
+// answer lost to a chatty run looks exactly like an app that answered
+// nothing.
+func TestSession_StructuredResultLeavesAsTheFinalEventChunk(t *testing.T) {
+	newSession := func(sender *fakeSender, result []byte) *session {
+		return &session{
+			id:     "sess-result",
+			start:  &memqlv1.AppSessionStart{SessionId: "sess-result"},
+			sender: sender,
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			redact: newRedactor(testBearer),
+			result: result,
+			// The transcript cap has ALREADY bitten: every ordinary
+			// chunk from here on is dropped.
+			capped: true,
+		}
+	}
+
+	t.Run("the answer is the last chunk before the end", func(t *testing.T) {
+		sender := newFakeSender()
+		s := newSession(sender, []byte(`{"answer":42}`))
+		s.sendEnd(0, "", nil)
+
+		chunks := sender.recorded()
+		if len(chunks) != 1 {
+			t.Fatalf("chunks = %d, want the one result chunk past a bitten cap: %+v", len(chunks), chunks)
+		}
+		if chunks[0].stream != StreamEvent {
+			t.Errorf("stream = %q, want %q", chunks[0].stream, StreamEvent)
+		}
+		var body struct {
+			Type      string          `json:"type"`
+			SessionID string          `json:"session_id"`
+			Result    json.RawMessage `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(chunks[0].data), &body); err != nil {
+			t.Fatalf("the result chunk is not JSON the engine can map: %v (%q)", err, chunks[0].data)
+		}
+		if body.Type != resultEventType {
+			t.Errorf("type = %q, want %q", body.Type, resultEventType)
+		}
+		if body.Type == "result" {
+			t.Error("a bare `result` is indistinguishable from Claude Code's own result event")
+		}
+		if body.SessionID != "sess-result" {
+			t.Errorf("session_id = %q", body.SessionID)
+		}
+		if string(body.Result) != `{"answer":42}` {
+			t.Errorf("result = %s, want the app's own answer verbatim", body.Result)
+		}
+		if sender.wait(t) == nil {
+			t.Fatal("no end was sent")
+		}
+	})
+
+	t.Run("no result means no chunk, never an empty object", func(t *testing.T) {
+		sender := newFakeSender()
+		s := newSession(sender, nil)
+		s.sendEnd(0, "", nil)
+
+		if chunks := sender.recorded(); len(chunks) != 0 {
+			t.Errorf("chunks = %+v, want none: an empty object reads as \"the app answered nothing\"", chunks)
+		}
+	})
+}
+
+// TestSession_CodexHarnessComesFromTheMachineNotTheId is the reason the
+// runner resolves the app through the Detector rather than through the
+// static spec table.
+//
+// Two harnesses answer to the id `codex`. apps.Specs() carries the FLOOR
+// -- `codex mcp-server`, which every Codex has -- so a runner that
+// trusted it would drive every Codex in the fleet through the fallback,
+// losing usage numbers and structured answers on every machine whose
+// binary has the app-server. Only a probe of THIS machine's binary can
+// tell, and it is the same probe the registration advertised with.
+func TestSession_CodexHarnessComesFromTheMachineNotTheId(t *testing.T) {
+	cases := []struct {
+		name       string
+		probeExits int
+		want       string
+		notWant    string
+	}{
+		{name: "a codex with an app-server is driven through it", probeExits: 0, want: "app-server", notWant: "mcp-server"},
+		{name: "a codex without one falls back to the mcp-server tools", probeExits: 9, want: "mcp-server", notWant: "app-server"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			argvFile := filepath.Join(dir, "argv")
+			fakeApp(t, "codex", fmt.Sprintf(`
+echo "$*" >> %q
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then exit %d; fi
+exit 9
+`, argvFile, tc.probeExits))
+
+			h := newRig(t, apps.IDCodex)
+			end := h.start(t, func(s *memqlv1.AppSessionStart) {
+				s.SessionId = "sess-codex-" + tc.want
+				s.App = apps.IDCodex
+			})
+			// Every fake dies at once, so the handshake fails; what is
+			// under test is WHICH subcommand was launched.
+			if end.GetError() == "" {
+				t.Fatal("a codex that dies at startup must end the session with a reason")
+			}
+			// Both Codex harnesses speak JSON-RPC over the child's
+			// stdio. A supervisor that handed them the default closed
+			// stdin would fail every Codex session on this machine with
+			// this sentence, whatever the app did.
+			if strings.Contains(end.GetError(), "without a stdin") {
+				t.Errorf("the harness got no writable stdin from the supervisor: %s", end.GetError())
+			}
+
+			launched := ""
+			for _, line := range readArgv(t, argvFile) {
+				if line == "app-server" || line == "mcp-server" {
+					launched = line
+				}
+			}
+			if launched != tc.want {
+				t.Errorf("launched %q, want %q; the recorded invocations were %v",
+					launched, tc.want, readArgv(t, argvFile))
+			}
+			if launched == tc.notWant {
+				t.Errorf("this machine's codex was driven through %q", launched)
+			}
+		})
+	}
+}
+
+// TestSession_HarnessThatCannotStartStillDeletesTheConfig.
+//
+// A harness that forks in Start -- both Codex clients do -- is a NEW
+// exit path out of the session, taken before any turn has run. The
+// deletion of the MCP configuration is the security control rather than
+// housekeeping (the bearer in it cannot be revoked), so every exit path
+// has to pass through the teardown, including one added later by
+// somebody who was thinking about something else.
+func TestSession_HarnessThatCannotStartStillDeletesTheConfig(t *testing.T) {
+	fakeApp(t, "codex", "exit 9\n")
+	h := newRig(t, apps.IDCodex)
+	end := h.start(t, func(s *memqlv1.AppSessionStart) {
+		s.SessionId = "sess-codex-dead"
+		s.App = apps.IDCodex
+	})
+
+	if end.GetError() == "" {
+		t.Fatal("a session whose app could not be started must carry a reason")
+	}
+	if end.GetExitCode() == 0 {
+		t.Error("a session that never ran a turn must not report a clean exit")
+	}
+	if found := grepTree(t, h.workspace, testBearer); len(found) > 0 {
+		t.Errorf("the bearer survived a failed harness start in: %v", found)
+	}
+	if found := grepTree(t, h.state, testBearer); len(found) > 0 {
+		t.Errorf("the bearer reached the ledger, which records paths only: %v", found)
+	}
+}
+
+// TestSession_AttachWithoutAPromptIsRefused.
+//
+// Attaching is now RESUMING AND SPEAKING, because that is the only thing
+// either app's protocol offers -- neither has a "watch the run somebody
+// else started" primitive. A turn with nothing to say would spend the
+// machine owner's subscription to ask the app nothing, so the refusal
+// names what attach actually does instead.
+func TestSession_AttachWithoutAPromptIsRefused(t *testing.T) {
+	fakeApp(t, "claude", "exit 0\n")
+	h := newRig(t)
+	end := h.start(t, func(s *memqlv1.AppSessionStart) {
+		s.SessionId = "sess-attach-noprompt"
+		s.Kind = KindAttach
+		s.AppSessionRef = "app-earlier-run"
+		s.Prompt = ""
+	})
+	if !strings.Contains(end.GetError(), "prompt") {
+		t.Errorf("error = %q, want it to name the missing prompt", end.GetError())
+	}
+	if !strings.Contains(end.GetError(), "app-earlier-run") {
+		t.Errorf("error = %q, want it to name the session it would have resumed", end.GetError())
+	}
+}
+
+// TestLauncher_IsTheSupervisorWithStdinAsADecision.
+//
+// The harness clients fork NOTHING: every process they need comes from
+// this adapter, so that production keeps exactly one process supervisor.
+// What that buys is asserted end to end by
+// TestSession_CancelKillsTheProcessGroup, which now runs through this
+// path -- a second supervisor would have quietly reaped only the direct
+// child and left an agent running on somebody's machine.
+//
+// What is asserted here is the one thing the adapter had to ADD: stdin.
+// The default stays closed so a prompt-on-stdin app fails fast instead
+// of hanging on input that will never come; a JSON-RPC harness that owns
+// both ends of the pipe opts in, because for `codex app-server` a closed
+// stdin is not a safety property but a client with nothing to say.
+func TestLauncher_IsTheSupervisorWithStdinAsADecision(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "reader.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nif read line; then echo \"got: $line\"; else echo 'stdin was closed'; fi\n"), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	run := func(t *testing.T, stdin bool, write string) (*session, string) {
+		t.Helper()
+		s := &session{}
+		proc, err := s.launcher()(context.Background(), dir, []string{script}, nil, stdin)
+		if err != nil {
+			t.Fatalf("launch: %v", err)
+		}
+		if w := proc.Stdin(); w != nil {
+			if write != "" {
+				if _, err := io.WriteString(w, write); err != nil {
+					t.Fatalf("write to the child's stdin: %v", err)
+				}
+			}
+			_ = w.Close()
+		}
+		out, err := io.ReadAll(proc.Stdout())
+		if err != nil {
+			t.Fatalf("read stdout: %v", err)
+		}
+		_ = proc.Wait()
+		return s, strings.TrimSpace(string(out))
+	}
+
+	t.Run("a harness that asks for stdin can speak its protocol", func(t *testing.T) {
+		s, out := run(t, true, "hello\n")
+		if out != "got: hello" {
+			t.Errorf("the child read %q, want the line written into its stdin", out)
+		}
+		// Registered on the session, which is what makes cancel and
+		// teardown reach it. A process nothing has a handle on is an
+		// agent running with nothing watching it.
+		s.mu.Lock()
+		registered := s.child != nil
+		s.mu.Unlock()
+		if !registered {
+			t.Error("the launched process was not registered on the session; cancel cannot reach it")
+		}
+	})
+
+	t.Run("the default is closed, and a reader sees EOF at once", func(t *testing.T) {
+		_, out := run(t, false, "")
+		if out != "stdin was closed" {
+			t.Errorf("the child read %q, want an immediate EOF", out)
+		}
+	})
+
+	t.Run("a session already over starts no further process", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "it-ran")
+		s := &session{}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := s.launcher()(ctx, dir, []string{"/bin/sh", "-c", "touch " + marker}, nil, false); err == nil {
+			t.Fatal("a cancel that lands between two turns must not start the next one")
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Error("a process was forked for a session that was already over")
+		}
+	})
 }
