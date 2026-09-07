@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
@@ -33,7 +34,7 @@ func TestBuildRegister_CarriesTheModelInventory(t *testing.T) {
 		Name:         "test-worker",
 		Capabilities: []string{"HEADLESS"},
 		Concurrency:  map[string]uint32{"HEADLESS": 8},
-	}, nil, inv)
+	}, nil, inv, hardware.Inventory{})
 
 	var hasModel bool
 	for _, c := range register.GetCapabilities() {
@@ -90,7 +91,7 @@ func TestBuildRegister_NoModelsContributesNothing(t *testing.T) {
 				Capabilities: []string{"HEADLESS"},
 				Labels:       map[string]string{"team": "platform"},
 				Concurrency:  map[string]uint32{"HEADLESS": 8},
-			}, nil, inv)
+			}, nil, inv, hardware.Inventory{})
 
 			for _, c := range register.GetCapabilities() {
 				if c == models.Capability {

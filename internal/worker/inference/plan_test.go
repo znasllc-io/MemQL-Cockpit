@@ -10,6 +10,7 @@ import (
 	"testing"
 	"unicode"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
 
@@ -311,8 +312,21 @@ func TestDecide(t *testing.T) {
 					t.Errorf("Install[%d] =\n  %q\nwant\n  %q", i, got.Install[i], tt.wantInstall[i])
 				}
 			}
-			if len(got.DefaultModels) != 2 || got.DefaultModels[0] != "llama3.1:8b" || got.DefaultModels[1] != "nomic-embed-text" {
-				t.Errorf("DefaultModels = %q, want the default pair", got.DefaultModels)
+			// Every case in this table leaves Host.Hardware zero, so
+			// every one classes `unsupported` and takes the smallest
+			// set. The assertion is here rather than in
+			// recommend_test.go because what it actually pins is that
+			// NO BRANCH of Decide blanks the set -- including the
+			// refusals, which is the half a table of happy cases would
+			// never reach.
+			if len(got.DefaultModels) != 2 ||
+				got.DefaultModels[0] != "qwen3.5:9b" ||
+				got.DefaultModels[1] != "qwen3-embedding:0.6b" {
+				t.Errorf("DefaultModels = %q, want the smallest recommended set", got.DefaultModels)
+			}
+			if got.MachineClass != hardware.ClassUnsupported {
+				t.Errorf("MachineClass = %q, want %q for a host with no hardware inventory",
+					got.MachineClass, hardware.ClassUnsupported)
 			}
 		})
 	}

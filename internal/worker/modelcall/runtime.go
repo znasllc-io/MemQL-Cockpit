@@ -193,14 +193,28 @@ type Result struct {
 	ToolCalls []ToolCall
 }
 
-// emitFunc receives one piece of generated text. Returning an error stops
+// Emit receives one piece of generated text. Returning an error stops
 // the generation -- it means the stream back to the cluster is gone, and
 // continuing would spend this machine's GPU on output nobody will read.
-type emitFunc func(content string) error
+//
+// Exported alongside Client for the same reason: a caller outside this
+// package cannot implement or supply one otherwise.
+type Emit func(content string) error
 
-// client is one runtime family. Both implementations are stateless; the
+// emitFunc is the internal spelling, kept so the existing call sites
+// read unchanged.
+type emitFunc = Emit
+
+// Client is one runtime family. Both implementations are stateless; the
 // per-call state lives on the call.
-type client interface {
+//
+// It is EXPORTED because two callers now need to reach a runtime: the
+// call manager here, and internal/worker/probe, which measures a model
+// against the suite. They must reach it the same way -- a probe that
+// measured a model through a different path than the one serving would
+// measure the wrong thing, and the figure it produced would rank a
+// machine on a code path no caller uses.
+type Client interface {
 	Chat(ctx context.Context, req ChatRequest, emit emitFunc) (Result, error)
 	Embed(ctx context.Context, req EmbedRequest) (Result, error)
 }

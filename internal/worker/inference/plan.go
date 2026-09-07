@@ -45,6 +45,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
 
@@ -161,6 +162,13 @@ type Host struct {
 	// unprobed: Docker is not a runtime option there, and probing it
 	// would invite a plan that used it.
 	Docker DockerFacts
+	// Hardware is this machine's presence-facts inventory, from
+	// internal/worker/hardware. Decide reads it for ONE thing -- the
+	// machine class, which chooses the recommended set -- and it is a
+	// field rather than a probe inside Decide for the reason every
+	// other fact here is: the class table has to be exercisable on a
+	// runner that is not the machine being classed.
+	Hardware hardware.Inventory
 	// FreeDisk is bytes available on the volume the runtime keeps models
 	// on. Decide DOES NOT read it, and that is deliberate rather than an
 	// oversight: refusing on disk needs the size of the models actually
@@ -206,17 +214,23 @@ type Plan struct {
 	// which is asked exactly once -- when the plan is about to install
 	// something -- and is noise on a machine that already works.
 	Note string
-	// DefaultModels is the pair `setup --inference` pulls when no --model
-	// is given (design D2). Populated on every plan including a refusal,
-	// so its meaning does not depend on which branch produced the plan.
+	// DefaultModels is the set `setup --inference` pulls when no --model
+	// is given. Populated on every plan including a refusal, so its
+	// meaning does not depend on which branch produced the plan.
+	//
+	// It is a SET rather than a pair since the open-weight defaults
+	// (engine memql#5137): what a machine should hold depends on how
+	// much of it there is. See RecommendedSet.
 	DefaultModels []string
+	// MachineClass is the class DefaultModels was chosen for --
+	// "16", "24", "32", "64", "128", or hardware.ClassUnsupported.
+	//
+	// It is on the plan rather than re-derived by the caller because
+	// the preamble prints the class and the set on adjacent lines, and
+	// two computations of the same class can disagree while a person is
+	// looking at both answers at once.
+	MachineClass string
 }
-
-// defaultModels: one general model and one embedding model, because the
-// operations this fleet serves locally are both kinds (planning and
-// conductor turns, and embeddings). A machine that pulled only the first
-// would advertise a model set that silently cannot answer half of them.
-func defaultModels() []string { return []string{"llama3.1:8b", "nomic-embed-text"} }
 
 // The sentences. Constants rather than fmt calls at the point of use, so
 // the whole vocabulary of this package is readable in one screen -- and
@@ -296,7 +310,14 @@ const (
 
 // Decide answers what this machine needs. Pure: same Host, same Plan.
 func Decide(h Host) Plan {
-	p := Plan{DefaultModels: defaultModels()}
+	// The class, and the set that follows from it, are settled BEFORE
+	// any branch, for the same reason RuntimePresent is: a refusal must
+	// not erase them. "This machine cannot serve models" and "and the
+	// set it would have pulled is this" are both facts a person reading
+	// a refusal wants, and a refusal that blanked the Models line would
+	// read as a command that had not decided anything yet.
+	class := hardware.Class(h.Hardware)
+	p := Plan{MachineClass: class, DefaultModels: RecommendedSet(class)}
 
 	// Presence is settled before any branch, so a refusal cannot erase
 	// it. ANY of the three signals counts, and erring toward "present" is
@@ -430,6 +451,7 @@ func Gather(ctx context.Context, d *models.Discoverer) (Host, error) {
 	facts := gatherPlatform(ctx)
 	h.Docker = facts.Docker
 	h.FreeDisk = facts.FreeDisk
+	h.Hardware = hardware.Local(ctx)
 
 	// Checked again on the way out: the probes above shell out and dial,
 	// and a Host assembled from calls a cancelled context aborted would

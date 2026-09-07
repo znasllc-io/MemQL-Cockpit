@@ -236,3 +236,38 @@ func TestRequestImmediateReadvertise_SafeWithoutAModelInventory(t *testing.T) {
 		t.Error("a runner with no inventory has nothing to re-advertise")
 	}
 }
+
+// The hardware inventory rides Register and then every tenth beat.
+//
+// At the 15-second default that is a refresh every two and a half
+// minutes -- "within minutes", which is what the design record asks for
+// -- and it keeps a scan that shells out to nvidia-smi and `docker
+// version` off the other nine.
+func TestHardwareOnBeat(t *testing.T) {
+	for _, tc := range []struct {
+		beat int
+		want bool
+	}{
+		// Register already carried one, so the first nine beats add
+		// nothing. A machine that reported again on beat 1 would send
+		// the same payload twice inside fifteen seconds of connecting.
+		{0, false}, {1, false}, {2, false}, {9, false},
+		{10, true}, {11, false}, {19, false}, {20, true},
+		{100, true}, {101, false},
+	} {
+		if got := hardwareOnBeat(tc.beat); got != tc.want {
+			t.Errorf("hardwareOnBeat(%d) = %v, want %v", tc.beat, got, tc.want)
+		}
+	}
+}
+
+// The cadence is stated in BEATS, so the wall-clock interval follows
+// from the heartbeat rather than being a second number that can drift
+// from it. Asserted so that changing the heartbeat is visibly also a
+// change to how often a machine re-describes itself.
+func TestHardwareRefreshInterval(t *testing.T) {
+	const defaultHeartbeat = 15 * time.Second
+	if got := time.Duration(hardwareRefreshBeats) * defaultHeartbeat; got != 150*time.Second {
+		t.Fatalf("hardware refresh interval = %s, want 2m30s", got)
+	}
+}

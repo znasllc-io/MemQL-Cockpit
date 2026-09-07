@@ -73,6 +73,10 @@ func dispatchHandleCommand(args []string) {
 		handleBackup(args[1:])
 	case "models":
 		handleModels(args[1:])
+	case "hardware":
+		handleHardware(args[1:])
+	case "probe":
+		handleProbe(args[1:])
 	case "consent":
 		handleConsentCmd(args[1:])
 	case "-h", "--help", "help":
@@ -429,7 +433,7 @@ func parseSetupFlags(args []string) setupFlags {
 	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml (its directory holds policy.yaml)")
 	runtimeFlag := fs.String("runtime", "", "with --inference: docker | native, overriding the runtime this platform would choose")
 	var modelIDs repeatedFlag
-	fs.Var(&modelIDs, "model", "with --inference: a model id to pull; repeatable (default: llama3.1:8b and nomic-embed-text)")
+	fs.Var(&modelIDs, "model", "with --inference: a model id to pull; repeatable (default: the recommended set for this machine's class)")
 	_ = fs.Parse(args)
 	return setupFlags{
 		nonInteractive: *nonInteractive,
@@ -509,6 +513,11 @@ func printUsage() {
 	fmt.Println("  memql worker models        Print the local models this machine would offer,")
 	fmt.Println("                                     or the reason it offers none. --pull <id>")
 	fmt.Println("                                     pulls one; --allow <id> offers one.")
+	fmt.Println("  memql worker hardware      Print what this machine reports about itself:")
+	fmt.Println("                                     chip, memory, GPU, runtimes, and the class")
+	fmt.Println("                                     that decides which models are recommended.")
+	fmt.Println("  memql worker probe         Measure a local model against the probe suite:")
+	fmt.Println("                                     structured output, tool calls, throughput.")
 	fmt.Println("  memql worker backup        Print the folders this machine backs up into the")
 	fmt.Println("                                     Library, or the reason it backs up none.")
 	fmt.Println("                                     --once runs one sweep now.")
@@ -529,8 +538,9 @@ func printUsage() {
 	fmt.Println("  --metrics-port <p>   Loopback port for prometheus metrics (default 9100; 0 disables)")
 	fmt.Println("")
 	fmt.Println("SETUP --INFERENCE FLAGS")
-	fmt.Println("  --model <id>         Model to pull; repeatable (default llama3.1:8b and")
-	fmt.Println("                       nomic-embed-text)")
+	fmt.Println("  --model <id>         Model to pull; repeatable. The default is the set")
+	fmt.Println("                       recommended for this machine's class; run")
+	fmt.Println("                       memql worker hardware to see it.")
 	fmt.Println("  --runtime <r>        docker | native, overriding the runtime this platform")
 	fmt.Println("                       would choose. A combination the platform cannot serve")
 	fmt.Println("                       is refused rather than ignored.")

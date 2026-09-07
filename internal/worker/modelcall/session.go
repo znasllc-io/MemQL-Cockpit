@@ -551,15 +551,39 @@ func (m *Manager) classify(c *call, err error) (finish, code, detail string) {
 	return FinishError, CodeRuntimeError, err.Error()
 }
 
-func (m *Manager) clientFor(info models.Info) client {
+func (m *Manager) clientFor(info models.Info) Client {
+	return NewClient(info, m.http, m.getenv)
+}
+
+// NewClient builds the runtime client for one model.
+//
+// It is the SINGLE place that knows how to reach a runtime from a
+// models.Info, and it is exported so internal/worker/probe reaches it
+// the same way this manager does. Two constructors would be two places
+// for the api_key_env resolution and the base URL to drift, and the
+// failure is a probe that authenticates where the serving path does not
+// -- which presents as a model that measures fine and refuses every
+// real call.
+//
+// getenv may be nil, which resolves no api_key_env: a declared runtime
+// that needs a bearer then fails its call rather than sending an empty
+// one, which is the fail-closed direction.
+func NewClient(info models.Info, httpClient *http.Client, getenv func(string) string) Client {
+	if httpClient == nil {
+		// No client-level timeout, for the reason NewManager gives: the
+		// envelope owns the deadlines and a second one here would cut a
+		// legitimate long generation off at whatever number this file
+		// happened to pick.
+		httpClient = &http.Client{}
+	}
 	if info.Kind == models.KindOpenAICompatible {
 		key := ""
-		if info.APIKeyEnv != "" {
-			key = m.getenv(info.APIKeyEnv)
+		if info.APIKeyEnv != "" && getenv != nil {
+			key = getenv(info.APIKeyEnv)
 		}
-		return &openAIClient{baseURL: info.BaseURL, apiKey: key, http: m.http}
+		return &openAIClient{baseURL: info.BaseURL, apiKey: key, http: httpClient}
 	}
-	return &ollamaClient{baseURL: info.BaseURL, http: m.http}
+	return &ollamaClient{baseURL: info.BaseURL, http: httpClient}
 }
 
 // -----------------------------------------------------------------------------

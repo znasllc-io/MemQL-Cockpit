@@ -14,6 +14,7 @@ import (
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/modelcall"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
@@ -251,11 +252,28 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
 	}
 }
 
+// hardwareRefreshBeats is how often the hardware inventory is re-scanned
+// onto the heartbeat (design record D1: "refreshed on every tenth
+// heartbeat"). At the 15-second default that is a refresh every two and
+// a half minutes, so a pulled model or an installed runtime shows within
+// minutes -- the record's own words -- without shelling out to
+// nvidia-smi and `docker version` four times a minute.
+const hardwareRefreshBeats = 10
+
+// hardwareOnBeat reports whether this beat carries the inventory.
+//
+// Register carries the first one, so beat 10 is the first REFRESH
+// rather than the first report -- a machine that reported on beat 1 as
+// well would send the same payload twice within fifteen seconds of
+// connecting.
+func hardwareOnBeat(beat int) bool { return beat > 0 && beat%hardwareRefreshBeats == 0 }
+
 func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 	t := time.NewTicker(r.heartbeat)
 	defer t.Stop()
 	refresh := time.NewTicker(modelRefreshInterval)
 	defer refresh.Stop()
+	beat := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -277,7 +295,19 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 			// is a routing change -- so signing into Claude Code makes
 			// this machine selectable on the NEXT BEAT, not the next
 			// reconnect. Sending a snapshot would give that back.
-			if err := conn.SendHeartbeat(0, nil, r.inventory(ctx)); err != nil {
+			beat++
+			// The hardware inventory rides every tenth beat and nothing
+			// in between. It is scanned HERE rather than cached on the
+			// Runner because a scan whose result is held across beats
+			// would report a runtime that has since been uninstalled --
+			// and the whole reason for the refresh is that a machine
+			// changes under the worker.
+			var hw *hardware.Inventory
+			if hardwareOnBeat(beat) {
+				inv := hardware.Local(ctx)
+				hw = &inv
+			}
+			if err := conn.SendHeartbeat(0, nil, r.inventory(ctx), hw); err != nil {
 				return
 			}
 		}
