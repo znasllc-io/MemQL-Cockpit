@@ -549,9 +549,14 @@ func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, li
 				c.cancel()
 				return
 			}
-			if idle >= limits.keepalive {
+			if stream.sinceSend() >= limits.keepalive {
 				// A delta with no content, carrying its own seq so it can
 				// never be mistaken for a replayed content delta.
+				//
+				// The cadence is measured against the last SEND, not the
+				// last content: two keepalives in a row are correct
+				// while a runtime is thinking, and measuring this
+				// against the idle clock would emit one on every tick.
 				if err := stream.keepalive(); err != nil {
 					c.cancel()
 					return
@@ -638,21 +643,44 @@ type deltaStream struct {
 	sender    Sender
 	requestID string
 
-	mu   sync.Mutex
-	seq  uint64
-	last time.Time
+	mu  sync.Mutex
+	seq uint64
+	// lastSend is when this worker last put ANYTHING on the stream,
+	// content or keepalive. It drives the keepalive CADENCE.
+	lastSend time.Time
+	// lastContent is when the RUNTIME last produced output. It drives
+	// the idle VERDICT, and the two are separate clocks for a reason
+	// that is easy to get wrong: a keepalive is this worker's own
+	// output and says nothing whatever about the runtime. A single
+	// clock that a keepalive reset would make the idle ceiling
+	// unreachable -- every keepalive pushes the deadline it exists to
+	// enforce, so a wedged runtime is never noticed and the call runs
+	// to the whole-call timeout while the engine, receiving keepalives,
+	// believes the machine is healthy.
+	lastContent time.Time
 }
 
 func (s *deltaStream) touch() {
 	s.mu.Lock()
-	s.last = time.Now()
+	now := time.Now()
+	s.lastSend, s.lastContent = now, now
 	s.mu.Unlock()
 }
 
+// idleFor is how long THE RUNTIME has been silent. Keepalives do not
+// reset it -- see lastContent.
 func (s *deltaStream) idleFor() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return time.Since(s.last)
+	return time.Since(s.lastContent)
+}
+
+// sinceSend is how long since anything went out on the stream, which is
+// what the keepalive cadence is measured against.
+func (s *deltaStream) sinceSend() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.lastSend)
 }
 
 func (s *deltaStream) emit(content string) error {
@@ -667,7 +695,15 @@ func (s *deltaStream) send(content string, keepalive bool) error {
 	s.mu.Lock()
 	seq := s.seq
 	s.seq++
-	s.last = time.Now()
+	now := time.Now()
+	s.lastSend = now
+	// ONLY CONTENT MOVES THE IDLE CLOCK. A keepalive proves this worker
+	// is alive to the engine; it proves nothing about the runtime, and
+	// letting it reset the idle verdict is what makes the ceiling
+	// unenforceable from this side.
+	if !keepalive {
+		s.lastContent = now
+	}
 	s.mu.Unlock()
 	return s.sender.SendModelCallDelta(s.requestID, seq, content, keepalive)
 }

@@ -179,11 +179,16 @@ channel — as labels the engine's fleet router selects on:
 
 ```
 capability   MODEL
-label        model:llama3.1:8b   = ctx=131072,structured=1,max=2,params=8030000000,quant=Q4_K_M,tools=1
-label        model:nomic-embed-text = ctx=2048,embeddings=1,max=4,params=137000000,quant=F16
-label        runtime:ollama
+label        model:qwen3.5:9b       = ctx=262144,structured=1,max=2,params=9000000000,quant=Q4_K_M,tools=1,vision=1
+label        model:qwen3-embedding:0.6b = ctx=2048,embeddings=1,max=4,params=600000000,quant=F16
+label        runtime:ollama         = 0.13.0
 concurrency  MODEL = 6
 ```
+
+The `runtime:` label's **value is the runtime's version**. A runtime whose
+version could not be read keeps the label with an empty value: the label is
+the advertisement that the runtime is here, and dropping it over an unreadable
+version would hide a runtime that is running.
 
 `memql worker models` prints those exact strings, and beside each one the
 same facts spelled for a person — `8B, Q4_K_M, 131072 context, tools,
@@ -228,6 +233,63 @@ the file you just edited would change nothing.
 `max_concurrent` is the one attribute that is **never** left absent: the engine
 reads a missing ceiling as *unlimited*. `OLLAMA_NUM_PARALLEL` sets it; silence
 gets 1.
+
+### The four modalities
+
+Beyond chat and embeddings, a machine can advertise four more things it can
+do. Each is a key on the same label, present only when true — **there is no
+`vision=0`**, because a missing key and a stated "no" have to be different
+things on the wire:
+
+| key | what it means | where the claim comes from |
+|---|---|---|
+| `vision=1` | the model accepts images | Ollama's own `/api/show` capability list |
+| `imagegen=1` | the model generates images | the same capability list |
+| `audioin=1` | the model transcribes audio | **declared only** |
+| `audioout=1` | the model produces speech | **declared only** |
+
+Two of the four are real probes and two are not, and the asymmetry is not an
+oversight. Ollama reports a `vision` capability and reports **nothing** about
+audio in either direction, so there is no honest probe for those two short of
+sending real audio to every model on the machine. The alternative — reading a
+modality out of a model's **name** — is exactly the failure this rule exists
+to prevent: a "kokoro" in an id is not a runtime that answered, and a machine
+that advertised speech on that basis takes a call it cannot serve, with the
+failure landing on somebody else's prompt.
+
+So a bare Ollama offers `vision` where its models report one, and nothing
+else. To advertise transcription or speech, declare the endpoint that serves
+them:
+
+```yaml
+models:
+  runtimes:
+    - name: local-speech
+      base_url: http://127.0.0.1:8880/v1
+      models:
+        - id: kokoro-82m
+          audio_out: true
+```
+
+The keys are spelled `vision`, `audio_in`, `audio_out` and `image_gen` — as
+the **label** spells them, so an operator comparing `audioout=1` on the Fleet
+page against this file reads one word in both places.
+
+### Serving a modality call
+
+The four kinds — `vision`, `transcribe`, `speak`, `image` — ride the same
+`ModelCall` envelope as chat, over the stream this worker already holds open.
+The machine's own runtimes serve them: vision and transcription through
+Ollama's OpenAI-compatible surface, speech through a Kokoro runtime, images
+through Ollama's own generate route.
+
+**At the current engine pin the payload has nowhere to travel.** The wire
+carries the *kind* and the *flags* today, and the fields for an image in or
+audio bytes out are the engine half of memql#5137, which has not merged. A
+modality call that arrives before then is refused with `payload_unavailable`
+and a sentence saying why — never served as a text completion, because a
+machine that answered a vision request with a generation that never saw the
+image would report success for a generation about nothing.
 
 ### `sharedInference` is not the cockpit's to send
 
@@ -356,9 +418,174 @@ terminal right now.
 
 ---
 
+## What this machine says it IS
+
+`memql worker hardware` prints the inventory the cockpit reports on `Register`
+and refreshes on every tenth heartbeat — chip, memory, GPU with its backend,
+CPU cores, OS, free disk on the volume the runtime keeps models on, and every
+model runtime it found with the version that runtime reported.
+
+```
+  Chip         Apple M3 Max
+  Memory       64 GB unified
+  GPU          Apple M3 Max, 64 GB, metal
+  CPU cores    16
+  OS           macOS 15.1
+  Disk free    412 GB
+  Runtimes     docker 27.3.1, ollama 0.13.0
+
+  Class        32 -- 48.0 GB usable, 75% of 64 GB unified
+```
+
+**Presence facts only.** No serial numbers, no user names, no paths, no
+hostname — and that is asserted by a test over the field set rather than
+by review, because this payload lands on a registration row the owner's
+whole cluster can read.
+
+### The class, and what it is not
+
+The class is the largest of 16, 24, 32, 64 and 128 not exceeding **usable**
+memory: three quarters of the unified pool on Apple Silicon, because the OS
+and everything else the person has open live in the same memory; the whole of
+VRAM on a discrete card, because nothing else is in it.
+
+**It is not the hardware floor.** The floor decides whether this machine
+serves models at all. The class decides only which set is *recommended* — so a
+Linux box with 8 GB of VRAM clears the floor, serves perfectly well, and
+classes `unsupported`. That machine still gets a set; it gets the smallest
+one.
+
+Usable memory is rounded to the nearest whole gigabyte rather than floored,
+and that matters more than it sounds: `nvidia-smi` reports total memory minus
+what the driver has already reserved, so a card sold as 24 GB reports about
+23.99 GB. Flooring puts every 24 GB machine in class 16 and classes every
+16 GB card `unsupported` — systematic, always in the same direction, and
+invisible except as a fleet that quietly under-recommends.
+
+### The recommended set
+
+`memql worker setup --inference` pulls the set for this machine's class, in
+order, with the embedder last — a run interrupted halfway should leave a
+machine with a general model rather than with only an embedder.
+
+| class | set |
+|---|---|
+| 16, 24, and below | `qwen3.5:9b`, `qwen3-embedding:0.6b` |
+| 32 | adds `qwen3.8:27b` |
+| 64, 128 | adds `qwen3.5:35b` and `gemma4:26b`; the embedder becomes `qwen3-embedding:4b` |
+
+`--model` still overrides, and the closing block still reports what the
+**cluster** will see rather than restating the command line.
+
+---
+
+## Measuring a model
+
+`memql worker probe` runs a version-pinned suite against a model this machine
+offers and reports what it measured: structured-output validity over five
+schemas drawn from the platform's own prompts, tool-call correctness over
+three tool definitions, and throughput plus time to first token at an 8K and a
+32K prompt.
+
+```
+  structured validity      1.00         5 of 5 schemas held
+  tool call correctness    0.67         2 of 3 definitions (missed: search)
+  throughput 8K            49.8 tok/s   92 tokens in 1.848s
+  time to first token 8K   1.04 s       first token after 1.041s
+  throughput 32K           --
+      the 32K throughput case did not answer within 2m0s and was ended.
+```
+
+**A figure and an absence are never the same shape.** A case that scored zero
+and a case that could not run are opposite facts — the first says the model
+failed, the second says nothing about the model at all — so a measured row
+carries a number and an unmeasured one carries a dash with its reason on the
+line below. Rendering both as `0` would rank a working model below a broken
+one.
+
+**These figures rank; they gate nothing.** A model that fails a case is still
+offered for every call it advertises. Making a failed probe a hard eligibility
+gate is a later decision, after a release of measurements — a probe that
+refuses a working model on a bad run is worse than no probe.
+
+The suite version is a **pin, not a floor**: measurements are filed by
+`(machine, model, suiteVersion)`, so a version this cockpit does not know is
+refused in both directions rather than run under the wrong number.
+
+---
+
+## Serving the cluster, not just yourself
+
+`policy.yaml`'s `inference.serve` is this machine's answer to *who may this
+GPU serve*:
+
+```yaml
+inference:
+  serve: cluster    # or owner, which is the default
+```
+
+**Sharing takes two consents and this is one of them.** The other is the
+owner's, set from the machine page; a machine serves somebody else's prompt
+only when both say `cluster`. A machine cannot grant a permission on its
+owner's behalf — the same rule that keeps `sharedInference` off the cockpit
+entirely.
+
+An unrecognised value is `owner`: not an error and not the grant. A typo must
+not widen a permission, and it must not stop a worker starting either. The
+field is re-read on `SIGHUP`, logged when it changes, and **takes effect on
+the next reconnect** — no reconnect is forced for it, because a reconnect
+abandons a running generation and this field steers no call already in flight.
+
+---
+
+## The speech and image runtimes
+
+Some modalities need a runtime Ollama does not provide.
+
+```bash
+memql worker setup --runtime kokoro    # text to speech
+memql worker setup --runtime image     # image generation
+```
+
+Both print the exact commands and ask before running any of them; both refuse
+under `--non-interactive` with exit 3 and install nothing; both are safe to
+re-run, and a second run says the runtime is already there rather than
+printing the commands again.
+
+`--runtime` means two different things and the mix is **refused rather than
+guessed**: alongside `--inference` it chooses how Ollama runs (`docker` or
+`native`), and on its own it installs one of these. A person who typed the
+wrong combination gets a sentence naming the command that works.
+
+Two things are worth knowing before you run either:
+
+- **Kokoro runs in Docker on macOS too**, which the model runtime deliberately
+  does not. A container there cannot reach the Mac's GPU, so a *language*
+  model in one would serve from the CPU — what the hardware floor exists to
+  prevent. An 82M-parameter speech model is faster than real time on a CPU, so
+  the reason does not apply.
+- **`--runtime image` installs nothing.** Image generation is a capability of
+  the model runtime this machine may already have, so the command's job is to
+  tell you whether the runtime reports one and which pull would change that.
+  Its refusal states what the runtime *reported*, never which platforms the
+  vendor offers it on — a claim this cockpit cannot verify and would be stale
+  within a release.
+
+The `runtime:<name>` label appears **only once the runtime answers a probe**,
+never because an install command exited zero: a container that started and
+then died is a successful install and a runtime that is not there.
+
+---
+
 ## Related
 
 - Engine + protocol: [memql#4676](https://github.com/znasllc-io/memql/issues/4676),
   design record `docs/superpowers/specs/2026-08-26-local-models-on-the-fleet-design.md`
 - The cockpit half: [memql-cockpit#357](https://github.com/znasllc-io/memql-cockpit/issues/357)
+- Open-weight defaults and the four modalities:
+  [memql#5137](https://github.com/znasllc-io/memql/issues/5137), cockpit half
+  [memql-cockpit#393](https://github.com/znasllc-io/memql-cockpit/issues/393)
+- The scanner, the probe and shared machines:
+  [memql#5146](https://github.com/znasllc-io/memql/issues/5146), cockpit half
+  [memql-cockpit#396](https://github.com/znasllc-io/memql-cockpit/issues/396)
 - [`local-apps.md`](local-apps.md) — the same shape, for Claude Code and Codex

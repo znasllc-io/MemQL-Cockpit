@@ -625,3 +625,101 @@ func TestStopAll_EndsEveryLiveCall(t *testing.T) {
 		t.Errorf("Live() = %d after StopAll; the concurrency slot leaked", m.Live())
 	}
 }
+
+// A KEEPALIVE MUST NOT PUSH BACK THE IDLE DEADLINE, and this is the
+// unit-level statement of the bug that made TestIdleTimeout_EndsTimeout
+// take anywhere between one second and never.
+//
+// The two clocks answer different questions. `lastSend` is "when did
+// this worker last put anything on the stream", which is what the
+// keepalive cadence is measured against. `lastContent` is "when did the
+// RUNTIME last produce output", which is the only thing the idle
+// ceiling can honestly be about -- a keepalive is this worker's own
+// output and says nothing whatever about the runtime behind it.
+//
+// One clock for both is the trap: with keepalive at half the idle
+// ceiling, every keepalive resets the deadline it exists to enforce, so
+// the ceiling is reached only when scheduling jitter lands a tick late.
+// In production that is worse than a flaky test -- a wedged runtime is
+// never noticed, the call runs to the whole-call timeout holding the
+// GPU, and the engine, receiving keepalives, believes the machine is
+// healthy the entire time.
+func TestKeepaliveDoesNotResetTheIdleClock(t *testing.T) {
+	s := &deltaStream{sender: newRecorder(), requestID: "r"}
+	s.touch()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := s.keepalive(); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.idleFor() < 20*time.Millisecond {
+		t.Fatalf("a keepalive reset the idle clock: idleFor = %s", s.idleFor())
+	}
+	// And it DID reset the send cadence, which is the half that keeps
+	// the engine's own idle timer alive.
+	if s.sinceSend() > 5*time.Millisecond {
+		t.Fatalf("a keepalive did not reset the send cadence: sinceSend = %s", s.sinceSend())
+	}
+}
+
+// Content moves BOTH clocks: the runtime spoke, so the idle ceiling
+// restarts, and something went out, so the keepalive cadence restarts
+// too.
+func TestContentResetsBothClocks(t *testing.T) {
+	s := &deltaStream{sender: newRecorder(), requestID: "r"}
+	s.touch()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := s.emit("hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.idleFor() > 5*time.Millisecond {
+		t.Fatalf("content did not reset the idle clock: idleFor = %s", s.idleFor())
+	}
+	if s.sinceSend() > 5*time.Millisecond {
+		t.Fatalf("content did not reset the send cadence: sinceSend = %s", s.sinceSend())
+	}
+}
+
+// The whole point, at the level it actually matters: a runtime that
+// goes quiet is ended by THIS machine, even though the worker keeps
+// answering the engine with keepalives the entire time. Both facts are
+// asserted together, because fixing one by dropping the other would
+// pass a narrower test and break the engine's own idle detection.
+func TestASilentRuntimeIsEndedWhileKeepalivesStillFlow(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		drain(r)
+		flusher, _ := w.(http.Flusher)
+		fmt.Fprintf(w, "%s\n", mustJSON(map[string]any{"message": map[string]string{"content": "one"}, "done": false}))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	m := managerFor(inventoryWith(ollamaModel(srv.URL, "m", models.Attributes{MaxConcurrent: 1})))
+	rec := newRecorder()
+	s := start("r", "m", KindChat)
+	s.Limits = &memqlv1.ModelCallLimits{TimeoutSeconds: 30, IdleTimeoutSeconds: 2, KeepaliveSeconds: 1}
+	m.Start(context.Background(), rec, s)
+
+	end := rec.wait(t)
+	if end.GetFinishReason() != FinishTimeout || end.GetErrorCode() != CodeTimeout {
+		t.Fatalf("end = %+v, want the idle ceiling to have ended it", end)
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	keepalives := 0
+	for _, d := range rec.deltas {
+		if d.GetKeepalive() {
+			keepalives++
+		}
+	}
+	if keepalives == 0 {
+		t.Fatal("no keepalive was sent; the engine had no reason to believe this worker was alive")
+	}
+}

@@ -348,6 +348,87 @@ dispatch arm would call is live and reachable through
 is not there.
 
 
+## The scanner, the probe, sharing, and the four modalities
+
+Epics memql-cockpit#393 (open-weight defaults) and #396 (the scanner and
+shared machines). Engine halves: memql#5137 and memql#5146, **neither
+merged**. Design records live in the ENGINE repo,
+`docs/superpowers/specs/2026-09-07-*-design.md`; this repository has no
+separate record for either. Operator doc: [docs/local-models.md](docs/local-models.md).
+
+**`internal/worker/hardware` is what this machine IS**, as presence facts
+only: chip, memory, gpu {name, vram, backend}, cpu cores, os version,
+disk free, runtimes with versions, reportedAt. No serials, no user
+names, no paths, no hostname -- and the FIELD SET IS ASSERTED BY A TEST
+rather than reviewed, because the payload lands on a registration row
+the owner's whole cluster can read and review is where "just this one
+path, for debugging" gets through. `Scan` is a pure function of `Probe`
+for the reason `inference.Decide` is a pure function of `Host`.
+
+**The class is not the floor**, and conflating them refuses a machine
+that works. The floor decides whether this machine serves models at all;
+the class decides only which set is RECOMMENDED, so a Linux box with
+8 GB of VRAM clears the floor, serves fine, and classes `unsupported` --
+and still gets the smallest set. **Usable memory ROUNDS to whole
+gigabytes, never floors**: nvidia-smi reports total minus the driver's
+reservation, so a 24 GB card reports 23.99 and flooring puts every one
+of them a whole class low, systematically and always in the same
+direction.
+
+**A probe FIGURE and an ABSENCE are never the same shape.** A case that
+scored zero and a case that could not run are opposite facts -- the
+first says the model failed, the second says nothing about the model at
+all -- so `probe.Figure` carries one or the other and `Measured()` is
+the only way to ask. Rendering both as `0` ranks a working model below a
+broken one. The suite version is a PIN, not a floor: figures are filed
+by `(machine, model, suiteVersion)`, so an unknown version is refused in
+BOTH directions. Each case runs under its own deadline, because a
+whole-run ceiling loses every figure to the last case that hung.
+
+**`inference.serve` is one of TWO consents.** The other is the owner's,
+on the registration; a machine serves somebody else's prompt only when
+both say `cluster`. It rides the EXISTING `capability_descriptor_json`
+field -- the one place a cockpit can define a key ahead of the engine
+and have it travel, because `ParseCapabilityDescriptor` tolerates
+unknown keys (`displays` set that precedent) while `AsMap()` drops them.
+**`CapabilityDescriptorSchemaVersion` STAYS 1**: the engine admits that
+number and refuses any other BY VALUE, so a bump for an additive field
+is a handshake refusal on every machine at once.
+
+**Two of the four modality flags are real probes and two are not.**
+`vision` and `imagegen` come from Ollama's own `/api/show` capability
+list. `audioin` and `audioout` have no capability anywhere, so a bare
+Ollama offers neither and an operator's declaration under
+`models.runtimes` is the only source. The alternative was never "probe
+harder" -- it was guessing from a model id, and a "kokoro" in a name is
+not a runtime that answered. False is ABSENT on the label; there is no
+`vision=0`.
+
+**The four KINDS ship; the four PAYLOADS cannot.** `ModelCallStart.kind`
+is a plain string and labels are a `map<string,string>`, so both travel
+today. There is nowhere on the wire for an image in or audio bytes out
+until memql#5137 lands, so `modelcall/payload.go`'s `payloadFor` is the
+one place those fields will be read, and a modality call is refused with
+`payload_unavailable` rather than served as a text completion -- which
+would report success for a generation that never saw the image. The
+settled field names and numbers are written out in that file's comment.
+
+**`--runtime` means two different things and the mix is REFUSED.**
+Alongside `--inference` it chooses how Ollama runs (docker | native); on
+its own it installs kokoro or image. Kokoro runs in Docker on macOS TOO,
+diverging from the inference record's D1 on purpose: D1 forbids a
+container there because it cannot reach the GPU, which matters for a
+language model and not for an 82M speech model. `--runtime image`
+installs nothing at all -- image generation is a capability of a runtime
+this machine may already have -- and its refusal states what the runtime
+REPORTED rather than which platforms the vendor offers it on.
+
+**The `runtime:<kind>` label now carries a VERSION as its value** and
+appears only once the runtime answers a probe, never because an install
+command exited zero. That value change, plus the four modality keys,
+costs every machine one reconnect on rollout.
+
+
 ## Watched-folder backup (memql#4841)
 
 One folder on this machine, kept arriving in a MemQL Library folder. The engine
