@@ -117,9 +117,32 @@ type AppsPolicy struct {
 // here: they are the shape discovery consumes, and the yaml tags belong
 // with the struct that carries the fields. models imports nothing from
 // this repo, so the direction stays acyclic.
+//
+// models.pull is the OPPOSITE posture -- DEFAULT TRUE -- and the
+// inconsistency is the point rather than an oversight. Allowing a model
+// spends this machine's GPU on somebody ELSE's prompt, which is a grant
+// only the machine's owner can make; PULLING one is that owner acting on
+// their own machine, and the engine gates the act on being that owner
+// before it ever reaches this process. A default-deny pull switch would
+// mean every machine in the fleet answered "Pull" with a refusal until
+// somebody edited a file on it by hand, on the machine -- which is the
+// exact errand this feature exists to remove. An operator who wants the
+// machine to refuse says so:
+//
+//	models:
+//	  pull: false
 type ModelsPolicy struct {
 	Allow    []string                 `yaml:"allow"`
 	Runtimes []models.DeclaredRuntime `yaml:"runtimes"`
+	// Pull is a POINTER, and that is the whole of how the default-true
+	// posture survives contact with a yaml file. An absent key
+	// unmarshals into the zero value, so a plain bool would read every
+	// policy.yaml written before this key existed -- which is all of
+	// them -- as `pull: false`, and every machine already in the fleet
+	// would start refusing pulls with nothing on it saying why. nil
+	// means "the file has no opinion", and the accessor answers that
+	// with the default. Do not "simplify" this to a bool.
+	Pull *bool `yaml:"pull"`
 }
 
 // BackupPolicy controls which folders this machine will back up into the
@@ -307,6 +330,13 @@ func (p *Policy) reload() error {
 	// models.allow merges the way apps.allow does, so SIGHUP makes a
 	// newly pulled model offerable without a worker restart.
 	p.models.Allow = mergeUnique(p.models.Allow, raw.Models.Allow)
+	// models.pull REPLACES rather than merges, for the reason the
+	// runtimes below do and one of its own: the field is tri-state, so
+	// "absent" is a meaningful value (the default, true). Merging would
+	// make `pull: false` unremovable without a worker restart -- an
+	// operator who deleted the line would keep the refusal and have
+	// nothing left in the file that explained it.
+	p.models.Pull = raw.Models.Pull
 	// Runtimes REPLACE rather than merge, and the asymmetry is
 	// deliberate: an allow entry is a bare name, where a runtime is a
 	// record with a base URL, a key variable and a model list. Merging
@@ -523,6 +553,36 @@ func (p *Policy) ModelsAllow() []string {
 	out := make([]string, len(p.models.Allow))
 	copy(out, p.models.Allow)
 	return out
+}
+
+// ModelsPullAllowed reports whether this machine will pull a model when
+// it is asked to -- by its own CLI, and by the engine once the model-pull
+// messages exist on the wire (they are not in the pinned proto today).
+//
+// TRUE when the key is absent, which is the opposite of every other
+// answer this file gives. The reasoning is on ModelsPolicy: a pull is the
+// machine's own owner acting on their own machine, and a fleet-wide
+// silent refusal is a worse failure than a pull somebody did not want,
+// which the engine's owner-only gate already prevents.
+//
+// It returns the VALUE, never the pointer, for the reason ModelsAllow
+// returns a copy: a SIGHUP reload replaces this field underneath a caller
+// that is still deciding, and a caller holding the pointer would be
+// reading a switch that flipped between its own two lines.
+func (p *Policy) ModelsPullAllowed() bool {
+	if p == nil {
+		// A build that loaded no policy at all has refused nothing.
+		// Answering false here would refuse a pull the owner asked for
+		// with no line in any file to point at -- the same direction
+		// MaxBodyBytes takes for a nil policy.
+		return true
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.models.Pull == nil {
+		return true
+	}
+	return *p.models.Pull
 }
 
 // ModelRuntimes returns a copy of the declared OpenAI-compatible

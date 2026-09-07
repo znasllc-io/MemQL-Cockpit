@@ -18,6 +18,18 @@ import (
 // wants no model reporting at all can pass nil.
 type ModelInventory interface {
 	Models(ctx context.Context) models.Inventory
+	// Invalidate forgets whatever was cached, so the next Models pays
+	// for a fresh probe.
+	//
+	// On the INTERFACE rather than behind a type assertion, because the
+	// caller that needs it -- the pull path, through
+	// Runner.RequestImmediateReadvertise -- is re-advertising on the
+	// strength of what the next Models says. An implementation that
+	// silently could not forget would hand it the label set from before
+	// the pull, the reconnect would re-register the old labels, and the
+	// person watching would see a pull that did nothing. The compiler
+	// asking every implementation to answer is the point.
+	Invalidate()
 }
 
 // DefaultModelInventoryTTL bounds how stale a discovery result may be.
@@ -37,11 +49,19 @@ type ModelInventory interface {
 // once -- at the first registration -- and never again while connected.
 const DefaultModelInventoryTTL = 90 * time.Second
 
+// modelDiscoverer is the discovery half, as an interface for the reason
+// ModelInventory is one: the cache and its invalidation are testable on a
+// machine with no Ollama, and on one that HAS Ollama they cannot pass for
+// the wrong reason.
+type modelDiscoverer interface {
+	Discover(ctx context.Context, req models.Request) models.Inventory
+}
+
 // policyModelInventory pairs the discoverer with the policy that gates it.
 // The policy is read on every call rather than captured, so a SIGHUP that
 // adds a model to models.allow is picked up by the next refresh.
 type policyModelInventory struct {
-	discoverer *models.Discoverer
+	discoverer modelDiscoverer
 	policy     *tools.Policy
 	ttl        time.Duration
 
@@ -82,6 +102,30 @@ func (p *policyModelInventory) Models(ctx context.Context) models.Inventory {
 	})
 	p.at = p.clock()
 	return p.cached
+}
+
+// Invalidate drops the cached inventory so the next Models re-probes.
+//
+// WHY IT EXISTS. The cache is 90 seconds wide, and a model pulled a
+// moment ago is not in one taken 30 seconds before it. A re-advertise
+// triggered right after a pull -- which is the whole point of the pull
+// path: somebody pressed Pull and is watching -- would otherwise spend a
+// RECONNECT to re-register the label set from BEFORE the pull. The
+// reconnect happens, the labels do not change, and the pull reads to the
+// person watching as one that did nothing, with every log line saying it
+// succeeded.
+//
+// It is a one-shot, not a switch: the fresh result is cached in its turn.
+// Nothing here re-probes on the spot, because the caller is usually
+// holding a pull that just finished and the next reader is a moment away.
+func (p *policyModelInventory) Invalidate() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cached = models.Inventory{}
+	p.at = time.Time{}
 }
 
 // -----------------------------------------------------------------------------
