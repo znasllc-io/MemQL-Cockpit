@@ -94,8 +94,8 @@ type AppsPolicy struct {
 //
 //	models:
 //	  allow:
-//	    - llama3.1:8b
-//	    - nomic-embed-text
+//	    - qwen3.5:9b
+//	    - qwen3-embedding:0.6b
 //	  runtimes:
 //	    - name: lmstudio
 //	      base_url: http://127.0.0.1:1234/v1
@@ -103,6 +103,11 @@ type AppsPolicy struct {
 //	        - id: qwen2.5-7b-instruct
 //	          context_window: 32768
 //	          structured_output: true
+//	    - name: local-speech
+//	      base_url: http://127.0.0.1:8880/v1
+//	      models:
+//	        - id: kokoro-82m
+//	          audio_out: true
 //
 // DEFAULT-DENY, for the reason apps.allow is. Serving a model call spends
 // this machine's own GPU on somebody else's prompt, so nothing is offered
@@ -198,6 +203,9 @@ type HTTPPolicy struct {
 // same two words, and a bool here would have to be named for one of them
 // -- `share: true` reads as a grant where `serve: cluster` reads as a
 // setting, and only the second survives being read back a year later.
+//
+//	inference:
+//	  serve: cluster    # or owner, which is the default
 type InferencePolicy struct {
 	Serve string `yaml:"serve"`
 }

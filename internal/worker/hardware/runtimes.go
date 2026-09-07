@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -64,32 +65,59 @@ func ollamaBaseURL() string {
 
 func now() time.Time { return time.Now() }
 
+// scanBudget is the ceiling on the WHOLE runtime scan.
+//
+// THIS RUNS ON THE REGISTER PATH, which is the reason it exists. The
+// models package's floor is explicit about never forking a subprocess
+// there -- a multi-second stall in front of a LaunchAgent's first
+// connection, on every start -- and six probes at five seconds each,
+// run one after another, is exactly that stall by a different route. So
+// the probes run CONCURRENTLY under one deadline: the typical machine
+// answers in about a tenth of a second, and the pathological one (a
+// wedged Docker daemon, a firewalled Ollama) costs this budget once
+// rather than probeTimeout six times.
+//
+// A probe that does not finish inside it reports the runtime ABSENT,
+// which is the same fail-closed answer every other probe here gives to
+// a question it could not settle.
+const scanBudget = 6 * time.Second
+
 // detectRuntimes reports what is installed, sorted by name so an
 // unchanged machine produces a byte-identical payload -- the same
 // stability rule the model labels have, and for the same reason: an
 // unstable rendering rewrites a registration row on every refresh for
 // no change.
 func detectRuntimes(ctx context.Context) []Runtime {
-	found := map[string]string{}
+	ctx, cancel := context.WithTimeout(ctx, scanBudget)
+	defer cancel()
 
-	if v, ok := ollamaVersion(ctx); ok {
-		found[RuntimeOllama] = v
-	}
-	if v, ok := kokoroVersion(ctx); ok {
-		found[RuntimeKokoro] = v
-	}
-	if v, ok := dockerVersion(ctx); ok {
-		found[RuntimeDocker] = v
-	}
-	for name, probe := range map[string]func(context.Context) (string, bool){
+	probes := map[string]func(context.Context) (string, bool){
+		RuntimeOllama:     ollamaVersion,
+		RuntimeKokoro:     kokoroVersion,
+		RuntimeDocker:     dockerVersion,
 		RuntimeMLX:        mlxVersion,
 		RuntimeWhisperCPP: whisperVersion,
 		RuntimeMFlux:      mfluxVersion,
-	} {
-		if v, ok := probe(ctx); ok {
-			found[name] = v
-		}
 	}
+
+	var mu sync.Mutex
+	found := make(map[string]string, len(probes))
+
+	var wg sync.WaitGroup
+	for name, probe := range probes {
+		wg.Add(1)
+		go func(name string, probe func(context.Context) (string, bool)) {
+			defer wg.Done()
+			v, ok := probe(ctx)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			found[name] = v
+			mu.Unlock()
+		}(name, probe)
+	}
+	wg.Wait()
 
 	out := make([]Runtime, 0, len(found))
 	for name, version := range found {
@@ -159,8 +187,18 @@ func mlxVersion(ctx context.Context) (string, bool) {
 	return firstLine(out), true
 }
 
+// whisperVersion tries whisper.cpp's two current binary names.
+//
+// It deliberately does NOT try `main`, which is what whisper.cpp's
+// build produced before it renamed its tools. The name is far too
+// generic to probe for: `main` on somebody's PATH is overwhelmingly
+// likely to be their own build output, and running an arbitrary
+// binary because it shares a name with a runtime we are looking for is
+// not a probe, it is executing a stranger's program to see what it
+// says. A machine with only the old binary reports whispercpp absent,
+// which costs an inventory line and nothing else.
 func whisperVersion(ctx context.Context) (string, bool) {
-	for _, bin := range []string{"whisper-cli", "whisper-cpp", "main"} {
+	for _, bin := range []string{"whisper-cli", "whisper-cpp"} {
 		if out, ok := runVersion(ctx, bin, "--version"); ok {
 			return parseRuntimeVersion(out), true
 		}
