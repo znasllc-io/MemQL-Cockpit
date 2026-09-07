@@ -29,6 +29,7 @@ import (
 //	memql worker                   Open the pairing wizard (paste a code)
 //	memql worker run [flags]       Run the worker (assumes worker.yaml already written)
 //	memql worker setup             Re-run TCC permissions check (computeruse builds)
+//	memql worker setup --inference Install a model runtime, pull models, allow them
 //	memql worker config            Print effective config
 //
 // `pair` is the primary entry: it walks the user from "I have an
@@ -341,6 +342,24 @@ func handleRun(args []string) {
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
+					// A RELOADED models.allow THAT NOBODY
+					// RE-ADVERTISED IS A MODEL THE CLUSTER STILL
+					// CANNOT SEE. Model labels are bound at Register
+					// and Heartbeat carries none of them, so the
+					// reload changes only this machine's own answer to
+					// "may I serve this" -- and `memql worker setup
+					// --inference` and `memql worker models --allow`
+					// both end by sending this signal and telling the
+					// operator the cluster will see the model shortly.
+					// Without this line that sentence is false and the
+					// whole feature ends at "the file changed".
+					//
+					// It drops the inventory cache and waives the
+					// two-minute reconnect floor once; the busy guard
+					// is not waived, so nothing in flight is killed
+					// for it. Read RequestImmediateReadvertise before
+					// moving it.
+					runner.RequestImmediateReadvertise()
 				}
 			default:
 				logger.Info("worker shutting down", "signal", sig.String())
@@ -389,11 +408,55 @@ func handleRun(args []string) {
 // instead of pausing for approval -- for scripted installs and CI.
 var setupNonInteractive bool
 
-func handleSetup(args []string) {
+// setupFlags is `worker setup`'s command line, parsed.
+//
+// A struct rather than five locals so the ONE decision this command
+// makes -- which of two entirely different things it is -- is assertable
+// in a test without a terminal, a machine, or an os.Exit. See
+// TestSetupFlags.
+type setupFlags struct {
+	nonInteractive bool
+	inference      bool
+	configPath     string
+	runtimeFlag    string
+	modelIDs       []string
+}
+
+func parseSetupFlags(args []string) setupFlags {
 	fs := flag.NewFlagSet("worker setup", flag.ExitOnError)
-	nonInteractive := fs.Bool("non-interactive", false, "never prompt; report what is missing and exit 4 (not granted) or 5 (probe failed)")
+	nonInteractive := fs.Bool("non-interactive", false, "never prompt; report what is missing and exit 3 (a question could not be asked), 4 (not granted) or 5 (probe failed)")
+	inference := fs.Bool("inference", false, "set this machine up to serve local models: runtime, models, models.allow")
+	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml (its directory holds policy.yaml)")
+	runtimeFlag := fs.String("runtime", "", "with --inference: docker | native, overriding the runtime this platform would choose")
+	var modelIDs repeatedFlag
+	fs.Var(&modelIDs, "model", "with --inference: a model id to pull; repeatable (default: llama3.1:8b and nomic-embed-text)")
 	_ = fs.Parse(args)
-	setupNonInteractive = *nonInteractive
+	return setupFlags{
+		nonInteractive: *nonInteractive,
+		inference:      *inference,
+		configPath:     *configPath,
+		runtimeFlag:    *runtimeFlag,
+		modelIDs:       modelIDs,
+	}
+}
+
+func handleSetup(args []string) {
+	f := parseSetupFlags(args)
+	setupNonInteractive = f.nonInteractive
+
+	// --inference IS ITS OWN COMMAND, and the branch is here rather than
+	// inside the wizard so the computer-use pre-flight is UNTOUCHED when
+	// the flag is absent. That pre-flight is reached by `worker pair` on
+	// every machine that enrolls; folding a model setup into it would
+	// mean an enrollment could now fail for a reason that has nothing to
+	// do with the permissions it was asking about -- on the majority of
+	// machines, which are below the hardware floor and were never going
+	// to serve a model.
+	if f.inference {
+		os.Exit(runInferenceSetup(context.Background(),
+			newInferenceSetup(f.configPath, f.modelIDs, f.nonInteractive, f.runtimeFlag)))
+	}
+
 	if err := runSetupWizard(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		// The wizard's own code, not a flat 1: an install script reading
@@ -439,9 +502,13 @@ func printUsage() {
 	fmt.Println("  memql worker run           Run an already-configured worker (used by")
 	fmt.Println("                                     LaunchAgent / scripts).")
 	fmt.Println("  memql worker setup         Re-run TCC permissions check (computeruse builds only).")
+	fmt.Println("  memql worker setup --inference")
+	fmt.Println("                                     Set this machine up to serve local models:")
+	fmt.Println("                                     the runtime, the models, and models.allow.")
 	fmt.Println("  memql worker config        Print the effective config.")
 	fmt.Println("  memql worker models        Print the local models this machine would offer,")
-	fmt.Println("                                     or the reason it offers none.")
+	fmt.Println("                                     or the reason it offers none. --pull <id>")
+	fmt.Println("                                     pulls one; --allow <id> offers one.")
 	fmt.Println("  memql worker backup        Print the folders this machine backs up into the")
 	fmt.Println("                                     Library, or the reason it backs up none.")
 	fmt.Println("                                     --once runs one sweep now.")
@@ -460,6 +527,15 @@ func printUsage() {
 	fmt.Println("  --name <name>        Worker name (overrides config)")
 	fmt.Println("  --log-level <l>      Log level: debug | info | warn | error")
 	fmt.Println("  --metrics-port <p>   Loopback port for prometheus metrics (default 9100; 0 disables)")
+	fmt.Println("")
+	fmt.Println("SETUP --INFERENCE FLAGS")
+	fmt.Println("  --model <id>         Model to pull; repeatable (default llama3.1:8b and")
+	fmt.Println("                       nomic-embed-text)")
+	fmt.Println("  --runtime <r>        docker | native, overriding the runtime this platform")
+	fmt.Println("                       would choose. A combination the platform cannot serve")
+	fmt.Println("                       is refused rather than ignored.")
+	fmt.Println("  --non-interactive    Never ask. A runtime install it would have asked about")
+	fmt.Println("                       is refused with exit 3 and nothing is installed.")
 }
 
 func newLogger(level string) *slog.Logger {

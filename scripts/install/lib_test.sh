@@ -17,6 +17,11 @@
 # the flavour/platform pair), plus both installers refusing BEFORE any
 # mutation when the asset is missing and proceeding past the preflight
 # to the download when it is present.
+# And the --inference pass-through: setup_inference's reading of the
+# setup command's exit code (0 quiet, 3 prints the interactive command
+# on ONE physical line, anything else reported), that it never fails the
+# install, and that both installers accept the flag and call it after
+# worker.yaml and the service.
 #
 # Run: bash scripts/install/lib_test.sh
 # Wired into CI by .github/workflows/install-scripts-lint.yml.
@@ -349,6 +354,112 @@ for _installer in install-mac.sh install-linux.sh; do
         pass "$_installer proceeds past preflight to the download"
     else
         fail "$_installer should reach the download after preflight; got: $_out"
+    fi
+done
+
+# ---------------------------------------------------------------
+# setup_inference -- the --inference pass-through
+# ---------------------------------------------------------------
+#
+# A machine that paired fine and could not set up local models is still
+# a working worker, so setup_inference REPORTS every failure and returns
+# 0. Exit 3 is the one with its own answer -- "refused: required
+# confirmation not provided", which here means a runtime install a
+# scripted run may not approve -- and the answer is the interactive
+# command, printed for the person who is standing at this terminal now.
+# A fake binary stands in for memql: what is under test is the shell's
+# reading of `$?`, not the Go program's.
+
+_si_bin="${_tmp}/fake-memql"
+_si_log="${_tmp}/fake-memql.argv"
+cat > "$_si_bin" << STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "${_si_log}"
+exit "\${FAKE_MEMQL_EXIT:-0}"
+STUB
+chmod +x "$_si_bin"
+
+_out="$(FAKE_MEMQL_EXIT=0 setup_inference "$_si_bin" 2>&1)"
+_rc=$?
+expect_eq "setup_inference success returns 0" "$_rc" "0"
+expect_eq "setup_inference runs the non-interactive setup" \
+    "$(tail -1 "$_si_log")" "worker setup --inference --non-interactive"
+
+# Exit 3: print the interactive command, and do not fail the install.
+_out="$(FAKE_MEMQL_EXIT=3 setup_inference "$_si_bin" 2>&1)"
+_rc=$?
+expect_eq "setup_inference exit 3 still returns 0 (the install succeeded)" "$_rc" "0"
+
+# The command MUST BE ONE PHYSICAL LINE: it is meant to be copied out of
+# the terminal, and a bracketed paste of a wrapped command has already
+# cost this project once. grep -qx matches the WHOLE line.
+if printf '%s\n' "$_out" | grep -qx "  ${_si_bin} worker setup --inference"; then
+    pass "setup_inference exit 3 prints the interactive command on one line"
+else
+    fail "setup_inference exit 3 should print the interactive command; got: $_out"
+fi
+
+if [[ "$_out" == *"worker setup --inference --non-interactive"* ]]; then
+    fail "setup_inference exit 3 must not tell the operator to re-run the flag that refused"
+else
+    pass "setup_inference exit 3 drops --non-interactive from the printed command"
+fi
+
+# Any other non-zero: reported, install not failed. A below-floor
+# machine (4) or a failed pull (5) is not a reason to undo a working
+# pairing.
+for _si_code in 4 5 1; do
+    _out="$(FAKE_MEMQL_EXIT="$_si_code" setup_inference "$_si_bin" 2>&1)"
+    _rc=$?
+    expect_eq "setup_inference exit ${_si_code} still returns 0" "$_rc" "0"
+    if [[ "$_out" == *"WARN"* && "$_out" == *"exited ${_si_code}"* \
+        && "$_out" == *"paired and working"* ]]; then
+        pass "setup_inference exit ${_si_code} reports without failing the install"
+    else
+        fail "setup_inference exit ${_si_code} should report the code and say the machine still works; got: $_out"
+    fi
+done
+
+# ---------------------------------------------------------------
+# Both installers accept --inference and wire it after the service
+# ---------------------------------------------------------------
+#
+# The flag itself is checked by running the real installer: --help exits
+# 0 before any download, so `--inference --help` proves the flag reached
+# a case arm rather than the unknown-flag branch. The CALL SITE is
+# checked by reading main(), because the end-to-end path needs a
+# release asset over https and these tests stay offline.
+
+for _installer in install-mac.sh install-linux.sh; do
+    if _out="$(cd "$_script_dir" && "./${_installer}" --inference --help 2>&1)" \
+        && [[ "$_out" == *"Usage:"* ]]; then
+        pass "$_installer accepts --inference"
+    else
+        fail "$_installer should accept --inference; got: $_out"
+    fi
+
+    if [[ "$_out" == *"--inference"* ]]; then
+        pass "$_installer documents --inference in its help"
+    else
+        fail "$_installer help should document --inference"
+    fi
+
+    # The order matters: worker.yaml first (nothing to configure
+    # without it), the service next (so there is a running worker for
+    # the setup's SIGHUP to reach), setup_inference last.
+    _line_cfg="$(grep -nF '    write_config' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
+    _line_inf="$(grep -nF 'setup_inference "' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
+    if [[ -n "$_line_cfg" && -n "$_line_inf" && "$_line_inf" -gt "$_line_cfg" ]]; then
+        pass "$_installer runs setup_inference after worker.yaml is written"
+    else
+        fail "$_installer should call setup_inference after write_config (cfg=$_line_cfg inf=$_line_inf)"
+    fi
+
+    # And only when asked: a plain install must not touch the runtime.
+    if grep -qF 'INFERENCE" == "yes"' "${_script_dir}/${_installer}"; then
+        pass "$_installer only sets up inference when --inference was given"
+    else
+        fail "$_installer should guard setup_inference behind --inference"
     fi
 done
 

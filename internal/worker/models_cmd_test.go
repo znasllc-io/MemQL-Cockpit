@@ -50,8 +50,12 @@ func TestModelsReport_NoRuntime(t *testing.T) {
 		Floor:      models.FloorVerdict{Met: true, Detail: "apple silicon, 32 GB, macOS 15"},
 		ProbeNotes: []string{"no Ollama at http://127.0.0.1:11434 (connection refused)"},
 	})
-	if !strings.Contains(out, "Install Ollama") {
-		t.Errorf("with no runtime the report must say what to install:\n%s", out)
+	// The fix is ONE COMMAND now. The old sentence said "install
+	// Ollama", which an operator could follow to the letter and still
+	// end up with no model pulled and nothing in models.allow -- three
+	// steps, of which it named one.
+	if !strings.Contains(out, "memql worker setup --inference") {
+		t.Errorf("with no runtime the report must name the command that fixes it:\n%s", out)
 	}
 	if !strings.Contains(out, "connection refused") {
 		t.Errorf("the probe note must be shown:\n%s", out)
@@ -98,15 +102,59 @@ func TestModelsReport_OfferedPrintsTheExactLabels(t *testing.T) {
 
 // TestModelsReport_NamesTheAbsentCapabilities. A model that is in the
 // catalog and never picked is explained by an ABSENCE, so the absences
-// have to be printed too.
+// have to be printed too -- EVERY absence, including the three that
+// arrived after this command shipped.
 func TestModelsReport_NamesTheAbsentCapabilities(t *testing.T) {
 	out := render(t, servingInventory(
 		offeredModel("plain:7b", models.Attributes{MaxConcurrent: 1}),
 	))
-	if !strings.Contains(out, "structured output: not advertised") {
-		t.Errorf("an absent capability must be named:\n%s", out)
+	for _, want := range []string{
+		"structured output: not advertised",
+		"context not advertised",
+		"tools: not advertised",
+		"size not advertised",
+		"quantization not advertised",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("an absent attribute must be named -- %q is missing:\n%s", want, out)
+		}
 	}
-	if !strings.Contains(out, "context not advertised") {
-		t.Errorf("an absent context window must be named:\n%s", out)
+}
+
+// TestModelsReport_RendersEveryAdvertisedAttribute. This file's promise
+// is that what it prints is what the cluster would be told, and
+// attributeLine enumerates the attributes BY HAND -- so the label and
+// the human line are asserted against each other on the same model. It
+// shipped for one release without params, quant and tools, which are
+// exactly the three the engine ranks and routes on.
+func TestModelsReport_RendersEveryAdvertisedAttribute(t *testing.T) {
+	out := render(t, servingInventory(
+		offeredModel("llama3.1:8b", models.Attributes{
+			ContextWindow: 131072, StructuredOutput: true, Tools: true,
+			Params: 8_030_000_000, Quant: "Q4_K_M", MaxConcurrent: 2,
+		}),
+	))
+	// The label, exactly as the engine parses it.
+	if !strings.Contains(out, "model:llama3.1:8b=ctx=131072,structured=1,max=2,params=8030000000,quant=Q4_K_M,tools=1") {
+		t.Errorf("the exact label must be printed:\n%s", out)
+	}
+	// And the same facts spelled for a person, in the spelling they can
+	// compare against `ollama list`.
+	if !strings.Contains(out, "8B, Q4_K_M, 131072 context, tools, structured output, max 2 concurrent") {
+		t.Errorf("the attribute line must render size, quantization and tools:\n%s", out)
+	}
+}
+
+// An embedding model states no size and no quantization on some
+// runtimes, and the report says so rather than leaving a shorter line
+// that reads as complete.
+func TestModelsReport_EmbeddingModelRendersItsOwnAttributes(t *testing.T) {
+	out := render(t, servingInventory(
+		offeredModel("nomic-embed-text", models.Attributes{
+			ContextWindow: 2048, Embeddings: true, Params: 137_000_000, Quant: "F16", MaxConcurrent: 4,
+		}),
+	))
+	if !strings.Contains(out, "137M, F16, 2048 context, embeddings") {
+		t.Errorf("the embedding model's own attributes must be rendered:\n%s", out)
 	}
 }

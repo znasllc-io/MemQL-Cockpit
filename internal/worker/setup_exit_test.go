@@ -18,6 +18,14 @@ func TestSetupExitCode(t *testing.T) {
 	}{
 		{"success", nil, SetupExitOK},
 		{"prerequisite missing", setupPrereq("Accessibility is not granted"), SetupExitPrereq},
+		// 3 is the --non-interactive case and ONLY that: a question
+		// that had to be answered before anything changed was not.
+		// Nothing is absent (4) and nothing was attempted (5), and the
+		// installers' next step -- print the interactive command for
+		// the person at the terminal -- is right for this code and
+		// wrong for both of the others.
+		{"refused, nobody to ask", setupRefused("--non-interactive cannot answer that"), SetupExitRefused},
+		{"bad invocation", setupUsage("--runtime takes docker or native"), SetupExitUsage},
 		{"probe failed", setupFailed("temp file: no space"), SetupExitOpFailed},
 		// An error nobody classified is an operation failure -- not a
 		// success, and not a prerequisite. Reading it as either would be
@@ -38,7 +46,7 @@ func TestSetupExitCode(t *testing.T) {
 func TestSetupExitCodesAreDistinct(t *testing.T) {
 	seen := map[int]string{}
 	for name, code := range map[string]int{
-		"OK": SetupExitOK, "Usage": SetupExitUsage,
+		"OK": SetupExitOK, "Usage": SetupExitUsage, "Refused": SetupExitRefused,
 		"Prereq": SetupExitPrereq, "OpFailed": SetupExitOpFailed,
 	} {
 		if other, dup := seen[code]; dup {
@@ -62,6 +70,27 @@ func TestSetupErrorCarriesItsMessageAndCode(t *testing.T) {
 	}
 	if se.Code != SetupExitPrereq {
 		t.Errorf("Code = %d, want %d", se.Code, SetupExitPrereq)
+	}
+}
+
+// The codes are the capability-script contract's, and an install script
+// reading `$?` acts on the NUMBER. A renumbering here would leave every
+// installer already on a machine reading the new codes with the old
+// meanings, silently.
+func TestSetupExitCodesMatchTheCapabilityScriptContract(t *testing.T) {
+	for _, tc := range []struct {
+		meaning    string
+		got, wants int
+	}{
+		{"ok", SetupExitOK, 0},
+		{"bad invocation", SetupExitUsage, 2},
+		{"refused: required confirmation not provided", SetupExitRefused, 3},
+		{"precondition failed", SetupExitPrereq, 4},
+		{"operation failed", SetupExitOpFailed, 5},
+	} {
+		if tc.got != tc.wants {
+			t.Errorf("%s = %d, the contract says %d", tc.meaning, tc.got, tc.wants)
+		}
 	}
 }
 
