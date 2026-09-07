@@ -1,0 +1,493 @@
+package inference
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os/exec"
+	"strings"
+	"testing"
+	"unicode"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
+)
+
+// The table asserts the EXACT sentence on every path, and the literals
+// live here rather than behind a shared constant on purpose: a shared
+// constant would let a reworded refusal stay green, and these sentences
+// are the whole product of the package. Changing one has to be a decision
+// somebody makes on purpose, in a diff a reviewer can read.
+
+const gib = 1024 * 1024 * 1024
+
+// lookPath builds a Host.LookPath over a fixed set of binaries, so a
+// fixture never depends on what the CI runner happens to have installed.
+func lookPath(present ...string) func(string) (string, error) {
+	set := make(map[string]bool, len(present))
+	for _, p := range present {
+		set[p] = true
+	}
+	return func(name string) (string, error) {
+		if set[name] {
+			return "/usr/bin/" + name, nil
+		}
+		return "", exec.ErrNotFound
+	}
+}
+
+func metFloor(detail string) models.FloorVerdict {
+	return models.FloorVerdict{Met: true, Detail: detail}
+}
+
+// ollamaInventory is what Probe returns when Ollama answered with models.
+func ollamaInventory() models.Inventory {
+	return models.Inventory{
+		Models: []models.Info{{ID: "llama3.1:8b", Kind: models.KindOllama, Runtime: "ollama"}},
+	}
+}
+
+func TestDecide(t *testing.T) {
+	tests := []struct {
+		name string
+		host Host
+
+		wantRuntime Runtime
+		wantPresent bool
+		wantInstall []string
+		wantNote    string
+		wantRefusal string
+	}{
+		{
+			name: "apple silicon with ollama already installed",
+			host: Host{
+				GOOS: "darwin", GOARCH: "arm64",
+				Floor:    metFloor("apple silicon, 32 GB, macOS 15"),
+				Ollama:   ollamaInventory(),
+				LookPath: lookPath("brew", "ollama"),
+			},
+			wantRuntime: RuntimeNative,
+			wantPresent: true,
+		},
+		{
+			name: "apple silicon without ollama",
+			host: Host{
+				GOOS: "darwin", GOARCH: "arm64",
+				Floor:    metFloor("apple silicon, 32 GB, macOS 15"),
+				LookPath: lookPath("brew"),
+			},
+			wantRuntime: RuntimeNative,
+			wantInstall: []string{"brew install ollama", "brew services start ollama"},
+			wantNote:    "Docker is not offered on macOS: a container has no access to the GPU, so Ollama in a container would serve on the CPU and this machine would not be advertised for inference.",
+		},
+		{
+			name: "apple silicon without homebrew",
+			host: Host{
+				GOOS: "darwin", GOARCH: "arm64",
+				Floor:    metFloor("apple silicon, 16 GB, macOS 14"),
+				LookPath: lookPath(),
+			},
+			wantRefusal: "Homebrew is not installed, and it is the only macOS path this command can take. Install Homebrew from https://brew.sh and run this again, or install Ollama yourself from https://ollama.com/download.",
+		},
+		{
+			// The ollama binary is absent and something is nonetheless
+			// answering on the port -- Ollama.app, or a tunnel. Installing
+			// a second runtime would put two processes on port 11434.
+			name: "apple silicon serving ollama from something not on PATH",
+			host: Host{
+				GOOS: "darwin", GOARCH: "arm64",
+				Floor:    metFloor("apple silicon, 64 GB, macOS 15"),
+				Ollama:   ollamaInventory(),
+				LookPath: lookPath("brew"),
+			},
+			wantRuntime: RuntimeNative,
+			wantPresent: true,
+		},
+		{
+			name: "linux with docker and the nvidia container toolkit",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Docker: DockerFacts{
+					CLIPresent: true, Present: true, Version: "29.6.1",
+					GPUVendor: GPUVendorNVIDIA, GPUToolkit: true,
+				},
+				FreeDisk: 400 * gib,
+				LookPath: lookPath("docker", "nvidia-smi", "nvidia-ctk"),
+			},
+			wantRuntime: RuntimeDocker,
+			wantInstall: []string{"docker run -d --name ollama --restart unless-stopped --gpus=all -v ollama:/root/.ollama -p 127.0.0.1:11434:11434 ollama/ollama"},
+		},
+		{
+			name: "linux with docker and the rocm device nodes",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: metFloor("AMD GPU 0x744c, 24 GB VRAM"),
+				Docker: DockerFacts{
+					CLIPresent: true, Present: true, Version: "29.6.1",
+					GPUVendor: GPUVendorAMD, GPUToolkit: true,
+				},
+				FreeDisk: 400 * gib,
+				LookPath: lookPath("docker"),
+			},
+			wantRuntime: RuntimeDocker,
+			wantInstall: []string{"docker run -d --name ollama --restart unless-stopped --device /dev/kfd --device /dev/dri -v ollama:/root/.ollama -p 127.0.0.1:11434:11434 ollama/ollama:rocm"},
+		},
+		{
+			name: "linux with docker and no nvidia container toolkit",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Docker: DockerFacts{
+					CLIPresent: true, Present: true, Version: "29.6.1",
+					GPUVendor: GPUVendorNVIDIA, GPUToolkit: false,
+				},
+				LookPath: lookPath("docker", "nvidia-smi"),
+			},
+			wantRefusal: "Docker is installed but cannot pass this machine's NVIDIA GPU into a container. Install the nvidia-container-toolkit package (see https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), run sudo nvidia-ctk runtime configure --runtime=docker and sudo systemctl restart docker, then run this again.",
+		},
+		{
+			name: "linux with docker and no rocm device nodes",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: metFloor("AMD GPU 0x744c, 24 GB VRAM"),
+				Docker: DockerFacts{
+					CLIPresent: true, Present: true, Version: "29.6.1",
+					GPUVendor: GPUVendorAMD, GPUToolkit: false,
+				},
+				LookPath: lookPath("docker"),
+			},
+			wantRefusal: "Docker is installed but cannot pass this machine's AMD GPU into a container, because /dev/kfd is missing. Install the amdgpu-dkms driver (see https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html) and run this again.",
+		},
+		{
+			name: "linux with docker and a GPU neither probe recognised",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: metFloor("some GPU, 16 GB VRAM"),
+				Docker: DockerFacts{
+					CLIPresent: true, Present: true, Version: "29.6.1",
+					GPUVendor: GPUVendorUnknown, GPUToolkit: false,
+				},
+				LookPath: lookPath("docker"),
+			},
+			wantRefusal: "Docker is installed and no GPU passthrough could be established for it. Install the nvidia-container-toolkit package for an NVIDIA GPU, or the amdgpu-dkms driver for an AMD GPU, then run this again.",
+		},
+		{
+			name: "linux without docker",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor:    metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Docker:   DockerFacts{Reason: "docker is not on PATH"},
+				LookPath: lookPath("nvidia-smi"),
+			},
+			wantRefusal: "Docker is not installed, and this machine runs its model runtime in a container. Install Docker Engine from https://docs.docker.com/engine/install/ and run this again.",
+		},
+		{
+			name: "linux with the docker command and a daemon that did not answer",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Docker: DockerFacts{
+					CLIPresent: true,
+					Reason:     "permission denied while trying to connect to the Docker daemon socket",
+				},
+				LookPath: lookPath("docker", "nvidia-smi"),
+			},
+			wantRefusal: "The docker command is installed and the Docker daemon did not answer. Start it with sudo systemctl start docker, or add your user to the docker group with sudo usermod -aG docker $USER and log back in, then run this again.",
+		},
+		{
+			// The runtime check runs before the Docker check: a machine
+			// already serving needs nothing installed, so a missing Docker
+			// is not a reason to refuse it.
+			name: "linux already serving ollama without docker",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor:    metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Ollama:   ollamaInventory(),
+				Docker:   DockerFacts{Reason: "docker is not on PATH"},
+				LookPath: lookPath(),
+			},
+			wantRuntime: RuntimeDocker,
+			wantPresent: true,
+		},
+		{
+			name: "below the macOS memory floor",
+			host: Host{
+				GOOS: "darwin", GOARCH: "arm64",
+				Floor: models.FloorVerdict{
+					Reason: "this machine has 8 GB of unified memory; the floor is 16 GB.",
+					Detail: "apple silicon, 8 GB",
+				},
+				LookPath: lookPath("brew"),
+			},
+			wantRefusal: "this machine has 8 GB of unified memory; the floor is 16 GB.",
+		},
+		{
+			name: "below the Linux VRAM floor",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: models.FloorVerdict{
+					Reason: "this machine has no discrete GPU. CPU-only inference is not supported; it remains a full worker for everything else.",
+				},
+				Docker:   DockerFacts{CLIPresent: true, Present: true, Version: "29.6.1"},
+				LookPath: lookPath("docker"),
+			},
+			wantRefusal: "this machine has no discrete GPU. CPU-only inference is not supported; it remains a full worker for everything else.",
+		},
+		{
+			// A below-floor machine that already has the runtime is a
+			// different message from one that does not, so the presence
+			// survives the refusal rather than being reset by it.
+			name: "below the floor with ollama already installed",
+			host: Host{
+				GOOS: "darwin", GOARCH: "arm64",
+				Floor: models.FloorVerdict{
+					Reason: "an Intel Mac is not supported as an inference machine. It remains a full worker for everything else.",
+					Detail: "intel",
+				},
+				Ollama:   ollamaInventory(),
+				LookPath: lookPath("brew", "ollama"),
+			},
+			wantPresent: true,
+			wantRefusal: "an Intel Mac is not supported as an inference machine. It remains a full worker for everything else.",
+		},
+		{
+			name: "windows, refused by the floor before the platform rule",
+			host: Host{
+				GOOS: "windows", GOARCH: "amd64",
+				Floor: models.FloorVerdict{
+					Reason: "windows is not a supported inference platform; local models run on macOS (Apple Silicon) and Linux (discrete GPU).",
+					Detail: "windows",
+				},
+				LookPath: lookPath(),
+			},
+			wantRefusal: "windows is not a supported inference platform; local models run on macOS (Apple Silicon) and Linux (discrete GPU).",
+		},
+		{
+			// Decide is total: a Host assembled by hand can name a
+			// platform with a met floor, and it still gets a sentence
+			// rather than a plan that installs nothing and says nothing.
+			name: "an unsupported platform whose floor somehow passed",
+			host: Host{
+				GOOS: "freebsd", GOARCH: "amd64",
+				Floor:    metFloor("some GPU"),
+				LookPath: lookPath(),
+			},
+			wantRefusal: "freebsd is not a supported platform for local models. They run on macOS with Apple Silicon and on Linux with a discrete GPU.",
+		},
+		{
+			// A Host that names no platform. Gather cannot build one, and
+			// the sentence exists so a hand-built Host never produces a
+			// refusal that opens with a space and reads as truncated.
+			name: "a host that names no platform at all",
+			host: Host{
+				Floor:    metFloor("fixture"),
+				LookPath: lookPath(),
+			},
+			wantRefusal: "This machine's platform could not be established, so it is not offered for inference.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Decide(tt.host)
+			if got.Refusal != tt.wantRefusal {
+				t.Errorf("Refusal =\n  %q\nwant\n  %q", got.Refusal, tt.wantRefusal)
+			}
+			if got.Note != tt.wantNote {
+				t.Errorf("Note =\n  %q\nwant\n  %q", got.Note, tt.wantNote)
+			}
+			if got.Runtime != tt.wantRuntime {
+				t.Errorf("Runtime = %q, want %q", got.Runtime, tt.wantRuntime)
+			}
+			if got.RuntimePresent != tt.wantPresent {
+				t.Errorf("RuntimePresent = %v, want %v", got.RuntimePresent, tt.wantPresent)
+			}
+			if len(got.Install) != len(tt.wantInstall) {
+				t.Fatalf("Install = %q, want %q", got.Install, tt.wantInstall)
+			}
+			for i := range got.Install {
+				if got.Install[i] != tt.wantInstall[i] {
+					t.Errorf("Install[%d] =\n  %q\nwant\n  %q", i, got.Install[i], tt.wantInstall[i])
+				}
+			}
+			if len(got.DefaultModels) != 2 || got.DefaultModels[0] != "llama3.1:8b" || got.DefaultModels[1] != "nomic-embed-text" {
+				t.Errorf("DefaultModels = %q, want the default pair", got.DefaultModels)
+			}
+		})
+	}
+}
+
+// TestDecideAlwaysSaysSomething. The one property that must hold on every
+// path: a plan that neither refuses, nor reports a runtime, nor prints a
+// command leaves the person with a blank terminal at the exact moment
+// they are blocked -- the failure this package exists to prevent, and the
+// one a table of happy cases would never catch.
+func TestDecideAlwaysSaysSomething(t *testing.T) {
+	goos := []string{"darwin", "linux", "windows", "freebsd", ""}
+	vendors := []GPUVendor{GPUVendorUnknown, GPUVendorNVIDIA, GPUVendorAMD}
+	paths := [][]string{{}, {"brew"}, {"docker"}, {"brew", "ollama"}, {"docker", "nvidia-smi"}}
+
+	for _, goosName := range goos {
+		for _, met := range []bool{true, false} {
+			for _, vendor := range vendors {
+				for _, toolkit := range []bool{true, false} {
+					for _, cli := range []bool{true, false} {
+						for _, daemon := range []bool{true, false} {
+							for _, p := range paths {
+								h := Host{
+									GOOS: goosName, GOARCH: "amd64",
+									Floor:    models.FloorVerdict{Met: met, Reason: "a floor sentence."},
+									Docker:   DockerFacts{CLIPresent: cli, Present: cli && daemon, GPUVendor: vendor, GPUToolkit: toolkit},
+									LookPath: lookPath(p...),
+								}
+								if met {
+									h.Floor.Reason = ""
+								}
+								plan := Decide(h)
+								if plan.Refusal == "" && !plan.RuntimePresent && len(plan.Install) == 0 {
+									t.Fatalf("silent plan for %+v", h)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestSentencesAreReadableInATerminal guards the house rules on every
+// sentence this package can emit: they are read by a person in a terminal
+// at the moment they are blocked, and it is the only thing they get.
+func TestSentencesAreReadableInATerminal(t *testing.T) {
+	sentences := []string{
+		noteDockerNotOfferedOnMac,
+		refusalNoHomebrew,
+		refusalNoDocker,
+		refusalDockerDaemonSilent,
+		refusalNoNVIDIAToolkit,
+		refusalNoROCmDevices,
+		refusalNoGPUPassthrough,
+		unsupportedPlatform("freebsd"),
+		unsupportedPlatform(""),
+	}
+	banned := []string{"unfortunately", "sorry", "please note", "oops", "failed to"}
+
+	for _, s := range sentences {
+		if s == "" {
+			t.Error("an empty sentence is a blank terminal")
+			continue
+		}
+		if strings.ContainsRune(s, '!') {
+			t.Errorf("no exclamation: %q", s)
+		}
+		if strings.Contains(s, "  ") {
+			t.Errorf("one space after a full stop: %q", s)
+		}
+		if !strings.HasSuffix(s, ".") {
+			t.Errorf("a sentence ends in a full stop: %q", s)
+		}
+		for _, r := range s {
+			if r > unicode.MaxASCII {
+				t.Errorf("ASCII only, found %q in %q", r, s)
+				break
+			}
+		}
+		lower := strings.ToLower(s)
+		for _, b := range banned {
+			if strings.Contains(lower, b) {
+				t.Errorf("%q reads as an apology or a log line: %q", b, s)
+			}
+		}
+	}
+}
+
+// TestGatherReadsThisMachine is the only test that touches the platform
+// files. It asserts the facts that hold on every runner rather than any
+// that depend on what is installed, because the point is that Gather
+// returns a Host at all -- a Gather that panicked on a machine without
+// Docker would be found here and nowhere else.
+func TestGatherReadsThisMachine(t *testing.T) {
+	h, err := Gather(context.Background(), &models.Discoverer{
+		OllamaBaseURL: "http://127.0.0.1:1", // nothing listens there
+		FloorFn:       func() models.FloorVerdict { return models.FloorVerdict{Met: true, Detail: "fixture"} },
+	})
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	if h.GOOS == "" || h.GOARCH == "" {
+		t.Errorf("Gather must name the platform, got %q/%q", h.GOOS, h.GOARCH)
+	}
+	if h.LookPath == nil {
+		t.Error("Gather must supply LookPath, or Decide falls back to the process PATH silently")
+	}
+	if h.OllamaServing {
+		t.Error("nothing listens on port 1; OllamaServing must be false")
+	}
+	if !h.Floor.Met {
+		t.Errorf("Gather must carry the Discoverer's floor verdict through, got %+v", h.Floor)
+	}
+}
+
+// TestGatherCancelledContext. Gather is the interactive half of `setup
+// --inference` and it shells out; a person who pressed Ctrl-C gets the
+// cancellation back rather than a Host assembled from probes that were
+// never allowed to run.
+func TestGatherCancelledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Gather(ctx, &models.Discoverer{OllamaBaseURL: "http://127.0.0.1:1"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// TestOllamaServingWithNoModelsPulled pins the coupling this package has
+// to the models package's probe notes, and it is the reason the test
+// stands up a real HTTP server instead of a fixture Inventory.
+//
+// An Ollama that answers with an EMPTY model list is indistinguishable
+// from an absent one in Inventory.Models, and it is the exact state a
+// half-finished setup leaves behind. Reading it as "absent" would print
+// the docker run line for a container that already exists, and the person
+// would get a name conflict instead of a pull. The note is the only
+// exported signal that tells the two apart, so this test drives the real
+// Discoverer and fails here if its wording ever changes -- rather than on
+// somebody's machine.
+func TestOllamaServingWithNoModelsPulled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"models":[]}`))
+	}))
+	defer srv.Close()
+
+	inv := (&models.Discoverer{
+		OllamaBaseURL: srv.URL,
+		FloorFn:       func() models.FloorVerdict { return models.FloorVerdict{Met: true} },
+	}).Probe(context.Background(), models.Request{})
+
+	if len(inv.Models) != 0 {
+		t.Fatalf("fixture served no models, got %+v", inv.Models)
+	}
+	if !ollamaAnswered(inv) {
+		t.Fatalf("an Ollama with nothing pulled must read as serving; notes were %q", inv.ProbeNotes)
+	}
+}
+
+// TestOllamaAnsweredIsFalseWhenNothingListens is the other half: a
+// refused connection must not read as a runtime, or every machine
+// without Ollama would be told it already has one.
+func TestOllamaAnsweredIsFalseWhenNothingListens(t *testing.T) {
+	inv := (&models.Discoverer{
+		OllamaBaseURL: "http://127.0.0.1:1",
+		FloorFn:       func() models.FloorVerdict { return models.FloorVerdict{Met: true} },
+	}).Probe(context.Background(), models.Request{})
+
+	if ollamaAnswered(inv) {
+		t.Fatalf("nothing listens on port 1; notes were %q", inv.ProbeNotes)
+	}
+}
