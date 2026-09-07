@@ -213,6 +213,20 @@ func ollamaMessages(in []Message) []map[string]any {
 		if len(m.ToolCalls) > 0 {
 			msg["tool_calls"] = ollamaToolCallsOut(m.ToolCalls)
 		}
+		// Ollama's NATIVE shape takes images as a flat array of bare
+		// base64 strings on the message -- no media type, no data URL,
+		// which is where it differs from the OpenAI-compatible surface
+		// (see openAIMessages). Sending a data: URL here is accepted
+		// and then decoded as image bytes that start with the literal
+		// text "data:image/png;base64,", so the model is shown noise
+		// and answers about it confidently.
+		if len(m.Images) > 0 {
+			images := make([]string, 0, len(m.Images))
+			for _, img := range m.Images {
+				images = append(images, base64Of(img.Data))
+			}
+			msg["images"] = images
+		}
 		out = append(out, msg)
 	}
 	return out

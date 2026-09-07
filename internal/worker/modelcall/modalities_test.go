@@ -41,6 +41,19 @@ func fakeOpenAI(t *testing.T, seen *[]captured, sse ...string) *openAIClient {
 	return &openAIClient{baseURL: srv.URL, http: srv.Client()}
 }
 
+// speechClient is an ordinary OpenAI-compatible client pointed at the
+// stub. That is the whole shape of a speech runtime here: `audioout`
+// can only be true through a DECLARED runtime, clientFor reaches one as
+// an openAIClient, and /audio/speech is OpenAI-shaped -- so there is no
+// separate speech client to build or to keep in step.
+func speechClient(srv *httptest.Server) *openAIClient {
+	return &openAIClient{baseURL: srv.URL, http: srv.Client()}
+}
+
+func deadSpeechClient() *openAIClient {
+	return &openAIClient{baseURL: "http://127.0.0.1:1", http: http.DefaultClient}
+}
+
 func chunk(content string) string {
 	return `{"model":"m","choices":[{"delta":{"content":"` + content + `"}}]}`
 }
@@ -230,7 +243,7 @@ func TestTranscribeCarriesAnOptionalPrompt(t *testing.T) {
 // Speech
 // -----------------------------------------------------------------------------
 
-func TestSpeakReachesTheKokoroRuntime(t *testing.T) {
+func TestSpeakReachesTheSpeechRuntime(t *testing.T) {
 	var gotPath string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -241,7 +254,7 @@ func TestSpeakReachesTheKokoroRuntime(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	res, err := NewKokoroClient(srv.URL, "", srv.Client()).Speak(context.Background(), SpeakRequest{
+	res, err := speechClient(srv).Speak(context.Background(), SpeakRequest{
 		Model: "kokoro-82m", Text: "hello", Voice: "af_bella", Format: "wav",
 	})
 	if err != nil {
@@ -275,7 +288,7 @@ func TestSpeakOmitsAnUnsetVoiceAndFormat(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	if _, err := NewKokoroClient(srv.URL, "", srv.Client()).Speak(context.Background(),
+	if _, err := speechClient(srv).Speak(context.Background(),
 		SpeakRequest{Model: "kokoro-82m", Text: "hi"}); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +309,7 @@ func TestSpeakRefusesAnEmptyTwoHundred(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	_, err := NewKokoroClient(srv.URL, "", srv.Client()).Speak(context.Background(),
+	_, err := speechClient(srv).Speak(context.Background(),
 		SpeakRequest{Model: "m", Text: "hi"})
 	if err == nil {
 		t.Fatal("want a refusal for a 200 carrying no audio")
@@ -307,7 +320,7 @@ func TestSpeakRefusesAnEmptyTwoHundred(t *testing.T) {
 }
 
 func TestSpeakRefusesWithNoText(t *testing.T) {
-	if _, err := NewKokoroClient("http://127.0.0.1:1", "", nil).Speak(context.Background(),
+	if _, err := deadSpeechClient().Speak(context.Background(),
 		SpeakRequest{Model: "m"}); err == nil {
 		t.Fatal("want a refusal for a speak call with no text")
 	}
@@ -626,7 +639,7 @@ func TestSpeakSendsSpeedOnlyWhenSet(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
-			if _, err := NewKokoroClient(srv.URL, "", srv.Client()).Speak(context.Background(), tc.req); err != nil {
+			if _, err := speechClient(srv).Speak(context.Background(), tc.req); err != nil {
 				t.Fatal(err)
 			}
 			_, present := body["speed"]
@@ -700,6 +713,208 @@ func TestPayloadForIsAbsentAtThisEngineVersion(t *testing.T) {
 	for _, kind := range []string{KindVision, KindTranscribe, KindSpeak, KindImage} {
 		if _, ok := payloadFor(startModality("m", kind)); ok {
 			t.Fatalf("%s: payloadFor reported a payload; ModelCallStart has no modality fields yet", kind)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// The serving path, end to end
+// -----------------------------------------------------------------------------
+
+// withPayload drives the proto seam so the serving path can be
+// exercised before the wire can reach it. See readPayload.
+func withPayload(t *testing.T, p Payload) {
+	t.Helper()
+	prev := readPayload
+	readPayload = func(*memqlv1.ModelCallStart) (Payload, bool) { return p, true }
+	t.Cleanup(func() { readPayload = prev })
+}
+
+// A vision call reaches the runtime WITH ITS IMAGE, through the native
+// Ollama route -- which is the one that matters, because `vision=1` is
+// set by the native probe and clientFor hands those models an
+// ollamaClient.
+func TestVisionCallReachesTheNativeRuntimeWithItsImage(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"model":"m","message":{"content":"a cat"},"done":true,"done_reason":"stop"}` + "\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	withPayload(t, Payload{Images: []ImagePart{{MediaType: "image/png", Data: []byte("PNGDATA")}}})
+
+	rec := newRecorder()
+	m := NewManager(Options{Inventory: inventoryWith(
+		ollamaModel(srv.URL, "seeing:9b", models.Attributes{Vision: true, MaxConcurrent: 1}))})
+	s := start("r", "seeing:9b", KindVision)
+	m.Start(context.Background(), rec, s)
+
+	end := rec.wait(t)
+	if end.GetErrorCode() != "" {
+		t.Fatalf("end = %+v", end)
+	}
+	if rec.content() != "a cat" {
+		t.Fatalf("content = %q", rec.content())
+	}
+
+	msgs := body["messages"].([]any)
+	images, ok := msgs[len(msgs)-1].(map[string]any)["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("the image did not reach the runtime: %v", msgs)
+	}
+	// Ollama's NATIVE shape is a BARE base64 string, not a data URL.
+	// Sending a data: URL here is accepted and decoded as bytes that
+	// begin with the literal text "data:image/png;base64,", so the
+	// model is shown noise and answers about it confidently.
+	if images[0] != base64.StdEncoding.EncodeToString([]byte("PNGDATA")) {
+		t.Fatalf("image = %v, want bare base64", images[0])
+	}
+}
+
+// A transcription's TEXT rides the deltas, exactly as a generation's
+// does -- so a caller that streams and a caller that does not are the
+// same shape on the other side.
+func TestTranscribeCallStreamsItsTranscriptAsDeltas(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("data: " + chunk("hello world") + "\n\ndata: [DONE]\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	withPayload(t, Payload{Audio: []byte("RIFF"), AudioMediaType: "audio/wav"})
+
+	rec := newRecorder()
+	m := NewManager(Options{Inventory: inventoryWith(models.Info{
+		ID: "hear:9b", Kind: models.KindOpenAICompatible, Runtime: "declared",
+		BaseURL: srv.URL, Allowed: true,
+		Attributes: models.Attributes{AudioIn: true, MaxConcurrent: 1},
+	})})
+	m.Start(context.Background(), rec, start("r", "hear:9b", KindTranscribe))
+
+	end := rec.wait(t)
+	if end.GetErrorCode() != "" {
+		t.Fatalf("end = %+v", end)
+	}
+	if rec.content() != "hello world" {
+		t.Fatalf("content = %q, want the transcript as deltas", rec.content())
+	}
+}
+
+// A media type this machine cannot name a container for is REFUSED
+// rather than guessed: a wrong container has the runtime decode the
+// bytes as something they are not, and the result is a confident
+// transcript of noise.
+func TestTranscribeCallRefusesAnUnnameableContainer(t *testing.T) {
+	withPayload(t, Payload{Audio: []byte("x"), AudioMediaType: "audio/aiff"})
+
+	rec := newRecorder()
+	m := NewManager(Options{Inventory: inventoryWith(models.Info{
+		ID: "hear:9b", Kind: models.KindOpenAICompatible, BaseURL: "http://127.0.0.1:1", Allowed: true,
+		Attributes: models.Attributes{AudioIn: true, MaxConcurrent: 1},
+	})})
+	m.Start(context.Background(), rec, start("r", "hear:9b", KindTranscribe))
+
+	end := rec.wait(t)
+	if end.GetErrorCode() == "" {
+		t.Fatal("an unnameable container was accepted")
+	}
+	if !strings.Contains(end.GetError(), "audio/aiff") {
+		t.Fatalf("the refusal must name what arrived: %q", end.GetError())
+	}
+}
+
+// A speak call's TEXT comes from the last user turn -- there is no
+// separate input field on the wire (memql#5137) -- and the knobs come
+// from the payload.
+func TestSpeakCallTakesItsTextFromTheLastUserTurn(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "audio/wav")
+		_, _ = w.Write([]byte("RIFFWAVE"))
+	}))
+	t.Cleanup(srv.Close)
+
+	withPayload(t, Payload{Speech: SpeakRequest{Voice: "af_bella", Format: "wav"}})
+
+	rec := newRecorder()
+	m := NewManager(Options{Inventory: inventoryWith(models.Info{
+		ID: "kokoro-82m", Kind: models.KindOpenAICompatible, BaseURL: srv.URL, Allowed: true,
+		Attributes: models.Attributes{AudioOut: true, MaxConcurrent: 1},
+	})})
+	s := start("r", "kokoro-82m", KindSpeak)
+	s.Messages = []*memqlv1.ModelCallMessage{
+		{Role: "system", Content: "Be brief."},
+		{Role: "user", Content: "say this out loud"},
+	}
+	m.Start(context.Background(), rec, s)
+
+	end := rec.wait(t)
+	if end.GetErrorCode() != "" {
+		t.Fatalf("end = %+v", end)
+	}
+	if body["input"] != "say this out loud" {
+		t.Fatalf("input = %v, want the last user turn", body["input"])
+	}
+	if body["voice"] != "af_bella" {
+		t.Fatalf("the payload's knobs did not reach the runtime: %v", body)
+	}
+}
+
+// And an image call the same way: prompt from the messages, dimensions
+// from the payload.
+func TestImageCallTakesItsPromptFromTheMessages(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"images":["` + base64.StdEncoding.EncodeToString([]byte("PNG")) + `"]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	withPayload(t, Payload{Image: ImageRequest{Width: 1024, Height: 1024}})
+
+	rec := newRecorder()
+	m := NewManager(Options{Inventory: inventoryWith(
+		ollamaModel(srv.URL, "x/z-image-turbo", models.Attributes{ImageGen: true, MaxConcurrent: 1}))})
+	s := start("r", "x/z-image-turbo", KindImage)
+	s.Messages = []*memqlv1.ModelCallMessage{{Role: "user", Content: "a red cube"}}
+	m.Start(context.Background(), rec, s)
+
+	end := rec.wait(t)
+	if end.GetErrorCode() != "" {
+		t.Fatalf("end = %+v", end)
+	}
+	if body["prompt"] != "a red cube" {
+		t.Fatalf("prompt = %v, want the user turn", body["prompt"])
+	}
+	opts := body["options"].(map[string]any)
+	if opts["width"] != float64(1024) {
+		t.Fatalf("the payload's knobs did not reach the runtime: %v", opts)
+	}
+}
+
+// A RUNTIME THAT CANNOT SERVE THE MODALITY IT WAS ADVERTISED FOR is
+// named, not crashed into. A call reaches runModality only when the
+// machine advertised the flag, so this means the advertisement and the
+// runtime disagree -- and the operator needs the model and the modality
+// to find out which.
+func TestAModalityTheRuntimeCannotServeNamesTheDisagreement(t *testing.T) {
+	withPayload(t, Payload{Speech: SpeakRequest{}})
+
+	rec := newRecorder()
+	// A NATIVE Ollama model claiming audioout: Ollama serves no speech,
+	// so ollamaClient implements no Speaker.
+	m := NewManager(Options{Inventory: inventoryWith(
+		ollamaModel("http://127.0.0.1:1", "confused:9b", models.Attributes{AudioOut: true, MaxConcurrent: 1}))})
+	m.Start(context.Background(), rec, start("r", "confused:9b", KindSpeak))
+
+	end := rec.wait(t)
+	if end.GetErrorCode() == "" {
+		t.Fatal("a runtime that cannot speak served a speak call")
+	}
+	for _, want := range []string{"confused:9b", "speech", "ollama"} {
+		if !strings.Contains(end.GetError(), want) {
+			t.Errorf("the refusal must name %q: %s", want, end.GetError())
 		}
 	}
 }

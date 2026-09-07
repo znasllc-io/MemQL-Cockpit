@@ -1,12 +1,10 @@
 package modelcall
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 )
 
@@ -193,6 +191,26 @@ func attachImages(in []Message, images []ImagePart) []Message {
 	return append(out, Message{Role: "user", Images: images})
 }
 
+// Vision runs a chat turn carrying images against Ollama's NATIVE
+// route.
+//
+// It has to exist, and the reason is worth stating: `vision=1` is set
+// by the NATIVE probe -- Ollama's /api/show reports the capability --
+// so a model discovered that way is advertised as seeing, and
+// clientFor hands it an ollamaClient. Without this method the machine
+// would advertise a modality its own serving path could not reach, and
+// the call would be refused on a flag this cockpit set itself.
+func (c *ollamaClient) Vision(ctx context.Context, req VisionRequest, emit Emit) (Result, error) {
+	if len(req.Images) == 0 {
+		return Result{}, fmt.Errorf("vision: no image was supplied")
+	}
+	return c.Chat(ctx, ChatRequest{
+		Model:    req.Model,
+		Messages: attachImages(req.Messages, req.Images),
+		Params:   req.Params,
+	}, emit)
+}
+
 // -----------------------------------------------------------------------------
 // Transcription -- input_audio on the same chat route
 // -----------------------------------------------------------------------------
@@ -250,43 +268,26 @@ func (c *openAIClient) Transcribe(ctx context.Context, req TranscribeRequest) (T
 }
 
 // -----------------------------------------------------------------------------
-// Speech -- a Kokoro runtime's /audio/speech
+// Speech -- /audio/speech on a declared runtime
 // -----------------------------------------------------------------------------
 
-// kokoroClient serves text to speech.
-//
-// It is a separate client rather than a method on the OpenAI one
-// because it is a separate SERVICE: Ollama does not serve speech at
-// all, so a machine that speaks has a second runtime installed and
-// advertises `runtime:kokoro` for it. The route it exposes is
-// OpenAI-shaped (/v1/audio/speech), which is why the request looks
-// familiar; the endpoint behind it is not the same process.
-type kokoroClient struct {
-	baseURL string
-	apiKey  string
-	http    *http.Client
-}
-
-// NewKokoroClient builds a speech client for a runtime's base URL.
-func NewKokoroClient(baseURL, apiKey string, httpClient *http.Client) *kokoroClient {
-	if httpClient == nil {
-		httpClient = &http.Client{}
-	}
-	return &kokoroClient{
-		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		apiKey:  apiKey,
-		http:    httpClient,
-	}
-}
-
 // Speak generates audio.
+//
+// It is a method on the ORDINARY OpenAI-compatible client rather than
+// on a client of its own, and that is the simplification worth
+// noticing: `audioout` can only ever be true through a declared runtime
+// (no probe anywhere reports it), a declared runtime is reached by
+// clientFor as an openAIClient at the base URL the operator gave, and
+// Kokoro's route is OpenAI-shaped. A separate speech client would be a
+// second code path reached by nothing, and a machine advertising
+// speech would then have to be special-cased into it.
 //
 // The response is BYTES, not JSON: /audio/speech answers with the audio
 // file itself and states its container in Content-Type. Reading the
 // header rather than assuming the requested format is what keeps the
 // result honest when a runtime silently serves wav for an mp3 request,
 // which several do.
-func (c *kokoroClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult, error) {
+func (c *openAIClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult, error) {
 	if strings.TrimSpace(req.Text) == "" {
 		return SpeakResult{}, fmt.Errorf("speak: no text was supplied")
 	}
@@ -301,27 +302,11 @@ func (c *kokoroClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult
 		body["speed"] = req.Speed
 	}
 
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return SpeakResult{}, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/audio/speech", bytes.NewReader(raw))
-	if err != nil {
-		return SpeakResult{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.http.Do(httpReq)
+	resp, err := c.post(ctx, "/audio/speech", body)
 	if err != nil {
 		return SpeakResult{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return SpeakResult{}, fmt.Errorf("kokoro: /audio/speech returned %d%s", resp.StatusCode, readErrorBody(resp))
-	}
 
 	audio, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -331,7 +316,7 @@ func (c *kokoroClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult
 		// A 200 with an empty body is not success. The same trap
 		// /memql/query and Ollama's /api/pull set: the status says the
 		// request was accepted, and the absence of bytes is the failure.
-		return SpeakResult{}, fmt.Errorf("kokoro: /audio/speech answered 200 with no audio")
+		return SpeakResult{}, fmt.Errorf("speak: /audio/speech answered 200 with no audio")
 	}
 	media := resp.Header.Get("Content-Type")
 	if media == "" {

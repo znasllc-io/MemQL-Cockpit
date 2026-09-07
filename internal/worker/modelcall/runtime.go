@@ -247,6 +247,38 @@ type Result struct {
 	ToolCalls []ToolCall
 }
 
+// The MODALITY capabilities, as optional interfaces on top of Client.
+//
+// Optional rather than methods on Client, because not every runtime
+// serves every modality and a mandatory method would force each client
+// to carry a stub that refuses -- which reads as a runtime that CAN do
+// the thing and chose not to. A type assertion that fails is the
+// honest shape: this runtime does not serve this.
+//
+// Which client implements which is decided by which probe can set the
+// flag. `vision` and `imagegen` come from Ollama's own capability list,
+// so the native client implements both; `audioin` and `audioout` can
+// only be true through a declared runtime, which clientFor reaches as
+// an openAIClient.
+type (
+	// VisionClient serves kind="vision".
+	VisionClient interface {
+		Vision(ctx context.Context, req VisionRequest, emit Emit) (Result, error)
+	}
+	// Transcriber serves kind="transcribe".
+	Transcriber interface {
+		Transcribe(ctx context.Context, req TranscribeRequest) (TranscribeResult, error)
+	}
+	// Speaker serves kind="speak".
+	Speaker interface {
+		Speak(ctx context.Context, req SpeakRequest) (SpeakResult, error)
+	}
+	// ImageGenerator serves kind="image".
+	ImageGenerator interface {
+		GenerateImage(ctx context.Context, req ImageRequest) (ImageResult, error)
+	}
+)
+
 // Emit receives one piece of generated text. Returning an error stops
 // the generation -- it means the stream back to the cluster is gone, and
 // continuing would spend this machine's GPU on output nobody will read.

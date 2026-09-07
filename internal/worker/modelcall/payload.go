@@ -109,6 +109,20 @@ type Payload struct {
 // engine does not speak. The engine would then have to either adopt an
 // encoding nobody designed or break a machine already using it.
 func payloadFor(start *memqlv1.ModelCallStart) (Payload, bool) {
+	return readPayload(start)
+}
+
+// readPayload is the seam's body, held in a variable ONLY so the tests
+// can drive the serving path that the wire cannot reach yet.
+//
+// Without it, every line of runModality -- the four client capability
+// assertions, the media-type conversion, the transcript-as-delta rule,
+// the prompt-from-the-last-user-turn rule -- would be code no test could
+// execute, which is how a "mapping" that turns out to be a rewrite gets
+// written. With it, the whole path is exercised today against fake
+// runtimes and the only thing memql#5137 changes is this function's
+// body.
+var readPayload = func(start *memqlv1.ModelCallStart) (Payload, bool) {
 	_ = start
 	return Payload{}, false
 }
@@ -138,6 +152,49 @@ func audioFormatFor(mediaType string) string {
 	default:
 		return ""
 	}
+}
+
+// modalityResult is a modality call's non-text OUTPUT, on its way to
+// ModelCallEnd. The text half rides the deltas, exactly as a chat
+// generation's does.
+type modalityResult struct {
+	Segments       []TranscriptSegment
+	Audio          []byte
+	AudioMediaType string
+	Images         []ImagePart
+}
+
+func (r modalityResult) empty() bool {
+	return len(r.Segments) == 0 && len(r.Audio) == 0 && len(r.Images) == 0
+}
+
+// attachModalityResult is THE OTHER HALF OF THE SEAM: the single place
+// a modality call's bytes are written to the wire.
+//
+// Nothing is written at this engine version, because ModelCallEnd has
+// `content string` and no bytes anywhere. When memql#5137 lands this
+// becomes the mapping its message list fixes:
+//
+//	end.Segments = segmentsProto(r.Segments)
+//	end.Audio    = audioProto(r.Audio, r.AudioMediaType)
+//	end.Images   = imagesProto(r.Images)
+//
+// Bytes may go on Delta instead, following the rule `content` already
+// follows -- a worker that streamed leaves End's field empty and the
+// engine assembles what it accepted. This cockpit's speech and image
+// paths are one-shot, so they fill End's; a streaming transcriber would
+// fill Delta's per window and leave the full set here.
+func attachModalityResult(end *memqlv1.ModelCallEnd, r modalityResult) {
+	if r.empty() {
+		return
+	}
+	_ = end
+}
+
+// isModalityKind reports whether this kind is served by runModality.
+func isModalityKind(kind string) bool {
+	_, ok := modalityKinds[kind]
+	return ok
 }
 
 // quoteAll renders a list of kinds for a refusal sentence. The refusal

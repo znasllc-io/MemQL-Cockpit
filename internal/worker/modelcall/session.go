@@ -482,12 +482,23 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 
 	client := m.clientFor(info)
 	var (
-		res Result
-		err error
+		res   Result
+		modal modalityResult
+		err   error
 	)
-	if start.GetKind() == KindEmbedding {
+	switch kind := start.GetKind(); {
+	case kind == KindEmbedding:
 		res, err = client.Embed(ctx, EmbedRequest{Model: info.ID, Input: start.GetEmbeddingInput()})
-	} else {
+
+	case isModalityKind(kind):
+		// resolve already refused a modality call whose payload the
+		// wire could not carry, so reaching here means payloadFor
+		// answered -- which today happens only under test, and after
+		// memql#5137 happens for real.
+		payload, _ := payloadFor(start)
+		res, modal, err = m.runModality(ctx, client, info, start, payload, stream.emit)
+
+	default:
 		res, err = client.Chat(ctx, ChatRequest{
 			Model:    info.ID,
 			Messages: messagesFrom(start.GetMessages()),
@@ -518,6 +529,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 	end.Usage = usageProto(res.Usage)
 	end.Embeddings = embeddingsProto(res.Embeddings)
 	attachToolCalls(end, res.ToolCalls)
+	attachModalityResult(end, modal)
 
 	if err := sender.SendModelCallEnd(end); err != nil {
 		m.logger.Warn("failed to send model call end", "request_id", c.requestID, "error", err)
@@ -564,6 +576,124 @@ func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, li
 			}
 		}
 	}
+}
+
+// runModality serves one of the four modality kinds.
+//
+// THE CLIENT IS ASKED, NOT ASSUMED. Each kind needs a capability the
+// runtime may not have, so the type assertion is the check -- and its
+// failure is a refusal naming the runtime rather than a panic or a
+// silent fall back to a text completion. A machine reaches here only
+// when it advertised the flag, so a failure here means the flag and the
+// runtime disagree, which is worth saying plainly.
+func (m *Manager) runModality(
+	ctx context.Context,
+	client Client,
+	info models.Info,
+	start *memqlv1.ModelCallStart,
+	payload Payload,
+	emit Emit,
+) (Result, modalityResult, error) {
+	messages := messagesFrom(start.GetMessages())
+	params := paramsFrom(start.GetParams())
+
+	switch start.GetKind() {
+	case KindVision:
+		c, ok := client.(VisionClient)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "vision")
+		}
+		res, err := c.Vision(ctx, VisionRequest{
+			Model: info.ID, Messages: messages, Images: payload.Images, Params: params,
+		}, emit)
+		return res, modalityResult{}, err
+
+	case KindTranscribe:
+		c, ok := client.(Transcriber)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "transcription")
+		}
+		// The container is CONVERTED from the wire's media type, and a
+		// media type this side does not know yields no container --
+		// which Transcribe refuses by name rather than guessing.
+		format := audioFormatFor(payload.AudioMediaType)
+		if format == "" {
+			return Result{}, modalityResult{}, fmt.Errorf(
+				"transcribe: the audio arrived as %q, which this machine cannot name a container for",
+				payload.AudioMediaType)
+		}
+		out, err := c.Transcribe(ctx, TranscribeRequest{
+			Model: info.ID, Audio: payload.Audio, Format: format, Prompt: promptFrom(messages),
+		})
+		if err != nil {
+			return Result{}, modalityResult{}, err
+		}
+		// The transcript is CONTENT, so it goes out as a delta the same
+		// way a generation would: the engine assembles what it accepts,
+		// and a caller that streams and a caller that does not are the
+		// same shape on the other side.
+		if out.Text != "" {
+			if err := emit(out.Text); err != nil {
+				return Result{}, modalityResult{}, err
+			}
+		}
+		return Result{FinishReason: FinishStop, Usage: out.Usage},
+			modalityResult{Segments: out.Segments}, nil
+
+	case KindSpeak:
+		c, ok := client.(Speaker)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "speech")
+		}
+		req := payload.Speech
+		req.Model, req.Text = info.ID, promptFrom(messages)
+		out, err := c.Speak(ctx, req)
+		if err != nil {
+			return Result{}, modalityResult{}, err
+		}
+		return Result{FinishReason: FinishStop, Usage: out.Usage},
+			modalityResult{Audio: out.Audio, AudioMediaType: out.MediaType}, nil
+
+	case KindImage:
+		c, ok := client.(ImageGenerator)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "image generation")
+		}
+		req := payload.Image
+		req.Model, req.Prompt = info.ID, promptFrom(messages)
+		out, err := c.GenerateImage(ctx, req)
+		if err != nil {
+			return Result{}, modalityResult{}, err
+		}
+		return Result{FinishReason: FinishStop, Usage: out.Usage},
+			modalityResult{Images: out.Images}, nil
+	}
+	return Result{}, modalityResult{}, fmt.Errorf("modelcall: %q is not a modality kind", start.GetKind())
+}
+
+// unservedByRuntime names the disagreement rather than the symptom. A
+// call only reaches runModality when the machine ADVERTISED the flag,
+// so a runtime that cannot serve it means the advertisement and the
+// runtime disagree -- and the operator needs the model and the modality
+// to find out which.
+func unservedByRuntime(info models.Info, word string) error {
+	return fmt.Errorf("model %q advertises %s and its runtime (%s) does not serve it",
+		info.ID, word, info.Runtime)
+}
+
+// promptFrom is the text half of a modality call: the LAST user turn.
+//
+// A speak call's text and an image call's prompt ride `messages` as
+// ordinary user turns (memql#5137), so there is no separate field to
+// read -- and the LAST one is the request, where an earlier one is
+// context the caller chose to include.
+func promptFrom(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return messages[i].Content
+		}
+	}
+	return ""
 }
 
 // classify turns a transport error into the envelope's closed set. An
