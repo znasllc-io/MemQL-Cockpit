@@ -32,15 +32,43 @@ type DeclaredRuntime struct {
 //
 // THEY ARE STATED RATHER THAN PROBED, and that is not laziness. An
 // OpenAI-compatible `/v1/models` returns ids and nothing else -- no
-// context length, no capability flag. A capability the machine cannot
-// observe has to be declared or left absent; inferring one from a model
-// name would be a guess that fails at parse time, three layers from here.
+// context length, no capability flag, no size. An attribute the machine
+// cannot observe has to be declared or left absent; inferring one from a
+// model name would be a guess that fails at parse time, three layers from
+// here.
+//
+// UNDECLARED IS ABSENT, for every field. Silence is not a zero this side
+// makes up: an unstated size sorts last in the engine's ranking (D5),
+// where a params of 0 would be this machine claiming a size it never
+// read, and an unstated tools keeps the model out of tool turns (D11)
+// rather than into one it cannot serve. The single exception is
+// max_concurrent, which probeDeclared floors at 1 -- absent means
+// UNLIMITED to the engine, so it is the one attribute silence must not
+// reach it as.
+//
+// params, quant and tools are spelled here as the LABEL spells them,
+// unlike context_window and structured_output: an operator comparing
+// `quant=Q4_K_M` on the Fleet page against this file should read one word
+// in both places, whereas `ctx` and `structured` are abbreviations nobody
+// would guess from a policy.yaml.
 type DeclaredModel struct {
 	ID               string `yaml:"id"`
 	ContextWindow    int    `yaml:"context_window"`
 	StructuredOutput bool   `yaml:"structured_output"`
 	Embeddings       bool   `yaml:"embeddings"`
 	MaxConcurrent    int    `yaml:"max_concurrent"`
+	// Params is the parameter COUNT, written out (7620000000), not the
+	// human string a model card prints. It is what the engine ranks on.
+	Params int64 `yaml:"params"`
+	// Quant is the quantization level, an operator-facing string that
+	// gates nothing and breaks the label if it carries a ',' or an '='
+	// -- quantSafe drops such a level rather than emitting it.
+	Quant string `yaml:"quant"`
+	// Tools says this runtime can carry a tool-calling turn for this
+	// model. Separate from StructuredOutput because on a declared runtime
+	// they are two independent claims; a runtime that serves a schema and
+	// refuses tool calls is an ordinary thing to own.
+	Tools bool `yaml:"tools"`
 }
 
 // Request is what discovery is asked to consider.

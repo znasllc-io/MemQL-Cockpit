@@ -24,12 +24,28 @@ type ollamaClient struct {
 type ollamaChatChunk struct {
 	Model   string `json:"model"`
 	Message struct {
-		Content string `json:"content"`
+		Content   string           `json:"content"`
+		ToolCalls []ollamaToolCall `json:"tool_calls"`
 	} `json:"message"`
 	Done            bool   `json:"done"`
 	DoneReason      string `json:"done_reason"`
 	PromptEvalCount int64  `json:"prompt_eval_count"`
 	EvalCount       int64  `json:"eval_count"`
+}
+
+// ollamaToolCall mirrors Ollama's own api.ToolCall.
+//
+// `arguments` is a JSON OBJECT on this surface, so it is captured as raw
+// bytes and handed on as text -- see ToolCall.ArgumentsJSON for why the
+// two runtimes' shapes are normalised in the clients rather than above
+// them. `id` is omitempty there and usually absent: the models Ollama
+// runs do not mint one.
+type ollamaToolCall struct {
+	ID       string `json:"id"`
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
 }
 
 func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc) (Result, error) {
@@ -47,6 +63,9 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 		// validated it, and a round trip through a map would reorder
 		// keys the model was shown.
 		body["format"] = json.RawMessage(req.Schema)
+	}
+	if len(req.Tools) > 0 {
+		body["tools"] = ollamaTools(req.Tools)
 	}
 
 	resp, err := c.post(ctx, "/api/chat", body)
@@ -78,6 +97,22 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 			if err := emit(chunk.Message.Content); err != nil {
 				return out, err
 			}
+		}
+		// OLLAMA NEVER STREAMS A PARTIAL TOOL CALL. Each call arrives
+		// complete on the frame that carries it -- the name and the whole
+		// arguments object together -- unlike the OpenAI-compatible
+		// stream, which sends an id in one chunk and the arguments a few
+		// characters at a time across several more. So the calls are
+		// appended whole and there is no accumulator here. Its absence is
+		// not an oversight: someone looking for the streaming path should
+		// stop at this comment rather than conclude the decoder is
+		// broken and add one that reassembles frames Ollama never sends.
+		for _, tc := range chunk.Message.ToolCalls {
+			out.ToolCalls = append(out.ToolCalls, ToolCall{
+				ID:            tc.ID,
+				Name:          tc.Function.Name,
+				ArgumentsJSON: strings.TrimSpace(string(tc.Function.Arguments)),
+			})
 		}
 		if chunk.Done {
 			out.FinishReason = ollamaFinishReason(chunk.DoneReason)
@@ -157,10 +192,76 @@ func (c *ollamaClient) post(ctx context.Context, path string, body any) (*http.R
 	return resp, nil
 }
 
-func ollamaMessages(in []Message) []map[string]string {
-	out := make([]map[string]string, 0, len(in))
+// ollamaMessages maps the envelope's turns onto Ollama's api.Message.
+//
+// THE TOOL NAME IS THE FIELD THE TWO RUNTIMES DISAGREE ABOUT: Ollama
+// reads it from `tool_name` on a role="tool" turn where the
+// OpenAI-compatible surface reads `name`. The disagreement is absorbed
+// here so Message stays one shape, and getting it wrong is silent -- the
+// runtime's decoder drops the unknown key, the request succeeds, and the
+// model is simply never told which tool answered.
+func ollamaMessages(in []Message) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
 	for _, m := range in {
-		out = append(out, map[string]string{"role": m.Role, "content": m.Content})
+		msg := map[string]any{"role": m.Role, "content": m.Content}
+		if m.ToolCallID != "" {
+			msg["tool_call_id"] = m.ToolCallID
+		}
+		if m.Name != "" {
+			msg["tool_name"] = m.Name
+		}
+		if len(m.ToolCalls) > 0 {
+			msg["tool_calls"] = ollamaToolCallsOut(m.ToolCalls)
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+// ollamaToolCallsOut replays an assistant turn's tool calls.
+//
+// The arguments go back as RAW JSON, not as the string the
+// OpenAI-compatible surface wants: Ollama's `arguments` is an object, and
+// a quoted string there reaches the model as a blob it cannot read as
+// arguments. Nothing rejects it -- the request succeeds and the model
+// answers as though it had asked for something else.
+func ollamaToolCallsOut(in []ToolCall) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, c := range in {
+		fn := map[string]any{"name": c.Name}
+		if args := strings.TrimSpace(c.ArgumentsJSON); args != "" {
+			fn["arguments"] = json.RawMessage(args)
+		}
+		call := map[string]any{"function": fn}
+		if c.ID != "" {
+			call["id"] = c.ID
+		}
+		out = append(out, call)
+	}
+	return out
+}
+
+// ollamaTools renders the offered tools in the shape Ollama's /api/chat
+// takes (its api.Tool: type / function / name / description /
+// parameters -- the same shape the OpenAI-compatible surface uses).
+//
+// The schema goes on as json.RawMessage, verbatim, for the reason on
+// Tool.ParametersJSON. A tool with an EMPTY schema omits the key rather
+// than sending it: an empty json.RawMessage fails json.Marshal outright,
+// which would turn "this tool takes no arguments" into a whole request
+// that never leaves the machine -- reported to the operator as a runtime
+// failure for a request no runtime ever saw.
+func ollamaTools(in []Tool) []map[string]any {
+	out := make([]map[string]any, 0, len(in))
+	for _, t := range in {
+		fn := map[string]any{"name": t.Name}
+		if t.Description != "" {
+			fn["description"] = t.Description
+		}
+		if params := strings.TrimSpace(t.ParametersJSON); params != "" {
+			fn["parameters"] = json.RawMessage(params)
+		}
+		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
 }

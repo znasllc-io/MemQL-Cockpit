@@ -80,6 +80,22 @@ func (d *Discoverer) probeDeclared(ctx context.Context, rt DeclaredRuntime) ([]I
 				StructuredOutput: m.StructuredOutput,
 				Embeddings:       m.Embeddings,
 				MaxConcurrent:    maxConcurrent,
+				// Size, quantization and tool support come across too,
+				// and leaving any of them out here is not a missing
+				// feature but a silent one: yaml accepts the key, the
+				// operator sees no error, and the attribute never
+				// reaches a label -- which looks exactly like a typo
+				// they cannot find.
+				//
+				// It matters most for `tools`. resolveDuplicates lets a
+				// declared entry win WHOLESALE over the Ollama probe, so
+				// the documented escape hatch -- declare a model against
+				// Ollama's own /v1 endpoint to overrule the capability
+				// heuristic -- would otherwise DELETE tools=1 from that
+				// model rather than restate it.
+				Params: m.Params,
+				Quant:  strings.TrimSpace(m.Quant),
+				Tools:  m.Tools,
 			},
 		})
 	}

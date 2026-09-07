@@ -72,11 +72,22 @@ const (
 )
 
 // Attribute keys inside a `model:<id>` label value.
+//
+// The last three arrived with the cockpit AHEAD of the engine (design D5
+// and D11; the engine half is memql#5096), which is the one direction in
+// which a spelling mistake here is free of consequences until it is very
+// expensive: the engine's parser skips a key it does not know, so a
+// misspelled attribute is not rejected, not logged and not visible --
+// it is a fleet that quietly never ranks by size and never routes a tool
+// turn. TestWireContract is what holds the two halves to one spelling.
 const (
 	attrContext    = "ctx"
 	attrStructured = "structured"
 	attrEmbeddings = "embeddings"
 	attrMax        = "max"
+	attrParams     = "params"
+	attrQuant      = "quant"
+	attrTools      = "tools"
 )
 
 // Attributes is what this machine claims about ONE model.
@@ -98,6 +109,37 @@ type Attributes struct {
 	// MaxConcurrent is the per-model ceiling. Zero means none declared,
 	// which the engine's load ordering reads as unlimited.
 	MaxConcurrent int
+	// Params is the parameter COUNT, not the human string a runtime
+	// prints. The engine ranks on it numerically -- "strongest first" is
+	// parameters descending, then context window (D5) -- and "70B" sorts
+	// before "8.0B" as text, so the conversion happens on this side where
+	// the runtime's own spelling is still in hand.
+	//
+	// It GATES nothing: Satisfies does not read it, and a model that
+	// states no size is still served for every prompt it is eligible for.
+	// Zero means this machine did not say, and an unstated size sorts
+	// LAST -- a model does not become the fleet's strongest by silence.
+	Params int64
+	// Quant is the quantization level exactly as the runtime spelled it
+	// ("Q4_K_M", "F16"). Verbatim rather than normalised, because an
+	// operator compares it against what `ollama list` prints, and a
+	// spelling this side invented is one they cannot find.
+	//
+	// It is the only FREE-TEXT attribute in the label, which makes it the
+	// only one that can forge a second attribute -- see quantSafe.
+	Quant string
+	// Tools reports that the runtime can carry a tool-calling turn for
+	// this model. The engine skips a machine whose tools is false when
+	// the turn has tools (D6, D11), so the fail-closed direction here is
+	// the same as everywhere else in this package.
+	//
+	// It is a SEPARATE field from StructuredOutput even though the Ollama
+	// probe answers both from one capability, and it has to be: a
+	// declared runtime's operator states the two independently, and
+	// collapsing them would make "this model holds a schema" and "this
+	// runtime can carry a tool call" one claim that no single source
+	// actually establishes.
+	Tools bool
 }
 
 // String renders the label value the engine parses. Keys are emitted in a
@@ -105,7 +147,7 @@ type Attributes struct {
 // inventory always produces byte-identical labels -- an unstable rendering
 // would rewrite the registration row on every reconnect for no change.
 func (a Attributes) String() string {
-	parts := make([]string, 0, 4)
+	parts := make([]string, 0, 7)
 	if a.ContextWindow > 0 {
 		parts = append(parts, fmt.Sprintf("%s=%d", attrContext, a.ContextWindow))
 	}
@@ -118,7 +160,41 @@ func (a Attributes) String() string {
 	if a.MaxConcurrent > 0 {
 		parts = append(parts, fmt.Sprintf("%s=%d", attrMax, a.MaxConcurrent))
 	}
+	if a.Params > 0 {
+		parts = append(parts, fmt.Sprintf("%s=%d", attrParams, a.Params))
+	}
+	if q := strings.TrimSpace(a.Quant); quantSafe(q) {
+		parts = append(parts, attrQuant+"="+q)
+	}
+	if a.Tools {
+		parts = append(parts, attrTools+"=1")
+	}
 	return strings.Join(parts, ",")
+}
+
+// quantSafe reports whether a quantization level can travel inside a
+// label value verbatim, and it is the SINGLE gate on that -- the probes
+// store what the runtime said, and this is where an unusable one stops.
+//
+// Quant is the only free-text attribute in a delimiter-separated list, so
+// it is the only one that can forge a second attribute: a level carrying
+// a comma or an '=' would be re-read on the far side as some other key,
+// and the engine would then act on an attribute this machine never
+// claimed. Such a value is dropped WHOLE rather than escaped or
+// truncated, because quant gates nothing (D5 makes it an ordering signal)
+// -- losing it costs a tiebreak, while emitting it costs the integrity of
+// every attribute standing beside it. Control bytes go the same way: this
+// string is rendered on the Fleet page and into log lines.
+func quantSafe(q string) bool {
+	if q == "" {
+		return false
+	}
+	for _, r := range q {
+		if r < 0x20 || r > 0x7e || r == ',' || r == '=' {
+			return false
+		}
+	}
+	return true
 }
 
 // ParseAttributes reads a label value back. It exists so the round-trip
@@ -146,6 +222,24 @@ func ParseAttributes(value string) Attributes {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
 				a.MaxConcurrent = n
 			}
+		case attrParams:
+			// A COUNT, base ten, and nothing else. The human string a
+			// runtime prints ("8.0B") is converted where it is read, so a
+			// label carrying one is a label some other writer produced --
+			// and reading it as 8 would put a machine at the bottom of a
+			// ranking it belongs at the top of.
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				a.Params = n
+			}
+		case attrQuant:
+			// Refused unless String could have emitted it, so the set of
+			// levels that survive a round trip is closed rather than
+			// "whatever arrived".
+			if quantSafe(v) {
+				a.Quant = v
+			}
+		case attrTools:
+			a.Tools = parseAdvertisedBool(v)
 		}
 	}
 	return a

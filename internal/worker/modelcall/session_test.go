@@ -355,6 +355,46 @@ func TestAdmission_SchemaWithoutTheCapability(t *testing.T) {
 	}
 }
 
+// TestAdmission_ToolsWithoutTheCapability. A runtime handed a tool
+// catalogue it cannot honour does not refuse -- it answers in prose, and
+// the caller reads prose where it was waiting for a call. So the refusal
+// has to happen before the request is built.
+//
+// The gate is called DIRECTLY, and that is the point of it being a
+// function: the wire carries no tool catalogue yet (see toolsFromStart),
+// so a call routed through Start would arrive with no tools on it and
+// assert nothing at all.
+func TestAdmission_ToolsWithoutTheCapability(t *testing.T) {
+	tools := []Tool{{Name: "lookup", ParametersJSON: `{"type":"object"}`}}
+	plain := models.Info{ID: "plain", Kind: models.KindOllama, Allowed: true}
+
+	end := toolsRefusal(plain, tools)
+	if end == nil {
+		t.Fatal("a model that does not advertise tool calling must be refused before any request reaches the runtime")
+	}
+	if end.GetErrorCode() != CodeToolsUnsupported {
+		t.Errorf("error_code = %q, want %q", end.GetErrorCode(), CodeToolsUnsupported)
+	}
+	if end.GetFinishReason() != FinishError {
+		t.Errorf("finish_reason = %q", end.GetFinishReason())
+	}
+	if !strings.Contains(end.GetError(), "plain") {
+		t.Errorf("error = %q, want it to name the model", end.GetError())
+	}
+
+	capable := plain
+	capable.Tools = true
+	if end := toolsRefusal(capable, tools); end != nil {
+		t.Errorf("a model advertising tools must not be refused: %+v", end)
+	}
+	// The gate is about the CATALOGUE, not the model: an ordinary chat
+	// call against a model without tools is the common case and must
+	// pass.
+	if end := toolsRefusal(plain, nil); end != nil {
+		t.Errorf("a call that offers no tools must not be refused: %+v", end)
+	}
+}
+
 // TestAdmission_PerModelCap. The engine rations by the advertised number,
 // but the advertisement is a claim about THIS hardware and two replicas
 // selecting at the same moment is an ordinary race.
