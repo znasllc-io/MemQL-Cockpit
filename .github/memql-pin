@@ -15,22 +15,35 @@
 # TO BUMP: change the sha below, add the newly-landed module's `require` and
 # `replace` to go.mod, and run `go mod tidy` -- all in one commit.
 #
-# Currently pinned to memql main after the local-models engine half landed
-# (memql#4694, epic memql#4676) -- the wire tier now carries the
-# ModelCall family (Start / Delta / End / Cancel, with ModelCallMessage,
-# Params, Limits, Usage and Embedding) on WorkerService.Stream, which
-# memql-cockpit#358..#364 serve from this machine's own runtime.
+# Currently pinned to memql main after the app-session credential class
+# landed (memql#4863) -- the identity node mints class="app_session" for a
+# delegated run and the Library's byte routes admit that class as the user
+# it names, which is what makes appsession.Library.Pull / .Push work at all.
+# Before this the back-channel collapsed into class="service_account", a
+# class that surface pins off deliberately, and every pull answered 401.
+# memql-cockpit#371 is the cockpit half of that.
 #
-# ADVERTISEMENT NEEDED NO PROTO CHANGE, which is worth knowing before
+# WHAT THIS BUMP IS NOT. It does NOT carry the wire that epics memql#5096
+# (tools on the ModelCall family, `message` control and `result` on app
+# sessions, app descriptors on Register) and memql#5103 (ModelPullStart /
+# Progress / End) own. Neither had merged when this moved. The cockpit
+# halves of both are implemented against a narrow seam -- see
+# internal/worker/appsession/session.go's controlPrompt and
+# internal/worker/inference/pull.go -- so landing them is a pin bump plus
+# the field mapping, not a rewrite. Do not read the presence of harness
+# clients or the inference package as proof the wire exists.
+#
+# component/harness LOST its go.mod between the previous pin and this one,
+# so its `require` and `replace` came OUT in the same commit. That is row 4
+# of the truth table in go.mod read backwards: a replace with a require and
+# no go.mod on the far side is "ambiguous import", and the fix is to delete
+# both directives rather than to add anything. The remaining set is what
+# `go mod tidy` converged on and is unchanged otherwise.
+#
+# ADVERTISEMENT STILL NEEDS NO PROTO CHANGE, which is worth knowing before
 # reading the diff for one: models ride Register's EXISTING labels map as
 # `model:<id>` and `runtime:<kind>`, per the engine's
-# integrations/agent/worker/model_routing.go. Only the SERVING half
-# depends on this bump.
-#
-# No new nested module landed with it. `go mod tidy` moved two indirect
-# versions (anthropic-sdk-go, grpc) and nothing else -- component/worker,
-# where the label constants live, is a module of its own and deliberately
-# NOT required here: the cockpit mirrors those three strings the way
-# apps.go mirrors the engine's app id set, rather than putting this repo's
-# build graph behind a module the split is still moving.
-d05d4342b8bff10d2c7eb91fb22888e2948d7339
+# integrations/agent/worker/model_routing.go, and the params / quant / tools
+# attributes this repository now advertises are more text inside that same
+# map value. Only the SERVING half of tool calling depends on memql#5096.
+5c4f6ae9679e97609c115ec484ed1aa16edebd7a
