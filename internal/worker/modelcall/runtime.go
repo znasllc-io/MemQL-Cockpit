@@ -39,13 +39,57 @@ package modelcall
 import (
 	"context"
 	"time"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
 
 // Kinds, mirrored from memql component/worker/modelcall.go.
 const (
 	KindChat      = "chat"
 	KindEmbedding = "embedding"
+
+	// The four MODALITY kinds (engine memql#5137, record D4).
+	//
+	// The kind selector needs no proto change -- ModelCallStart.kind is
+	// a plain string, so these four travel today. What does NOT exist
+	// is anywhere to put their payloads: at the pin ModelCallMessage is
+	// {role, content} with no image parts, ModelCallDelta and
+	// ModelCallEnd carry only strings, and embedding_input is []string.
+	// So the kinds are admitted and the payload is refused by name --
+	// see payloadFor and CodePayloadUnavailable.
+	//
+	// This repository DEFINES these four strings, the same way it
+	// defines the four label flags: memql#5137 has not merged, so there
+	// is nothing upstream to transcribe.
+	KindVision     = "vision"
+	KindTranscribe = "transcribe"
+	KindSpeak      = "speak"
+	KindImage      = "image"
 )
+
+// modalityKinds maps each modality kind to the label flag a machine
+// must have advertised before it will serve one, and to the operator
+// word for it.
+//
+// A SINGLE TABLE, because the three things must agree: the kind the
+// router sends, the flag the label carries, and the sentence the
+// refusal prints. Three switch statements would be three places for a
+// modality to be half-added.
+var modalityKinds = map[string]struct {
+	Advertised func(models.Attributes) bool
+	Word       string
+}{
+	KindVision:     {func(a models.Attributes) bool { return a.Vision }, "vision"},
+	KindTranscribe: {func(a models.Attributes) bool { return a.AudioIn }, "transcription"},
+	KindSpeak:      {func(a models.Attributes) bool { return a.AudioOut }, "speech"},
+	KindImage:      {func(a models.Attributes) bool { return a.ImageGen }, "image generation"},
+}
+
+// ServedKinds lists every kind this worker admits, in a stable order,
+// for the refusal that has to name them.
+func ServedKinds() []string {
+	return []string{KindChat, KindEmbedding, KindVision, KindTranscribe, KindSpeak, KindImage}
+}
 
 // Finish reasons, mirrored from the same file.
 const (
@@ -87,6 +131,16 @@ type Message struct {
 	Name string
 	// ToolCalls are the calls an assistant turn asked for.
 	ToolCalls []ToolCall
+	// Images are the pictures a vision turn carries (memql#5137).
+	//
+	// A turn with images renders its content as an ARRAY of parts
+	// rather than a string, which is the only shape an
+	// OpenAI-compatible server accepts one in. The field is on the
+	// message rather than beside it so the mapping stays one function
+	// with one shape -- a second parameter threaded through
+	// openAIMessages would have to be kept in step with the slice it
+	// indexes, and a mismatch there attaches an image to the wrong turn.
+	Images []ImagePart
 }
 
 // ToolCall is one call the model asked for -- as it came back from the
@@ -193,14 +247,60 @@ type Result struct {
 	ToolCalls []ToolCall
 }
 
-// emitFunc receives one piece of generated text. Returning an error stops
+// The MODALITY capabilities, as optional interfaces on top of Client.
+//
+// Optional rather than methods on Client, because not every runtime
+// serves every modality and a mandatory method would force each client
+// to carry a stub that refuses -- which reads as a runtime that CAN do
+// the thing and chose not to. A type assertion that fails is the
+// honest shape: this runtime does not serve this.
+//
+// Which client implements which is decided by which probe can set the
+// flag. `vision` and `imagegen` come from Ollama's own capability list,
+// so the native client implements both; `audioin` and `audioout` can
+// only be true through a declared runtime, which clientFor reaches as
+// an openAIClient.
+type (
+	// VisionClient serves kind="vision".
+	VisionClient interface {
+		Vision(ctx context.Context, req VisionRequest, emit Emit) (Result, error)
+	}
+	// Transcriber serves kind="transcribe".
+	Transcriber interface {
+		Transcribe(ctx context.Context, req TranscribeRequest) (TranscribeResult, error)
+	}
+	// Speaker serves kind="speak".
+	Speaker interface {
+		Speak(ctx context.Context, req SpeakRequest) (SpeakResult, error)
+	}
+	// ImageGenerator serves kind="image".
+	ImageGenerator interface {
+		GenerateImage(ctx context.Context, req ImageRequest) (ImageResult, error)
+	}
+)
+
+// Emit receives one piece of generated text. Returning an error stops
 // the generation -- it means the stream back to the cluster is gone, and
 // continuing would spend this machine's GPU on output nobody will read.
-type emitFunc func(content string) error
+//
+// Exported alongside Client for the same reason: a caller outside this
+// package cannot implement or supply one otherwise.
+type Emit func(content string) error
 
-// client is one runtime family. Both implementations are stateless; the
+// emitFunc is the internal spelling, kept so the existing call sites
+// read unchanged.
+type emitFunc = Emit
+
+// Client is one runtime family. Both implementations are stateless; the
 // per-call state lives on the call.
-type client interface {
+//
+// It is EXPORTED because two callers now need to reach a runtime: the
+// call manager here, and internal/worker/probe, which measures a model
+// against the suite. They must reach it the same way -- a probe that
+// measured a model through a different path than the one serving would
+// measure the wrong thing, and the figure it produced would rank a
+// machine on a code path no caller uses.
+type Client interface {
 	Chat(ctx context.Context, req ChatRequest, emit emitFunc) (Result, error)
 	Embed(ctx context.Context, req EmbedRequest) (Result, error)
 }

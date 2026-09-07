@@ -109,6 +109,27 @@ func (d *Discoverer) probeOllama(ctx context.Context) ([]Info, string) {
 			info.Embeddings = hasCapability(show.Capabilities, "embedding")
 			info.Tools = hasCapability(show.Capabilities, "tools")
 			info.StructuredOutput = ollamaStructuredOutput(show.Capabilities)
+			// Vision is the ONE modality Ollama answers directly:
+			// `vision` is a capability in /api/show, beside `tools` and
+			// `embedding`. So this flag is a real probe, and it is the
+			// only one of the four that can be true on a bare Ollama.
+			info.Vision = hasCapability(show.Capabilities, "vision")
+			// And image generation, IF this runtime reports it. Read
+			// from the capability list rather than from anything about
+			// the model's name or the host's platform: which platforms
+			// Ollama offers image generation on is a vendor fact this
+			// cockpit cannot verify and would be stale within a
+			// release, where a capability the runtime just printed is a
+			// fact about the machine in front of us.
+			info.ImageGen = hasCapability(show.Capabilities, "image")
+			//
+			// AUDIO IN AND AUDIO OUT ARE DELIBERATELY NOT SET HERE.
+			// Ollama reports no capability for either, and there is no
+			// honest probe short of sending a real audio payload to
+			// every model on the machine. An operator with a
+			// transcription endpoint or a Kokoro speech runtime
+			// declares it under models.runtimes; a bare Ollama offers
+			// neither, which is true.
 		}
 		out = append(out, info)
 	}

@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
@@ -38,7 +39,7 @@ func TestBuildRegister_CarriesValidCapabilityDescriptor(t *testing.T) {
 		Name:         "test-worker",
 		Capabilities: []string{"HEADLESS"},
 		Concurrency:  map[string]uint32{"HEADLESS": 1},
-	}, nil, models.Inventory{})
+	}, nil, models.Inventory{}, hardware.Inventory{}, tools.ServeOwner)
 
 	raw := register.GetCapabilityDescriptorJson()
 	if raw == "" {
@@ -83,5 +84,29 @@ func TestBuildRegister_CarriesValidCapabilityDescriptor(t *testing.T) {
 	}
 	if raw != want {
 		t.Errorf("handshake descriptor diverges from the capabilities action:\nregister: %s\naction:   %s", raw, want)
+	}
+}
+
+// The sharing consent reaches the wire through the descriptor, and the
+// Register path is the only place it is read from the live policy.
+func TestRegisterCarriesTheSharingConsent(t *testing.T) {
+	for _, serve := range []string{tools.ServeOwner, tools.ServeCluster} {
+		register := buildRegister(Config{
+			Name:         "test-worker",
+			Capabilities: []string{"HEADLESS"},
+		}, nil, models.Inventory{}, hardware.Inventory{}, serve)
+
+		var got map[string]any
+		if err := json.Unmarshal([]byte(register.GetCapabilityDescriptorJson()), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got["inferenceServe"] != serve {
+			t.Fatalf("inferenceServe = %v, want %q", got["inferenceServe"], serve)
+		}
+		// And the version the engine gates on is untouched. A bump here
+		// is a handshake refusal on every machine, not a missing field.
+		if got["schemaVersion"] != float64(1) {
+			t.Fatalf("schemaVersion = %v, want 1", got["schemaVersion"])
+		}
 	}
 }

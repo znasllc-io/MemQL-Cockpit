@@ -17,6 +17,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/backup"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/consent"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/inference"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/modelcall"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
@@ -73,6 +74,10 @@ func dispatchHandleCommand(args []string) {
 		handleBackup(args[1:])
 	case "models":
 		handleModels(args[1:])
+	case "hardware":
+		handleHardware(args[1:])
+	case "probe":
+		handleProbe(args[1:])
 	case "consent":
 		handleConsentCmd(args[1:])
 	case "-h", "--help", "help":
@@ -325,6 +330,10 @@ func handleRun(args []string) {
 		Calls:    calls,
 		Sessions: sessions,
 		Metrics:  metrics,
+		// Read from the LIVE policy on every connect, so a SIGHUP that
+		// changed the consent is honoured at the next reconnect
+		// (record D6: "a change takes effect on the next reconnect").
+		InferenceServe: policy.InferenceServe,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -338,10 +347,36 @@ func handleRun(args []string) {
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
+				// Captured BEFORE the reload so the change can be
+				// named rather than merely implied. An operator who
+				// edits a sharing consent and sees only "policy
+				// reloaded" cannot tell from the log whether the file
+				// they edited is the one the worker read.
+				serveBefore := policy.InferenceServe()
 				if err := policy.Reload(); err != nil {
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
+
+					// A CHANGED CONSENT TAKES EFFECT ON THE NEXT
+					// RECONNECT, and nothing here forces one. The
+					// descriptor is built at Register, which the engine
+					// accepts exactly once per stream -- so the value
+					// on the cluster is the one this worker sent when
+					// it connected.
+					//
+					// No reconnect is taken for it, deliberately. A
+					// reconnect interrupts nothing when the machine is
+					// idle and abandons a running generation when it is
+					// not, and this field steers no call already in
+					// flight: the router chose this machine before the
+					// call started. That is the same trade
+					// RequestImmediateReadvertise refuses to make for
+					// labels, where the payoff is larger.
+					if after := policy.InferenceServe(); after != serveBefore {
+						logger.Info("inference.serve changed; it takes effect on the next reconnect",
+							"from", serveBefore, "to", after)
+					}
 					// A RELOADED models.allow THAT NOBODY
 					// RE-ADVERTISED IS A MODEL THE CLUSTER STILL
 					// CANNOT SEE. Model labels are bound at Register
@@ -427,9 +462,9 @@ func parseSetupFlags(args []string) setupFlags {
 	nonInteractive := fs.Bool("non-interactive", false, "never prompt; report what is missing and exit 3 (a question could not be asked), 4 (not granted) or 5 (probe failed)")
 	inference := fs.Bool("inference", false, "set this machine up to serve local models: runtime, models, models.allow")
 	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml (its directory holds policy.yaml)")
-	runtimeFlag := fs.String("runtime", "", "with --inference: docker | native, overriding the runtime this platform would choose")
+	runtimeFlag := fs.String("runtime", "", "with --inference: docker | native, overriding the runtime this platform would choose. On its own: kokoro | image, to install that runtime")
 	var modelIDs repeatedFlag
-	fs.Var(&modelIDs, "model", "with --inference: a model id to pull; repeatable (default: llama3.1:8b and nomic-embed-text)")
+	fs.Var(&modelIDs, "model", "with --inference: a model id to pull; repeatable (default: the recommended set for this machine's class)")
 	_ = fs.Parse(args)
 	return setupFlags{
 		nonInteractive: *nonInteractive,
@@ -438,6 +473,64 @@ func parseSetupFlags(args []string) setupFlags {
 		runtimeFlag:    *runtimeFlag,
 		modelIDs:       modelIDs,
 	}
+}
+
+// runtimeModeFor decides which of --runtime's two meanings applies.
+//
+// It returns ("", false) when the flag is absent or names a model
+// runtime alongside --inference (the existing path, unchanged); the
+// runtime name when this is an install; and (sentence, true) for a
+// combination that is refused.
+//
+// A PURE FUNCTION of the parsed flags, so every combination is
+// assertable without a terminal or a machine -- the same reason
+// setupFlags is a struct.
+func runtimeModeFor(f setupFlags) (string, bool) {
+	name := strings.ToLower(strings.TrimSpace(f.runtimeFlag))
+	if name == "" {
+		return "", false
+	}
+
+	installable := false
+	for _, r := range inference.InstallableRuntimes() {
+		if name == r {
+			installable = true
+			break
+		}
+	}
+
+	switch {
+	case installable && f.inference:
+		return wrapJoin(fmt.Sprintf(
+			"--runtime %s installs a speech or image runtime, and --runtime docker or native chooses"+
+				" how Ollama runs. They are different questions, so they are different commands: run"+
+				" memql worker setup --runtime %s on its own.", name, name)), true
+
+	case installable:
+		return name, false
+
+	case f.inference:
+		// docker | native alongside --inference: the existing meaning.
+		// applyRuntimeFlag validates it and refuses a combination the
+		// platform cannot serve, in its own words.
+		return "", false
+
+	case name == "docker" || name == "native":
+		return wrapJoin(fmt.Sprintf(
+			"--runtime %s chooses how Ollama runs, which is a question only --inference asks."+
+				" Run memql worker setup --inference --runtime %s, or drop the flag.", name, name)), true
+
+	default:
+		return wrapJoin(fmt.Sprintf(
+			"--runtime takes docker or native with --inference, or %s on its own. It does not take %q.",
+			strings.Join(inference.InstallableRuntimes(), " or "), f.runtimeFlag)), true
+	}
+}
+
+// wrapJoin renders a refusal at the width the rest of this surface
+// wraps to, so a usage error and a plan refusal look like one product.
+func wrapJoin(text string) string {
+	return strings.Join(wrapText(text, inferenceWrapWidth), "\n")
 }
 
 func handleSetup(args []string) {
@@ -452,6 +545,24 @@ func handleSetup(args []string) {
 	// do with the permissions it was asking about -- on the majority of
 	// machines, which are below the hardware floor and were never going
 	// to serve a model.
+	// --runtime MEANS TWO DIFFERENT THINGS, and the ambiguity is
+	// resolved by refusing the mix rather than by guessing.
+	//
+	// Alongside --inference it chooses HOW OLLAMA RUNS (docker or
+	// native). On its own it installs an ADDITIONAL runtime (kokoro or
+	// image). Those are different questions -- one is about a runtime
+	// this machine is getting either way, the other about whether it
+	// gets a second one at all -- and a person who typed the wrong
+	// combination is better served by a sentence than by whichever
+	// meaning happened to win.
+	if verdict, refused := runtimeModeFor(f); refused {
+		fmt.Fprintln(os.Stdout, verdict)
+		os.Exit(SetupExitUsage)
+	} else if verdict != "" {
+		os.Exit(runRuntimeSetup(context.Background(),
+			newRuntimeSetup(f.configPath, verdict, f.nonInteractive)))
+	}
+
 	if f.inference {
 		os.Exit(runInferenceSetup(context.Background(),
 			newInferenceSetup(f.configPath, f.modelIDs, f.nonInteractive, f.runtimeFlag)))
@@ -505,10 +616,19 @@ func printUsage() {
 	fmt.Println("  memql worker setup --inference")
 	fmt.Println("                                     Set this machine up to serve local models:")
 	fmt.Println("                                     the runtime, the models, and models.allow.")
+	fmt.Println("  memql worker setup --runtime kokoro")
+	fmt.Println("                                     Install the speech runtime, so this machine")
+	fmt.Println("                                     can serve text to speech. --runtime image")
+	fmt.Println("                                     does the same for image generation.")
 	fmt.Println("  memql worker config        Print the effective config.")
 	fmt.Println("  memql worker models        Print the local models this machine would offer,")
 	fmt.Println("                                     or the reason it offers none. --pull <id>")
 	fmt.Println("                                     pulls one; --allow <id> offers one.")
+	fmt.Println("  memql worker hardware      Print what this machine reports about itself:")
+	fmt.Println("                                     chip, memory, GPU, runtimes, and the class")
+	fmt.Println("                                     that decides which models are recommended.")
+	fmt.Println("  memql worker probe         Measure a local model against the probe suite:")
+	fmt.Println("                                     structured output, tool calls, throughput.")
 	fmt.Println("  memql worker backup        Print the folders this machine backs up into the")
 	fmt.Println("                                     Library, or the reason it backs up none.")
 	fmt.Println("                                     --once runs one sweep now.")
@@ -529,11 +649,14 @@ func printUsage() {
 	fmt.Println("  --metrics-port <p>   Loopback port for prometheus metrics (default 9100; 0 disables)")
 	fmt.Println("")
 	fmt.Println("SETUP --INFERENCE FLAGS")
-	fmt.Println("  --model <id>         Model to pull; repeatable (default llama3.1:8b and")
-	fmt.Println("                       nomic-embed-text)")
+	fmt.Println("  --model <id>         Model to pull; repeatable. The default is the set")
+	fmt.Println("                       recommended for this machine's class; run")
+	fmt.Println("                       memql worker hardware to see it.")
 	fmt.Println("  --runtime <r>        docker | native, overriding the runtime this platform")
 	fmt.Println("                       would choose. A combination the platform cannot serve")
-	fmt.Println("                       is refused rather than ignored.")
+	fmt.Println("                       is refused rather than ignored. Without --inference the")
+	fmt.Println("                       flag takes kokoro | image instead and installs that")
+	fmt.Println("                       runtime; the two meanings are never mixed silently.")
 	fmt.Println("  --non-interactive    Never ask. A runtime install it would have asked about")
 	fmt.Println("                       is refused with exit 3 and nothing is installed.")
 }

@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
 // TestBuildRegister_CarriesTheAppInventory: the engine cannot discover
@@ -17,7 +19,7 @@ func TestBuildRegister_CarriesTheAppInventory(t *testing.T) {
 	}, []apps.Info{
 		{Id: apps.IDClaudeCode, Version: "2.1.4", SignedIn: true, Subscription: apps.SubscriptionPresent, Allowed: true},
 		{Id: apps.IDCodex, Version: "0.9.1", SignedIn: false, Subscription: apps.SubscriptionUnknown, Allowed: false},
-	}, models.Inventory{})
+	}, models.Inventory{}, hardware.Inventory{}, tools.ServeOwner)
 
 	got := register.GetApps()
 	if len(got) != 2 {
@@ -80,7 +82,7 @@ func TestAppsToProto_EmptyInventoryIsNil(t *testing.T) {
 // truth, including "none".
 func TestBuildHeartbeat_AlwaysSetsAppsPresent(t *testing.T) {
 	t.Run("with apps", func(t *testing.T) {
-		hb := buildHeartbeat(0, nil, []apps.Info{{Id: apps.IDClaudeCode, SignedIn: true, Allowed: true}})
+		hb := buildHeartbeat(0, nil, []apps.Info{{Id: apps.IDClaudeCode, SignedIn: true, Allowed: true}}, nil)
 		if !hb.GetAppsPresent() {
 			t.Error("apps_present must be true")
 		}
@@ -89,7 +91,7 @@ func TestBuildHeartbeat_AlwaysSetsAppsPresent(t *testing.T) {
 		}
 	})
 	t.Run("uninstalled the last app", func(t *testing.T) {
-		hb := buildHeartbeat(0, nil, nil)
+		hb := buildHeartbeat(0, nil, nil, nil)
 		if !hb.GetAppsPresent() {
 			t.Fatal("an empty inventory must still set apps_present -- it is how the cockpit says \"I now have none\"")
 		}

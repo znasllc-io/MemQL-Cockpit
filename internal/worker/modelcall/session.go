@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,8 +26,29 @@ const (
 	CodeModelNotOffered = "model_not_offered"
 	// CodeConcurrencyExceeded: the model is offered but at its cap.
 	CodeConcurrencyExceeded = "model_concurrency_exceeded"
-	// CodeUnsupportedKind: neither chat nor embedding.
+	// CodeUnsupportedKind: not a kind this worker serves at all.
 	CodeUnsupportedKind = "unsupported_kind"
+	// CodeModalityUnsupported: the kind is one this worker serves and
+	// the model never advertised the modality it needs.
+	//
+	// SEPARATE FROM CodeUnsupportedKind because the fixes are
+	// different: an unknown kind is a version skew between the engine
+	// and this cockpit, where an unadvertised modality is a stale
+	// routing decision or a policy change -- and the refusal report
+	// lists every machine considered and why, so two causes that send
+	// an operator to different places get two codes.
+	CodeModalityUnsupported = "modality_unsupported"
+	// CodePayloadUnavailable: the kind is served and the call carried
+	// no payload for it.
+	//
+	// THIS IS THE PROTO SEAM (memql#5137). At the pin there is nowhere
+	// on ModelCallStart to put an image or audio bytes, so a modality
+	// call that reached this worker would have arrived empty. It is
+	// REFUSED rather than served as a text call: a machine that
+	// answered a vision request with a completion that never saw the
+	// image would report success for a generation about nothing, and
+	// nothing downstream could detect it.
+	CodePayloadUnavailable = "payload_unavailable"
 	// CodeSchemaUnsupported: a response schema arrived for a model this
 	// machine never advertised structured output for.
 	CodeSchemaUnsupported = "schema_unsupported"
@@ -326,9 +348,11 @@ func limitsFrom(l *memqlv1.ModelCallLimits) callLimits {
 // running on somebody's hardware.
 func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCallStart) (models.Info, *memqlv1.ModelCallEnd) {
 	kind := start.GetKind()
-	if kind != KindChat && kind != KindEmbedding {
+	modality, isModality := modalityKinds[kind]
+	if kind != KindChat && kind != KindEmbedding && !isModality {
 		return models.Info{}, refuse(CodeUnsupportedKind,
-			fmt.Sprintf("this worker serves %q and %q; the call asked for %q", KindChat, KindEmbedding, kind))
+			fmt.Sprintf("this worker serves %s; the call asked for %q",
+				strings.Join(quoteAll(ServedKinds()), ", "), kind))
 	}
 
 	var inv models.Inventory
@@ -339,6 +363,16 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 	if !ok {
 		return models.Info{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("this machine does not currently offer model %q", start.GetModel()))
+	}
+	// A SCHEMA ONLY MEANS SOMETHING ON A CHAT-SHAPED CALL. Vision is
+	// one; transcription, speech and image generation are not -- their
+	// answers are a transcript, audio bytes and image bytes, and there
+	// is no text for a schema to constrain. A schema arriving on one of
+	// those is refused rather than dropped, because dropping it would
+	// let a caller believe it had asked for something.
+	if len(start.GetResponseFormatSchema()) > 0 && isModalityKind(kind) && kind != KindVision {
+		return models.Info{}, refuse(CodeSchemaUnsupported,
+			fmt.Sprintf("a %q call returns no text for a response schema to constrain", kind))
 	}
 	if len(start.GetResponseFormatSchema()) > 0 && !info.StructuredOutput {
 		// The router only sends a schema to a machine that advertised
@@ -354,6 +388,22 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 	if kind == KindEmbedding && !info.Embeddings {
 		return models.Info{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("model %q does not advertise embeddings on this machine", info.ID))
+	}
+	if isModality {
+		// The advertised flag gates the call, exactly as the structured
+		// and tools flags above do and for the same reason: the router
+		// only sends a modality to a machine that advertised it, so
+		// arriving here without one is a stale advertisement, and
+		// serving it anyway would defeat the gating that put the call
+		// here.
+		if !modality.Advertised(info.Attributes) {
+			return models.Info{}, refuse(CodeModalityUnsupported,
+				fmt.Sprintf("model %q does not advertise %s on this machine", info.ID, modality.Word))
+		}
+		// And the payload, which the wire cannot carry yet.
+		if _, ok := payloadFor(start); !ok {
+			return models.Info{}, refuse(CodePayloadUnavailable, modalityUnavailableSentence(modality.Word))
+		}
 	}
 
 	m.mu.Lock()
@@ -442,12 +492,23 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 
 	client := m.clientFor(info)
 	var (
-		res Result
-		err error
+		res   Result
+		modal modalityResult
+		err   error
 	)
-	if start.GetKind() == KindEmbedding {
+	switch kind := start.GetKind(); {
+	case kind == KindEmbedding:
 		res, err = client.Embed(ctx, EmbedRequest{Model: info.ID, Input: start.GetEmbeddingInput()})
-	} else {
+
+	case isModalityKind(kind):
+		// resolve already refused a modality call whose payload the
+		// wire could not carry, so reaching here means payloadFor
+		// answered -- which today happens only under test, and after
+		// memql#5137 happens for real.
+		payload, _ := payloadFor(start)
+		res, modal, err = m.runModality(ctx, client, info, start, payload, stream.emit)
+
+	default:
 		res, err = client.Chat(ctx, ChatRequest{
 			Model:    info.ID,
 			Messages: messagesFrom(start.GetMessages()),
@@ -478,6 +539,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 	end.Usage = usageProto(res.Usage)
 	end.Embeddings = embeddingsProto(res.Embeddings)
 	attachToolCalls(end, res.ToolCalls)
+	attachModalityResult(end, modal)
 
 	if err := sender.SendModelCallEnd(end); err != nil {
 		m.logger.Warn("failed to send model call end", "request_id", c.requestID, "error", err)
@@ -487,7 +549,27 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 // watchdog enforces the idle ceiling and emits the keepalives that make
 // it enforceable on the other side too.
 func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, limits callLimits, done <-chan struct{}) {
-	t := time.NewTicker(limits.keepalive)
+	// THE CHECK CADENCE IS HALF THE KEEPALIVE INTERVAL, and the halving
+	// is what makes keepalives fire at all.
+	//
+	// Ticking at exactly limits.keepalive and then testing
+	// `sinceSend() >= limits.keepalive` makes every tick land within
+	// scheduling jitter of the threshold it is testing: the elapsed
+	// time at tick N is the ticker period, which is the threshold, so
+	// whether the comparison is true is a coin flip. Half the calls
+	// emit no keepalive at all, and the engine -- whose idle ceiling
+	// the keepalive exists to keep enforceable -- sees silence it
+	// cannot distinguish from a wedged machine.
+	//
+	// Halved, a keepalive lands somewhere in [keepalive, 1.5 x
+	// keepalive], comfortably inside the idle ceiling (which limitsFrom
+	// holds at strictly more than the keepalive), and the idle check
+	// keeps its own granularity well under the deadline it guards.
+	tick := limits.keepalive / 2
+	if tick <= 0 {
+		tick = limits.keepalive
+	}
+	t := time.NewTicker(tick)
 	defer t.Stop()
 	for {
 		select {
@@ -509,9 +591,14 @@ func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, li
 				c.cancel()
 				return
 			}
-			if idle >= limits.keepalive {
+			if stream.sinceSend() >= limits.keepalive {
 				// A delta with no content, carrying its own seq so it can
 				// never be mistaken for a replayed content delta.
+				//
+				// The cadence is measured against the last SEND, not the
+				// last content: two keepalives in a row are correct
+				// while a runtime is thinking, and measuring this
+				// against the idle clock would emit one on every tick.
 				if err := stream.keepalive(); err != nil {
 					c.cancel()
 					return
@@ -519,6 +606,130 @@ func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, li
 			}
 		}
 	}
+}
+
+// runModality serves one of the four modality kinds.
+//
+// THE CLIENT IS ASKED, NOT ASSUMED. Each kind needs a capability the
+// runtime may not have, so the type assertion is the check -- and its
+// failure is a refusal naming the runtime rather than a panic or a
+// silent fall back to a text completion. A machine reaches here only
+// when it advertised the flag, so a failure here means the flag and the
+// runtime disagree, which is worth saying plainly.
+func (m *Manager) runModality(
+	ctx context.Context,
+	client Client,
+	info models.Info,
+	start *memqlv1.ModelCallStart,
+	payload Payload,
+	emit Emit,
+) (Result, modalityResult, error) {
+	messages := messagesFrom(start.GetMessages())
+	params := paramsFrom(start.GetParams())
+
+	switch start.GetKind() {
+	case KindVision:
+		c, ok := client.(VisionClient)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "vision")
+		}
+		res, err := c.Vision(ctx, VisionRequest{
+			Model: info.ID, Messages: messages, Images: payload.Images, Params: params,
+			// The schema travels. A vision call IS a chat call, and
+			// resolve only admitted this one because the model
+			// advertises structured output -- so dropping it here
+			// would answer prose to a call that was routed on the
+			// promise of JSON.
+			Schema: start.GetResponseFormatSchema(),
+		}, emit)
+		return res, modalityResult{}, err
+
+	case KindTranscribe:
+		c, ok := client.(Transcriber)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "transcription")
+		}
+		// The container is CONVERTED from the wire's media type, and a
+		// media type this side does not know yields no container --
+		// which Transcribe refuses by name rather than guessing.
+		format := audioFormatFor(payload.AudioMediaType)
+		if format == "" {
+			return Result{}, modalityResult{}, fmt.Errorf(
+				"transcribe: the audio arrived as %q, which this machine cannot name a container for",
+				payload.AudioMediaType)
+		}
+		out, err := c.Transcribe(ctx, TranscribeRequest{
+			Model: info.ID, Audio: payload.Audio, Format: format, Prompt: promptFrom(messages),
+		})
+		if err != nil {
+			return Result{}, modalityResult{}, err
+		}
+		// The transcript is CONTENT, so it goes out as a delta the same
+		// way a generation would: the engine assembles what it accepts,
+		// and a caller that streams and a caller that does not are the
+		// same shape on the other side.
+		if out.Text != "" {
+			if err := emit(out.Text); err != nil {
+				return Result{}, modalityResult{}, err
+			}
+		}
+		return Result{FinishReason: FinishStop, Usage: out.Usage},
+			modalityResult{Segments: out.Segments}, nil
+
+	case KindSpeak:
+		c, ok := client.(Speaker)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "speech")
+		}
+		req := payload.Speech
+		req.Model, req.Text = info.ID, promptFrom(messages)
+		out, err := c.Speak(ctx, req)
+		if err != nil {
+			return Result{}, modalityResult{}, err
+		}
+		return Result{FinishReason: FinishStop, Usage: out.Usage},
+			modalityResult{Audio: out.Audio, AudioMediaType: out.MediaType}, nil
+
+	case KindImage:
+		c, ok := client.(ImageGenerator)
+		if !ok {
+			return Result{}, modalityResult{}, unservedByRuntime(info, "image generation")
+		}
+		req := payload.Image
+		req.Model, req.Prompt = info.ID, promptFrom(messages)
+		out, err := c.GenerateImage(ctx, req)
+		if err != nil {
+			return Result{}, modalityResult{}, err
+		}
+		return Result{FinishReason: FinishStop, Usage: out.Usage},
+			modalityResult{Images: out.Images}, nil
+	}
+	return Result{}, modalityResult{}, fmt.Errorf("modelcall: %q is not a modality kind", start.GetKind())
+}
+
+// unservedByRuntime names the disagreement rather than the symptom. A
+// call only reaches runModality when the machine ADVERTISED the flag,
+// so a runtime that cannot serve it means the advertisement and the
+// runtime disagree -- and the operator needs the model and the modality
+// to find out which.
+func unservedByRuntime(info models.Info, word string) error {
+	return fmt.Errorf("model %q advertises %s and its runtime (%s) does not serve it",
+		info.ID, word, info.Runtime)
+}
+
+// promptFrom is the text half of a modality call: the LAST user turn.
+//
+// A speak call's text and an image call's prompt ride `messages` as
+// ordinary user turns (memql#5137), so there is no separate field to
+// read -- and the LAST one is the request, where an earlier one is
+// context the caller chose to include.
+func promptFrom(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return messages[i].Content
+		}
+	}
+	return ""
 }
 
 // classify turns a transport error into the envelope's closed set. An
@@ -551,15 +762,39 @@ func (m *Manager) classify(c *call, err error) (finish, code, detail string) {
 	return FinishError, CodeRuntimeError, err.Error()
 }
 
-func (m *Manager) clientFor(info models.Info) client {
+func (m *Manager) clientFor(info models.Info) Client {
+	return NewClient(info, m.http, m.getenv)
+}
+
+// NewClient builds the runtime client for one model.
+//
+// It is the SINGLE place that knows how to reach a runtime from a
+// models.Info, and it is exported so internal/worker/probe reaches it
+// the same way this manager does. Two constructors would be two places
+// for the api_key_env resolution and the base URL to drift, and the
+// failure is a probe that authenticates where the serving path does not
+// -- which presents as a model that measures fine and refuses every
+// real call.
+//
+// getenv may be nil, which resolves no api_key_env: a declared runtime
+// that needs a bearer then fails its call rather than sending an empty
+// one, which is the fail-closed direction.
+func NewClient(info models.Info, httpClient *http.Client, getenv func(string) string) Client {
+	if httpClient == nil {
+		// No client-level timeout, for the reason NewManager gives: the
+		// envelope owns the deadlines and a second one here would cut a
+		// legitimate long generation off at whatever number this file
+		// happened to pick.
+		httpClient = &http.Client{}
+	}
 	if info.Kind == models.KindOpenAICompatible {
 		key := ""
-		if info.APIKeyEnv != "" {
-			key = m.getenv(info.APIKeyEnv)
+		if info.APIKeyEnv != "" && getenv != nil {
+			key = getenv(info.APIKeyEnv)
 		}
-		return &openAIClient{baseURL: info.BaseURL, apiKey: key, http: m.http}
+		return &openAIClient{baseURL: info.BaseURL, apiKey: key, http: httpClient}
 	}
-	return &ollamaClient{baseURL: info.BaseURL, http: m.http}
+	return &ollamaClient{baseURL: info.BaseURL, http: httpClient}
 }
 
 // -----------------------------------------------------------------------------
@@ -574,21 +809,44 @@ type deltaStream struct {
 	sender    Sender
 	requestID string
 
-	mu   sync.Mutex
-	seq  uint64
-	last time.Time
+	mu  sync.Mutex
+	seq uint64
+	// lastSend is when this worker last put ANYTHING on the stream,
+	// content or keepalive. It drives the keepalive CADENCE.
+	lastSend time.Time
+	// lastContent is when the RUNTIME last produced output. It drives
+	// the idle VERDICT, and the two are separate clocks for a reason
+	// that is easy to get wrong: a keepalive is this worker's own
+	// output and says nothing whatever about the runtime. A single
+	// clock that a keepalive reset would make the idle ceiling
+	// unreachable -- every keepalive pushes the deadline it exists to
+	// enforce, so a wedged runtime is never noticed and the call runs
+	// to the whole-call timeout while the engine, receiving keepalives,
+	// believes the machine is healthy.
+	lastContent time.Time
 }
 
 func (s *deltaStream) touch() {
 	s.mu.Lock()
-	s.last = time.Now()
+	now := time.Now()
+	s.lastSend, s.lastContent = now, now
 	s.mu.Unlock()
 }
 
+// idleFor is how long THE RUNTIME has been silent. Keepalives do not
+// reset it -- see lastContent.
 func (s *deltaStream) idleFor() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return time.Since(s.last)
+	return time.Since(s.lastContent)
+}
+
+// sinceSend is how long since anything went out on the stream, which is
+// what the keepalive cadence is measured against.
+func (s *deltaStream) sinceSend() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.lastSend)
 }
 
 func (s *deltaStream) emit(content string) error {
@@ -603,7 +861,15 @@ func (s *deltaStream) send(content string, keepalive bool) error {
 	s.mu.Lock()
 	seq := s.seq
 	s.seq++
-	s.last = time.Now()
+	now := time.Now()
+	s.lastSend = now
+	// ONLY CONTENT MOVES THE IDLE CLOCK. A keepalive proves this worker
+	// is alive to the engine; it proves nothing about the runtime, and
+	// letting it reset the idle verdict is what makes the ceiling
+	// unenforceable from this side.
+	if !keepalive {
+		s.lastContent = now
+	}
 	s.mu.Unlock()
 	return s.sender.SendModelCallDelta(s.requestID, seq, content, keepalive)
 }

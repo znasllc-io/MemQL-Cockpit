@@ -16,6 +16,7 @@ import (
 	sdkworker "github.com/znasllc-io/memql/sdk/go/worker"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
@@ -46,7 +47,7 @@ type Connection struct {
 // sends the worker-protocol Register handshake. Returns the live
 // connection and the registration metadata pulled from the
 // RegisterAck.
-func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, logger *slog.Logger) (*Connection, error) {
+func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, inferenceServe string, logger *slog.Logger) (*Connection, error) {
 	endpoint, useTLS, err := sdkworker.ParseClusterURL(cfg.ClusterURL)
 	if err != nil {
 		return nil, err
@@ -67,7 +68,7 @@ func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv mo
 		logger: logger,
 	}
 
-	if err := c.register(ctx, cfg, inventory, modelInv); err != nil {
+	if err := c.register(ctx, cfg, inventory, modelInv, inferenceServe); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -79,7 +80,7 @@ func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv mo
 // shape -- in particular that capability_descriptor_json always
 // satisfies the server-side validation rules (memql#1331: raw size,
 // schemaVersion, action-name pattern) -- without a live stream.
-func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory) *memqlv1.Register {
+func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string) *memqlv1.Register {
 	hostname, _ := os.Hostname()
 	// Local models (memql-cockpit#361). They ride the EXISTING
 	// registration mechanism -- `model:<id>` and `runtime:<kind>` labels
@@ -113,15 +114,16 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory)
 	// proto field is optional -- on the (never-expected) marshal
 	// failure we register without it rather than fail the handshake;
 	// the server treats omission as valid.
-	if descJSON, err := tools.CapabilityDescriptorJSON(); err == nil {
+	if descJSON, err := tools.CapabilityDescriptorJSONFor(inferenceServe); err == nil {
 		register.CapabilityDescriptorJson = descJSON
 	}
+	registerHardware(register, hw)
 	return register
 }
 
 // register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory) error {
-	register := buildRegister(cfg, inventory, modelInv)
+func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, inferenceServe string) error {
+	register := buildRegister(cfg, inventory, modelInv, hardware.Local(ctx), inferenceServe)
 	c.ModelFingerprint = advertisedFingerprint(modelInv.Labels())
 	if err := c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
@@ -150,6 +152,7 @@ func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.
 			"registration_id", c.RegistrationId,
 			"owner_user_id", c.OwnerUserId,
 			"models_offered", len(modelInv.Advertised()),
+			"inference_serve", inferenceServe,
 		)
 	}
 	return nil
@@ -175,10 +178,10 @@ func (c *Connection) Recv() (*memqlv1.WorkerServerMessage, error) {
 // wrong for this one on a machine that just uninstalled its last app.
 // Once a build supports the field, every beat asserts the full truth,
 // including "none".
-func (c *Connection) SendHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.Info) error {
+func (c *Connection) SendHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.Info, hw *hardware.Inventory) error {
 	return c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Heartbeat{
-			Heartbeat: buildHeartbeat(active, perCap, inventory),
+			Heartbeat: buildHeartbeat(active, perCap, inventory, hw),
 		},
 	})
 }
@@ -186,14 +189,46 @@ func (c *Connection) SendHeartbeat(active uint32, perCap map[string]uint32, inve
 // buildHeartbeat assembles the Heartbeat message. Pulled out of
 // SendHeartbeat for the same reason buildRegister is pulled out of
 // register: the wire shape is assertable without a live stream.
-func buildHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.Info) *memqlv1.Heartbeat {
-	return &memqlv1.Heartbeat{
+func buildHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.Info, hw *hardware.Inventory) *memqlv1.Heartbeat {
+	beat := &memqlv1.Heartbeat{
 		Ts:                       timestamppb.Now(),
 		ActiveCallsTotal:         active,
 		ActiveCallsPerCapability: perCap,
 		Apps:                     appsToProto(inventory),
 		AppsPresent:              true,
 	}
+	heartbeatHardware(beat, hw)
+	return beat
+}
+
+// The hardware inventory seams (memql#5146, record D1).
+//
+// THE FIELD DOES NOT EXIST. `Heartbeat` and `Register` carry no
+// `hardware` at the pin (5c4f6ae9) and none on engine main either --
+// memql#5146 has not merged. So the inventory is computed, asserted,
+// rendered by `memql worker hardware`, and consumed locally by the
+// machine class that chooses the recommended set; these two functions
+// are the ONLY places the wire field is written, and landing the engine
+// half is a line each:
+//
+//	beat.Hardware = hardwareToProto(hw)
+//	register.Hardware = hardwareToProto(&inv)
+//
+// It is deliberately NOT smuggled into capability_descriptor_json in
+// the meantime. That field does tolerate unknown keys -- which is what
+// makes inferenceServe travel today -- but the engine's AsMap() drops
+// them, so nothing would arrive, and a shape defined in the wrong place
+// is a shape the engine's own field then has to disagree with. The
+// cadence is the part worth getting right now, and it is tested:
+// hardwareOnBeat in loop.go.
+func heartbeatHardware(beat *memqlv1.Heartbeat, hw *hardware.Inventory) {
+	_, _ = beat, hw
+}
+
+// registerHardware is the same seam on the handshake. Register carries
+// the FIRST inventory; the beat carries every refresh after it.
+func registerHardware(register *memqlv1.Register, inv hardware.Inventory) {
+	_, _ = register, inv
 }
 
 // SendAppSessionChunk emits one piece of app-session output.

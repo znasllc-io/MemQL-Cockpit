@@ -14,8 +14,10 @@ import (
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/modelcall"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
 // Re-advertising a changed model set (memql-cockpit#361).
@@ -55,6 +57,7 @@ type Runner struct {
 	calls     *modelcall.Manager
 	sessions  *appsession.Manager
 	heartbeat time.Duration
+	serve     func() string
 	metrics   *Metrics
 
 	conn            atomic.Pointer[Connection]
@@ -97,6 +100,16 @@ type Options struct {
 	Sessions  *appsession.Manager
 	Heartbeat time.Duration
 	Metrics   *Metrics
+	// InferenceServe reads this machine's sharing consent from the live
+	// policy (memql-cockpit#399). A FUNCTION rather than a value,
+	// because the value is re-read on SIGHUP and a snapshot taken at
+	// startup would advertise a consent the file no longer states --
+	// and this is the one setting whose stale value hands somebody
+	// else's prompt to this machine's GPU.
+	//
+	// Nil reports tools.ServeOwner, which is the fail-closed default a
+	// build that does not wire this should send.
+	InferenceServe func() string
 }
 
 // NewRunner constructs a Runner. The runner is not yet running; call
@@ -110,7 +123,7 @@ func NewRunner(opts Options) (*Runner, error) {
 	}
 	hb := opts.Heartbeat
 	if hb <= 0 {
-		hb = 15 * time.Second
+		hb = DefaultHeartbeat
 	}
 	return &Runner{
 		logger:    opts.Logger,
@@ -122,6 +135,7 @@ func NewRunner(opts Options) (*Runner, error) {
 		sessions:  opts.Sessions,
 		heartbeat: hb,
 		metrics:   opts.Metrics,
+		serve:     opts.InferenceServe,
 		closed:    make(chan struct{}),
 		// Room for one. A nil channel would be safe (both the send and
 		// the receive sit in a select), but it would make every request
@@ -165,7 +179,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 
-		conn, err := Connect(ctx, r.cfg, r.inventory(ctx), r.modelInventory(ctx), r.logger)
+		conn, err := Connect(ctx, r.cfg, r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe(), r.logger)
 		if err != nil {
 			if r.metrics != nil {
 				r.metrics.RecordReconnect()
@@ -251,11 +265,37 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
 	}
 }
 
+// DefaultHeartbeat is the beat interval when the caller states none.
+//
+// A named constant rather than a literal because the hardware refresh
+// cadence is stated in BEATS and its wall-clock interval follows from
+// this number -- so a test that pinned the interval against its own
+// copy of 15s would stay green while this moved, and the refresh would
+// silently become five minutes.
+const DefaultHeartbeat = 15 * time.Second
+
+// hardwareRefreshBeats is how often the hardware inventory is re-scanned
+// onto the heartbeat (design record D1: "refreshed on every tenth
+// heartbeat"). At the 15-second default that is a refresh every two and
+// a half minutes, so a pulled model or an installed runtime shows within
+// minutes -- the record's own words -- without shelling out to
+// nvidia-smi and `docker version` four times a minute.
+const hardwareRefreshBeats = 10
+
+// hardwareOnBeat reports whether this beat carries the inventory.
+//
+// Register carries the first one, so beat 10 is the first REFRESH
+// rather than the first report -- a machine that reported on beat 1 as
+// well would send the same payload twice within fifteen seconds of
+// connecting.
+func hardwareOnBeat(beat int) bool { return beat > 0 && beat%hardwareRefreshBeats == 0 }
+
 func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 	t := time.NewTicker(r.heartbeat)
 	defer t.Stop()
 	refresh := time.NewTicker(modelRefreshInterval)
 	defer refresh.Stop()
+	beat := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -277,11 +317,34 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 			// is a routing change -- so signing into Claude Code makes
 			// this machine selectable on the NEXT BEAT, not the next
 			// reconnect. Sending a snapshot would give that back.
-			if err := conn.SendHeartbeat(0, nil, r.inventory(ctx)); err != nil {
+			beat++
+			// The hardware inventory rides every tenth beat and nothing
+			// in between. It is scanned HERE rather than cached on the
+			// Runner because a scan whose result is held across beats
+			// would report a runtime that has since been uninstalled --
+			// and the whole reason for the refresh is that a machine
+			// changes under the worker.
+			var hw *hardware.Inventory
+			if hardwareOnBeat(beat) {
+				inv := hardware.Local(ctx)
+				hw = &inv
+			}
+			if err := conn.SendHeartbeat(0, nil, r.inventory(ctx), hw); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// inferenceServe reads the live sharing consent, defaulting closed.
+func (r *Runner) inferenceServe() string {
+	if r.serve == nil {
+		return tools.ServeOwner
+	}
+	if v := r.serve(); v == tools.ServeCluster {
+		return tools.ServeCluster
+	}
+	return tools.ServeOwner
 }
 
 // modelInventory takes the current local model inventory, or the zero

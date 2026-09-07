@@ -236,3 +236,61 @@ func TestRequestImmediateReadvertise_SafeWithoutAModelInventory(t *testing.T) {
 		t.Error("a runner with no inventory has nothing to re-advertise")
 	}
 }
+
+// The hardware inventory rides Register and then every tenth beat.
+//
+// At the 15-second default that is a refresh every two and a half
+// minutes -- "within minutes", which is what the design record asks for
+// -- and it keeps a scan that shells out to nvidia-smi and `docker
+// version` off the other nine.
+func TestHardwareOnBeat(t *testing.T) {
+	for _, tc := range []struct {
+		beat int
+		want bool
+	}{
+		// Register already carried one, so the first nine beats add
+		// nothing. A machine that reported again on beat 1 would send
+		// the same payload twice inside fifteen seconds of connecting.
+		{0, false}, {1, false}, {2, false}, {9, false},
+		{10, true}, {11, false}, {19, false}, {20, true},
+		{100, true}, {101, false},
+	} {
+		if got := hardwareOnBeat(tc.beat); got != tc.want {
+			t.Errorf("hardwareOnBeat(%d) = %v, want %v", tc.beat, got, tc.want)
+		}
+	}
+}
+
+// The cadence is stated in BEATS, so the wall-clock interval follows
+// from the heartbeat rather than being a second number that can drift
+// from it. Asserted so that changing the heartbeat is visibly also a
+// change to how often a machine re-describes itself.
+//
+// It reads the PRODUCTION constant. A local copy of 15s would let
+// loop.go move to 30s while this stayed green, and the refresh would
+// silently become five minutes -- the precise drift this is here to
+// prevent, committed by the test that claims to prevent it.
+func TestHardwareRefreshInterval(t *testing.T) {
+	if got := time.Duration(hardwareRefreshBeats) * DefaultHeartbeat; got != 150*time.Second {
+		t.Fatalf("hardware refresh interval = %s (%d beats of %s), want 2m30s",
+			got, hardwareRefreshBeats, DefaultHeartbeat)
+	}
+}
+
+// And the runner actually USES that constant when the caller states no
+// heartbeat -- otherwise the interval above is arithmetic about a
+// number nothing reads.
+func TestRunnerDefaultsToTheNamedHeartbeat(t *testing.T) {
+	r, err := NewRunner(Options{
+		Config: Config{
+			ClusterURL: "https://api.example.com", Token: "mql_wkr_x", Name: "w",
+			Capabilities: []string{"HEADLESS"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.heartbeat != DefaultHeartbeat {
+		t.Fatalf("heartbeat = %s, want %s", r.heartbeat, DefaultHeartbeat)
+	}
+}

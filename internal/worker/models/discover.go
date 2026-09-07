@@ -69,6 +69,26 @@ type DeclaredModel struct {
 	// they are two independent claims; a runtime that serves a schema and
 	// refuses tool calls is an ordinary thing to own.
 	Tools bool `yaml:"tools"`
+
+	// The four MODALITIES (engine memql#5137, record D4).
+	//
+	// THREE OF THE FOUR HAVE NO PROBE AT ALL, and a declaration is the
+	// only way they can ever be true. Ollama reports a `vision`
+	// capability and reports nothing about audio in, audio out or image
+	// generation -- so an operator running a Kokoro speech runtime or a
+	// transcription endpoint states it here, and a machine that states
+	// nothing offers nothing. That is the fail-closed direction, and
+	// the alternative was never "probe harder": it was guessing from a
+	// model id, which advertises a modality on the strength of a name
+	// and fails on somebody else's prompt.
+	//
+	// Spelled as the LABEL spells them, like params/quant/tools and
+	// unlike context_window: an operator comparing `audioout=1` on the
+	// Fleet page against this file reads one word in both places.
+	Vision   bool `yaml:"vision"`
+	AudioIn  bool `yaml:"audio_in"`
+	AudioOut bool `yaml:"audio_out"`
+	ImageGen bool `yaml:"image_gen"`
 }
 
 // Request is what discovery is asked to consider.
@@ -156,6 +176,13 @@ func (d *Discoverer) Probe(ctx context.Context, req Request) Inventory {
 		inv.ProbeNotes = append(inv.ProbeNotes, note)
 	}
 	inv.Models = append(inv.Models, found...)
+	if len(found) > 0 {
+		// The version is read only when the runtime ALREADY ANSWERED
+		// with models, so this adds no round trip to a machine that has
+		// no Ollama -- the case the probe is fastest on today, and the
+		// one that must not become slower.
+		inv.RuntimeVersions = setRuntimeVersion(inv.RuntimeVersions, KindOllama, d.ollamaVersion(ctx))
+	}
 
 	for _, rt := range req.Runtimes {
 		got, n := d.probeDeclared(ctx, rt)
@@ -182,6 +209,34 @@ func (d *Discoverer) Probe(ctx context.Context, req Request) Inventory {
 	})
 	inv.Models, inv.ProbeNotes = resolveDuplicates(inv.Models, inv.ProbeNotes)
 	return inv
+}
+
+// setRuntimeVersion records a version, dropping an empty one rather
+// than storing a blank entry. The map's presence is not the
+// advertisement -- the LABEL is -- so an entry with no version says
+// nothing that its absence does not.
+func setRuntimeVersion(m map[string]string, kind, version string) map[string]string {
+	if strings.TrimSpace(version) == "" {
+		return m
+	}
+	if m == nil {
+		m = map[string]string{}
+	}
+	m[kind] = strings.TrimSpace(version)
+	return m
+}
+
+// ollamaVersion asks /api/version. A runtime that does not answer it
+// keeps an empty version, which is "present, version unknown" -- the
+// label is still written, because the runtime is still there.
+func (d *Discoverer) ollamaVersion(ctx context.Context) string {
+	var body struct {
+		Version string `json:"version"`
+	}
+	if err := d.getJSON(ctx, d.ollamaBaseURL()+"/api/version", "", &body); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(body.Version)
 }
 
 // resolveDuplicates keeps ONE entry per model id.

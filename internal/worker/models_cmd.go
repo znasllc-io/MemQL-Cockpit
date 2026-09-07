@@ -206,7 +206,37 @@ func attributeLine(a models.Attributes) string {
 	if a.MaxConcurrent > 0 {
 		parts = append(parts, fmt.Sprintf("max %d concurrent", a.MaxConcurrent))
 	}
+	// The four modalities, listed only when CLAIMED.
+	//
+	// Unlike tools and structured output above, an absent modality is
+	// NOT spelled out as "not advertised". Those two are asked about on
+	// every model, so their absence is news; a chat model that does not
+	// generate images is the ordinary case, and four "not advertised"
+	// clauses on every row would bury the two that matter under noise
+	// nobody reads. What is missing is legible from what is present.
+	if m := modalityWords(a); len(m) > 0 {
+		parts = append(parts, strings.Join(m, ", "))
+	}
 	return strings.Join(parts, ", ")
+}
+
+// modalityWords names the modalities a model claims, in the label's own
+// order so the line and the label read the same way round.
+func modalityWords(a models.Attributes) []string {
+	var out []string
+	if a.Vision {
+		out = append(out, "vision")
+	}
+	if a.AudioIn {
+		out = append(out, "transcription")
+	}
+	if a.AudioOut {
+		out = append(out, "speech")
+	}
+	if a.ImageGen {
+		out = append(out, "image generation")
+	}
+	return out
 }
 
 // whyNothing names the actual reason rather than leaving the operator to

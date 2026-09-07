@@ -319,6 +319,12 @@ func (s *inferenceSetup) preamble(h inference.Host, p inference.Plan, wanted []s
 	s.line("Setting this machine up to run local models.")
 	s.line("")
 	s.field("Hardware", hardwareLine(h))
+	// The class earns its line because the model list stopped being a
+	// constant: an operator who sees three models on one machine and
+	// five on another, from the same command, is owed the reason on the
+	// same screen. Without it the only available explanation is that
+	// one of the two runs went wrong.
+	s.field("Class", classLine(h.Hardware))
 	s.field("Runtime", runtimeLine(p, s.base()))
 	s.field("Models", strings.Join(wanted, ", "))
 	s.line("")

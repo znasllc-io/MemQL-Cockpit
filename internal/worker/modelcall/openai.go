@@ -145,6 +145,18 @@ func (c *openAIClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 		body["tools"] = openAITools(req.Tools)
 	}
 
+	return c.chatRaw(ctx, body, emit)
+}
+
+// chatRaw posts an already-assembled chat body and reads the stream.
+//
+// Split out of Chat so the TRANSCRIPTION path shares this exact reader
+// rather than growing a second one. A transcribe call is a chat call
+// whose single user turn carries an input_audio part -- same route,
+// same server-sent events, same usage handling -- and a second reader
+// beside this one would be a second place for the [DONE] terminator
+// rule and the tool-call accumulator to drift.
+func (c *openAIClient) chatRaw(ctx context.Context, body map[string]any, emit emitFunc) (Result, error) {
 	resp, err := c.post(ctx, "/chat/completions", body)
 	if err != nil {
 		return Result{}, err
@@ -290,6 +302,23 @@ func openAIMessages(in []Message) []map[string]any {
 	out := make([]map[string]any, 0, len(in))
 	for _, m := range in {
 		msg := map[string]any{"role": m.Role, "content": m.Content}
+		// A turn carrying IMAGES renders its content as an array of
+		// parts, which is the only shape an OpenAI-compatible server
+		// accepts an inline image in. The text part goes FIRST and is
+		// emitted even when empty, because a content array with no text
+		// element is rejected by some servers as a malformed message --
+		// and a vision call that 400s on punctuation is the least
+		// debuggable failure in this file.
+		if len(m.Images) > 0 {
+			parts := []map[string]any{{"type": "text", "text": m.Content}}
+			for _, img := range m.Images {
+				parts = append(parts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": img.dataURL()},
+				})
+			}
+			msg["content"] = parts
+		}
 		if m.ToolCallID != "" {
 			msg["tool_call_id"] = m.ToolCallID
 		}

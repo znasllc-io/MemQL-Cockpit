@@ -29,6 +29,7 @@ type Policy struct {
 	http       HTTPPolicy
 	apps       AppsPolicy
 	models     ModelsPolicy
+	inference  InferencePolicy
 	backup     BackupPolicy
 	configPath string
 }
@@ -93,8 +94,8 @@ type AppsPolicy struct {
 //
 //	models:
 //	  allow:
-//	    - llama3.1:8b
-//	    - nomic-embed-text
+//	    - qwen3.5:9b
+//	    - qwen3-embedding:0.6b
 //	  runtimes:
 //	    - name: lmstudio
 //	      base_url: http://127.0.0.1:1234/v1
@@ -102,6 +103,11 @@ type AppsPolicy struct {
 //	        - id: qwen2.5-7b-instruct
 //	          context_window: 32768
 //	          structured_output: true
+//	    - name: local-speech
+//	      base_url: http://127.0.0.1:8880/v1
+//	      models:
+//	        - id: kokoro-82m
+//	          audio_out: true
 //
 // DEFAULT-DENY, for the reason apps.allow is. Serving a model call spends
 // this machine's own GPU on somebody else's prompt, so nothing is offered
@@ -183,14 +189,45 @@ type HTTPPolicy struct {
 	BlockPrivateNet bool     `yaml:"block_private_net"`
 }
 
+// InferencePolicy is this machine's answer to "who may this GPU serve"
+// (engine memql#5146, record D6).
+//
+// SHARING TAKES TWO CONSENTS AND THIS IS ONLY ONE OF THEM. The other is
+// the owner's, set from the machine page and stored on the
+// registration; a machine serves somebody else's prompt only when both
+// say `cluster`. That split is the same rule that keeps `sharedInference`
+// off the cockpit entirely: a machine cannot grant a permission on its
+// owner's behalf, and one that could would be granting itself one.
+//
+// It is a string rather than a bool because the engine's half spells the
+// same two words, and a bool here would have to be named for one of them
+// -- `share: true` reads as a grant where `serve: cluster` reads as a
+// setting, and only the second survives being read back a year later.
+//
+//	inference:
+//	  serve: cluster    # or owner, which is the default
+type InferencePolicy struct {
+	Serve string `yaml:"serve"`
+}
+
+const (
+	// ServeOwner: only this machine's owner. The default, and where an
+	// unrecognised value lands.
+	ServeOwner = "owner"
+	// ServeCluster: anyone in the cluster, subject to the OWNER's
+	// separate grant. This half alone grants nothing.
+	ServeCluster = "cluster"
+)
+
 // rawPolicy is the YAML-unmarshal target.
 type rawPolicy struct {
-	Shell  ShellPolicy  `yaml:"shell"`
-	FS     FSPolicy     `yaml:"fs"`
-	HTTP   HTTPPolicy   `yaml:"http"`
-	Apps   AppsPolicy   `yaml:"apps"`
-	Backup BackupPolicy `yaml:"backup"`
-	Models ModelsPolicy `yaml:"models"`
+	Shell     ShellPolicy     `yaml:"shell"`
+	FS        FSPolicy        `yaml:"fs"`
+	HTTP      HTTPPolicy      `yaml:"http"`
+	Apps      AppsPolicy      `yaml:"apps"`
+	Backup    BackupPolicy    `yaml:"backup"`
+	Models    ModelsPolicy    `yaml:"models"`
+	Inference InferencePolicy `yaml:"inference"`
 }
 
 // DefaultPolicy returns the baseline allow/deny lists shipped with
@@ -344,7 +381,38 @@ func (p *Policy) reload() error {
 	// operator nor this code intended -- an endpoint moved to a new port
 	// would keep answering on the old one until a restart.
 	p.models.Runtimes = raw.Models.Runtimes
+	// inference.serve REPLACES, so a SIGHUP that removed the key
+	// returns this machine to `owner` rather than leaving a grant the
+	// file no longer mentions. Merging a consent would make it
+	// unrevokable without a restart, which is the wrong direction for
+	// the one setting here that hands a stranger this machine's GPU.
+	p.inference.Serve = raw.Inference.Serve
 	return nil
+}
+
+// InferenceServe reports this machine's sharing consent: ServeOwner or
+// ServeCluster.
+//
+// AN UNRECOGNISED VALUE IS ServeOwner, and it is neither an error nor a
+// grant. A typo in policy.yaml must not widen a permission -- the
+// fail-closed direction every other list in this file runs in -- and it
+// must not stop a worker starting either, because a machine that
+// refused to boot over a misspelled sharing preference is a machine
+// nobody can reach to fix it.
+func (p *Policy) InferenceServe() string {
+	// A nil policy reports the closed default rather than panicking,
+	// which is what every sibling accessor here does. Unreachable from
+	// handleRun today; the guard costs a line and the alternative is a
+	// panic on the Register path.
+	if p == nil {
+		return ServeOwner
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.inference.Serve == ServeCluster {
+		return ServeCluster
+	}
+	return ServeOwner
 }
 
 // CheckShell returns nil if the supplied command is allowed.

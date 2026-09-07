@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/hardware"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/inference"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
@@ -53,9 +54,24 @@ func macServing() inference.Host {
 	return inference.Host{
 		GOOS: "darwin", GOARCH: "arm64",
 		Floor:         models.FloorVerdict{Met: true, Detail: "Apple M2 Max, 32 GB, macOS 15"},
+		Hardware:      macHardware(),
 		OllamaServing: true,
 		FreeDisk:      500_000_000_000,
 		LookPath:      noPath,
+	}
+}
+
+// macHardware is the inventory that goes with the Mac fixtures. It
+// MATCHES their floor Detail on purpose: the preamble prints the floor
+// verdict and the class on adjacent lines, and a fixture whose two
+// halves disagreed would be asserting a screen no real machine shows.
+func macHardware() hardware.Inventory {
+	return hardware.Inventory{
+		Chip:        "Apple M2 Max",
+		MemoryBytes: 32 << 30,
+		GPU:         &hardware.GPU{Name: "Apple M2 Max", VRAMBytes: 32 << 30, Backend: hardware.BackendMetal},
+		CPUCores:    12,
+		OSVersion:   "macOS 15.1",
 	}
 }
 
@@ -64,6 +80,7 @@ func macNeedsOllama() inference.Host {
 	return inference.Host{
 		GOOS: "darwin", GOARCH: "arm64",
 		Floor:    models.FloorVerdict{Met: true, Detail: "Apple M2 Max, 32 GB, macOS 15"},
+		Hardware: macHardware(),
 		FreeDisk: 500_000_000_000,
 		LookPath: pathWith("brew"),
 	}
@@ -77,6 +94,12 @@ func belowFloor() inference.Host {
 			Reason: "this machine has 8 GB of unified memory; the floor is 16 GB.",
 			Detail: "apple silicon, 8 GB, macOS 15",
 		},
+		Hardware: hardware.Inventory{
+			Chip:        "Apple M1",
+			MemoryBytes: 8 << 30,
+			GPU:         &hardware.GPU{Name: "Apple M1", VRAMBytes: 8 << 30, Backend: hardware.BackendMetal},
+			OSVersion:   "macOS 15.1",
+		},
 		LookPath: noPath,
 	}
 }
@@ -86,6 +109,13 @@ func linuxNoToolkit() inference.Host {
 	return inference.Host{
 		GOOS: "linux", GOARCH: "amd64",
 		Floor: models.FloorVerdict{Met: true, Detail: "NVIDIA GeForce RTX 4090, 24 GB VRAM"},
+		Hardware: hardware.Inventory{
+			Chip:        "AMD Ryzen 9 7950X",
+			MemoryBytes: 128 << 30,
+			GPU:         &hardware.GPU{Name: "NVIDIA GeForce RTX 4090", VRAMBytes: 24 << 30, Backend: hardware.BackendCUDA},
+			CPUCores:    16,
+			OSVersion:   "Ubuntu 24.04.1 LTS",
+		},
 		Docker: inference.DockerFacts{
 			CLIPresent: true, Present: true, Version: "27.1.1",
 			GPUVendor: inference.GPUVendorNVIDIA,
@@ -174,14 +204,14 @@ func (f *fakeSetup) run() (int, string) {
 
 func TestSetupInference_HappyPath(t *testing.T) {
 	f := newFakeSetup(t, macServing())
-	f.progress["llama3.1:8b"] = onePull(4_661_211_808)
-	f.progress["nomic-embed-text"] = onePull(274_302_450)
+	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
+	f.progress["qwen3-embedding:0.6b"] = onePull(274_302_450)
 	f.inv = servingInventory(
-		offeredModel("llama3.1:8b", models.Attributes{
+		offeredModel("qwen3.5:9b", models.Attributes{
 			ContextWindow: 131072, StructuredOutput: true, Tools: true,
 			Params: 8_030_000_000, Quant: "Q4_K_M", MaxConcurrent: 1,
 		}),
-		offeredModel("nomic-embed-text", models.Attributes{
+		offeredModel("qwen3-embedding:0.6b", models.Attributes{
 			ContextWindow: 2048, Embeddings: true,
 			Params: 137_000_000, Quant: "F16", MaxConcurrent: 1,
 		}),
@@ -199,7 +229,8 @@ func TestSetupInference_HappyPath(t *testing.T) {
 		"Setting this machine up to run local models.",
 		"  Hardware   Apple M2 Max, 32 GB, macOS 15 -- meets the floor",
 		"  Runtime    Ollama, already running at http://127.0.0.1:11434",
-		"  Models     llama3.1:8b, nomic-embed-text",
+		"  Class      24 -- 24.0 GB usable, 75% of 32 GB unified",
+		"  Models     qwen3.5:9b, qwen3-embedding:0.6b",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the preamble must carry %q:\n%s", want, out)
@@ -209,10 +240,10 @@ func TestSetupInference_HappyPath(t *testing.T) {
 	// Both defaults, in the order the plan states them: one general
 	// model and one embedding model, because the operations this fleet
 	// serves locally are both kinds.
-	if got := strings.Join(f.pulled, ","); got != "llama3.1:8b,nomic-embed-text" {
+	if got := strings.Join(f.pulled, ","); got != "qwen3.5:9b,qwen3-embedding:0.6b" {
 		t.Errorf("pulled = %q, want the default pair", got)
 	}
-	if got := strings.Join(f.allowed, ","); got != "llama3.1:8b,nomic-embed-text" {
+	if got := strings.Join(f.allowed, ","); got != "qwen3.5:9b,qwen3-embedding:0.6b" {
 		t.Errorf("allowed = %q, want both models", got)
 	}
 	if !f.readvertised {
@@ -247,14 +278,14 @@ func TestSetupInference_HappyPath(t *testing.T) {
 func TestSetupInference_HappyPathOnATerminal(t *testing.T) {
 	f := newFakeSetup(t, macServing())
 	f.setup.tty = true
-	f.progress["llama3.1:8b"] = onePull(4_661_211_808)
-	f.progress["nomic-embed-text"] = onePull(274_302_450)
+	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
+	f.progress["qwen3-embedding:0.6b"] = onePull(274_302_450)
 	f.inv = servingInventory(
-		offeredModel("llama3.1:8b", models.Attributes{
+		offeredModel("qwen3.5:9b", models.Attributes{
 			ContextWindow: 131072, StructuredOutput: true, Tools: true,
 			Params: 8_030_000_000, Quant: "Q4_K_M", MaxConcurrent: 1,
 		}),
-		offeredModel("nomic-embed-text", models.Attributes{
+		offeredModel("qwen3-embedding:0.6b", models.Attributes{
 			ContextWindow: 2048, Embeddings: true,
 			Params: 137_000_000, Quant: "F16", MaxConcurrent: 1,
 		}),
@@ -270,10 +301,10 @@ func TestSetupInference_HappyPathOnATerminal(t *testing.T) {
 		t.Errorf("a terminal must be redrawn in place:\n%q", out)
 	}
 	for _, want := range []string{
-		"Pulling llama3.1:8b",
+		"Pulling qwen3.5:9b",
 		"  4.7 GB total",
 		"[========================================] 100%   4.7 GB / 4.7 GB",
-		"Pulling nomic-embed-text",
+		"Pulling qwen3-embedding:0.6b",
 		"  274.3 MB total",
 		"This machine now offers 2 models. The cluster will see:",
 	} {
@@ -298,7 +329,7 @@ func TestSetupInference_ModelFlagOverridesTheDefaults(t *testing.T) {
 	if got := strings.Join(f.pulled, ","); got != "qwen2.5:7b,hf.co/owner/repo:Q4_K_M" {
 		t.Errorf("pulled = %q, want the ids as typed, deduplicated", got)
 	}
-	if strings.Contains(out, "llama3.1:8b") {
+	if strings.Contains(out, "qwen3.5:9b") {
 		t.Errorf("a default must not be pulled beside an explicit --model:\n%s", out)
 	}
 }
@@ -795,8 +826,12 @@ func TestSetupInference_DiskRefusalNamesBothNumbers(t *testing.T) {
 	h := macServing()
 	h.FreeDisk = 2_100_000_000
 	f := newFakeSetup(t, h)
-	f.progress["llama3.1:8b"] = onePull(4_661_211_808)
-	f.pullErr = errors.New("pulling llama3.1:8b was cancelled: context canceled")
+	// Keyed on the FIRST id of the recommended set, which is what the
+	// flow will actually ask for. A fixture keyed on some other model
+	// fires no progress at all, and the disk refusal this test exists
+	// for is then never reached.
+	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
+	f.pullErr = errors.New("pulling qwen3.5:9b was cancelled: context canceled")
 
 	code, out := f.run()
 	t.Logf("transcript:\n%s", out)
@@ -809,7 +844,7 @@ func TestSetupInference_DiskRefusalNamesBothNumbers(t *testing.T) {
 	if strings.Contains(out, "context canceled") {
 		t.Errorf("the cancellation must not be what is reported:\n%s", out)
 	}
-	for _, want := range []string{"not enough disk", "4.7 GB", "2.1 GB", "llama3.1:8b"} {
+	for _, want := range []string{"not enough disk", "4.7 GB", "2.1 GB", "qwen3.5:9b"} {
 		if !strings.Contains(strings.ToLower(flat(out)), strings.ToLower(want)) {
 			t.Errorf("the refusal must name %q:\n%s", want, out)
 		}
