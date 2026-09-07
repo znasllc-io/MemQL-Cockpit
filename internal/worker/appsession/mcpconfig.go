@@ -395,19 +395,34 @@ func claudeCodeMCPBody(endpoint, credential string) ([]byte, error) {
 
 // codexMCPBody renders a config.toml for the per-session CODEX_HOME.
 //
-// UNVERIFIED AGAINST THE APP, and flagged rather than hidden: the engine's
-// mcp-connect runbook documents the Claude Code form only, so the key
-// names here for Codex's HTTP MCP transport come from its own
-// configuration format rather than from something in this ecosystem that
-// pins them. If Codex names them differently, the run fails with the MCP
-// server absent rather than with a wrong credential, and the fix is this
-// function. That trade is deliberate: a mis-keyed config denies the app
-// MemQL's tools, whereas guessing at an auth mechanism could put the
-// bearer somewhere this does not delete.
+// VERIFIED 2026-09-07 against Codex's own configuration parser and its
+// own tests (codex-rs/config/src/mcp_types.rs and mcp_types_tests.rs at
+// openai/codex@main) and the published reference at
+// https://learn.chatgpt.com/docs/config-file/config-reference. The table
+// is `[mcp_servers.<id>]`; a `url` with no `command` selects the
+// streamable-HTTP transport; and the credential travels either as
+// `bearer_token_env_var` -- the NAME of an environment variable, never
+// the secret -- or as a static `http_headers` entry.
+//
+// THE `bearer_token` KEY THIS USED TO WRITE IS REFUSED BY CODEX. It
+// survives in the raw config struct only so that its presence can be
+// rejected by name, and Codex's own test
+// `deserialize_rejects_inline_bearer_token_field` asserts the error
+// "bearer_token is not supported". A config carrying it does not load
+// unauthenticated -- it does not load at all, and the app then runs with
+// no MemQL tools and reports that as MemQL being broken.
+//
+// The header form is chosen over `bearer_token_env_var` on purpose: it
+// keeps the bearer in the ONE file Remove() and Sweep() delete on every
+// exit path, and it keeps Renew() meaningful. A credential moved into
+// the process environment sits somewhere this file's deletion guarantee
+// does not reach, and cannot be replaced in place afterwards.
 //
 // Written by hand rather than through a TOML encoder because this is the
 // module's only TOML and the document is three lines; a dependency for
-// that is not worth its own supply-chain surface.
+// that is not worth its own supply-chain surface. The test's parser is
+// deliberately as narrow as this renderer -- a body that outgrows it is a
+// body nobody has verified.
 func codexMCPBody(endpoint, credential string) ([]byte, error) {
 	if strings.ContainsAny(endpoint, "\"\n\r") || strings.ContainsAny(credential, "\"\n\r") {
 		// Neither value can legitimately contain these, and a hand-rolled
@@ -419,7 +434,7 @@ func codexMCPBody(endpoint, credential string) ([]byte, error) {
 	fmt.Fprintf(&b, "# Written by memql for app session; deleted when the session ends.\n")
 	fmt.Fprintf(&b, "[mcp_servers.%s]\n", mcpServerName)
 	fmt.Fprintf(&b, "url = %q\n", endpoint)
-	fmt.Fprintf(&b, "bearer_token = %q\n", credential)
+	fmt.Fprintf(&b, "http_headers = { %q = %q }\n", "Authorization", "Bearer "+credential)
 	return []byte(b.String()), nil
 }
 

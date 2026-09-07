@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -304,4 +305,293 @@ func grepTree(t *testing.T, root, needle string) []string {
 		return nil
 	})
 	return found
+}
+
+// ---------------------------------------------------------------------
+// The Codex config.toml contract
+// ---------------------------------------------------------------------
+//
+// VERIFIED 2026-09-07 against Codex's own configuration parser and its
+// own tests -- `codex-rs/config/src/mcp_types.rs` and
+// `codex-rs/config/src/mcp_types_tests.rs` at openai/codex@main -- and
+// against the published reference at
+// https://learn.chatgpt.com/docs/config-file/config-reference (which
+// developers.openai.com/codex/config-reference now redirects to). This
+// file previously said the shape was UNVERIFIED, and it was also wrong.
+//
+// What those sources establish:
+//
+//   - The table is `[mcp_servers.<id>]`.
+//   - A `url` key with no `command` selects the streamable-HTTP
+//     transport; neither key is the error "invalid transport".
+//   - The credential travels either as `bearer_token_env_var` (the NAME
+//     of an environment variable, never the secret) or as a static
+//     `http_headers` entry. There is NO literal `bearer_token` key. It
+//     exists in the raw config struct only so that its presence can be
+//     refused -- `throw_if_set("streamable_http", "bearer_token", ...)`
+//     -- and Codex's own test, `deserialize_rejects_inline_bearer_token_field`,
+//     asserts the resulting error contains "bearer_token is not
+//     supported".
+//
+// We carry the credential in `http_headers` rather than through an
+// environment variable deliberately. The bearer then lives in the one
+// file Remove() and Sweep() delete on every exit path, and Renew() can
+// replace it there. Moving it into the process environment would put a
+// per-run credential somewhere this file's deletion guarantee does not
+// reach, and would make renewal meaningless -- an environment is fixed
+// when the process starts.
+//
+// The parser below is DELIBERATELY NARROW: it reads exactly the grammar
+// codexMCPBody emits and fails loudly on anything else. That is the
+// point. This repository has no TOML library and one is not worth adding
+// for a three-line document, and a body that outgrows this parser is a
+// body nobody has verified -- so growing the body must mean growing the
+// parser, in the same commit, with the source that justifies the new key.
+
+const (
+	testCodexEndpoint = "https://mcp.example.com/mcp?cluster=acme"
+	codexServerTable  = "mcp_servers." + mcpServerName
+)
+
+// TestCodexMCPBody_MatchesCodexsOwnGrammar reads the generated body back
+// the way Codex's parser does and asserts each field it will look for.
+func TestCodexMCPBody_MatchesCodexsOwnGrammar(t *testing.T) {
+	body, err := codexMCPBody(testCodexEndpoint, testBearer)
+	if err != nil {
+		t.Fatalf("codexMCPBody: %v", err)
+	}
+	doc := parseNarrowTOML(t, body)
+
+	table, ok := doc[codexServerTable]
+	if !ok {
+		t.Fatalf("no [%s] table; Codex reads MCP servers from that table and nowhere else:\n%s", codexServerTable, body)
+	}
+	if got := table["url"]; got != testCodexEndpoint {
+		t.Errorf("url = %q, want %q", got, testCodexEndpoint)
+	}
+	// `url` with no `command` is what selects the streamable-HTTP
+	// transport. A `command` here would make Codex try to fork the
+	// endpoint as a program.
+	if got, ok := table["command"]; ok {
+		t.Errorf("command = %q; a command key turns this into a stdio server", got)
+	}
+	if got := table["http_headers.Authorization"]; got != "Bearer "+testBearer {
+		t.Errorf("Authorization header = %q, want %q", got, "Bearer "+testBearer)
+	}
+}
+
+// TestCodexMCPBody_NeverWritesABearerTokenKey guards the exact bug this
+// body used to have.
+//
+// `bearer_token = "<jwt>"` is not merely ignored by Codex -- it is
+// refused, by name, with "bearer_token is not supported for
+// streamable_http". The server entry never loads, the app starts with no
+// MemQL tools at all, and the run reports that as MemQL's tools being
+// broken. Which is precisely the failure mcpconfig.go's own comments
+// warn about, arriving through the file those comments are attached to.
+func TestCodexMCPBody_NeverWritesABearerTokenKey(t *testing.T) {
+	body, err := codexMCPBody(testCodexEndpoint, testBearer)
+	if err != nil {
+		t.Fatalf("codexMCPBody: %v", err)
+	}
+	for _, refused := range []string{"bearer_token", "bearer_token_env_var"} {
+		if _, ok := parseNarrowTOML(t, body)[codexServerTable][refused]; ok {
+			t.Errorf("the config carries %q:\n%s", refused, body)
+		}
+	}
+}
+
+// TestCodexMCPBody_RefusesValuesItCannotRenderHonestly. The renderer is
+// hand-written, so a value carrying a quote or a newline could produce a
+// document whose meaning is not the one intended -- a second key, a
+// truncated URL. Neither a cluster endpoint nor a bearer can legitimately
+// contain one, so refusing names the real cause instead of shipping a
+// config that means something else.
+func TestCodexMCPBody_RefusesValuesItCannotRenderHonestly(t *testing.T) {
+	cases := map[string][2]string{
+		"quote in endpoint":  {`https://x/"`, testBearer},
+		"newline in bearer":  {testCodexEndpoint, "abc\ndef"},
+		"carriage return":    {testCodexEndpoint, "abc\rdef"},
+		"quote in the token": {testCodexEndpoint, `ab"cd`},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := codexMCPBody(tc[0], tc[1]); err == nil {
+				t.Error("a value TOML cannot carry here must be refused, not rendered")
+			}
+		})
+	}
+}
+
+// TestWriteMCPConfig_CodexFileCarriesTheAuthorizationHeader checks the
+// end-to-end write, not just the renderer: the file Codex will actually
+// read has to hold the header, at 0600, because the bearer is in it.
+func TestWriteMCPConfig_CodexFileCarriesTheAuthorizationHeader(t *testing.T) {
+	ws := t.TempDir()
+	m, err := writeMCPConfig(apps.IDCodex, ws, testCodexEndpoint, testBearer, "sess-codex-headers", t.TempDir())
+	if err != nil {
+		t.Fatalf("writeMCPConfig: %v", err)
+	}
+	defer m.Remove()
+
+	path := filepath.Join(ws, codexHomeRel, "config.toml")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("mode = %o, want 600", perm)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := parseNarrowTOML(t, data)[codexServerTable]["http_headers.Authorization"]; got != "Bearer "+testBearer {
+		t.Errorf("Authorization header = %q", got)
+	}
+}
+
+// TestRenew_CodexRewritesTheHeaderInPlace. Renewal is one of the three
+// things standing in for a revocation the engine's JWKS-only verify path
+// cannot offer, and it only means anything if the superseded bearer stops
+// existing on disk. Codex needs its own case because the credential
+// travels in a different key from Claude Code's.
+func TestRenew_CodexRewritesTheHeaderInPlace(t *testing.T) {
+	ws := t.TempDir()
+	m, err := writeMCPConfig(apps.IDCodex, ws, testCodexEndpoint, testBearer, "sess-codex-renew", t.TempDir())
+	if err != nil {
+		t.Fatalf("writeMCPConfig: %v", err)
+	}
+	defer m.Remove()
+
+	const next = "eyJhbGciOiJSUzI1NiJ9.the-renewed-bearer.sig"
+	if err := m.Renew(next); err != nil {
+		t.Fatalf("Renew: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(ws, codexHomeRel, "config.toml"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if got := parseNarrowTOML(t, data)[codexServerTable]["http_headers.Authorization"]; got != "Bearer "+next {
+		t.Errorf("Authorization header = %q, want the renewed bearer", got)
+	}
+	if strings.Contains(string(data), testBearer) {
+		t.Error("the superseded bearer survived the rewrite")
+	}
+}
+
+// parseNarrowTOML reads the exact grammar codexMCPBody emits: comments,
+// blank lines, `[table.name]` headers, `key = "string"`, and one level of
+// inline table (`key = { "K" = "V" }`, flattened to `key.K`). Anything
+// else fails the test rather than being skipped -- a silently ignored
+// line is how a body that no longer says what it claims passes.
+func parseNarrowTOML(t *testing.T, body []byte) map[string]map[string]string {
+	t.Helper()
+	doc := map[string]map[string]string{}
+	table := ""
+	for n, raw := range strings.Split(string(body), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			if !strings.HasSuffix(line, "]") {
+				t.Fatalf("line %d: unterminated table header: %q", n+1, raw)
+			}
+			table = line[1 : len(line)-1]
+			if _, ok := doc[table]; !ok {
+				doc[table] = map[string]string{}
+			}
+			continue
+		}
+		key, rest := scanTOMLKey(t, line)
+		rest = strings.TrimSpace(rest)
+		if !strings.HasPrefix(rest, "=") {
+			t.Fatalf("line %d: not a key/value line: %q", n+1, raw)
+		}
+		if table == "" {
+			t.Fatalf("line %d: key %q sits outside any table, so Codex would read it as a global setting", n+1, key)
+		}
+		rest = strings.TrimSpace(rest[1:])
+		if strings.HasPrefix(rest, "{") {
+			for k, v := range parseInlineTOMLTable(t, rest) {
+				doc[table][key+"."+k] = v
+			}
+			continue
+		}
+		value, tail := scanTOMLString(t, rest)
+		if strings.TrimSpace(tail) != "" {
+			t.Fatalf("line %d: trailing text after the value: %q", n+1, raw)
+		}
+		doc[table][key] = value
+	}
+	return doc
+}
+
+// parseInlineTOMLTable reads `{ "K" = "V", K2 = "V2" }`.
+func parseInlineTOMLTable(t *testing.T, s string) map[string]string {
+	t.Helper()
+	body := strings.TrimSpace(s)
+	if !strings.HasPrefix(body, "{") || !strings.HasSuffix(body, "}") {
+		t.Fatalf("not an inline table: %q", s)
+	}
+	out := map[string]string{}
+	body = strings.TrimSpace(body[1 : len(body)-1])
+	for body != "" {
+		key, rest := scanTOMLKey(t, body)
+		rest = strings.TrimSpace(rest)
+		if !strings.HasPrefix(rest, "=") {
+			t.Fatalf("inline table entry %q has no value", key)
+		}
+		value, rest := scanTOMLString(t, strings.TrimSpace(rest[1:]))
+		out[key] = value
+		body = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rest), ","))
+	}
+	return out
+}
+
+// scanTOMLKey reads a bare or quoted key and returns the rest of the line.
+func scanTOMLKey(t *testing.T, s string) (string, string) {
+	t.Helper()
+	if strings.HasPrefix(s, `"`) {
+		return scanTOMLString(t, s)
+	}
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		bare := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.'
+		if !bare {
+			break
+		}
+		i++
+	}
+	if i == 0 {
+		t.Fatalf("expected a key at %q", s)
+	}
+	return s[:i], s[i:]
+}
+
+// scanTOMLString reads one double-quoted string and returns the rest.
+// Go's %q and TOML's basic strings agree on the escapes this body can
+// produce, so strconv.Unquote is the decoder rather than a hand-rolled
+// one that could disagree with the renderer.
+func scanTOMLString(t *testing.T, s string) (string, string) {
+	t.Helper()
+	if !strings.HasPrefix(s, `"`) {
+		t.Fatalf("expected a quoted string at %q", s)
+	}
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			value, err := strconv.Unquote(s[:i+1])
+			if err != nil {
+				t.Fatalf("unquote %q: %v", s[:i+1], err)
+			}
+			return value, s[i+1:]
+		}
+	}
+	t.Fatalf("unterminated string at %q", s)
+	return "", ""
 }

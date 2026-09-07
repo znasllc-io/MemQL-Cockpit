@@ -19,7 +19,14 @@ type fakeEnv struct {
 	present  map[string]string // binary -> resolved path
 	versions map[string]string // resolved path -> version output
 	calls    atomic.Int64
-	now      time.Time
+	// answers records which subcommand probes a binary answers
+	// successfully, keyed by "<resolved path> <arg> <arg>". A path
+	// absent from the map is a binary that does not know the
+	// subcommand, which is the ordinary state of a Codex older than
+	// its app-server.
+	answers    map[string]bool
+	probeCalls atomic.Int64
+	now        time.Time
 }
 
 func newFakeEnv(t *testing.T) *fakeEnv {
@@ -28,8 +35,14 @@ func newFakeEnv(t *testing.T) *fakeEnv {
 		home:     t.TempDir(),
 		present:  map[string]string{},
 		versions: map[string]string{},
+		answers:  map[string]bool{},
 		now:      time.Unix(1_700_000_000, 0).UTC(),
 	}
+}
+
+// answer makes a binary respond successfully to one subcommand probe.
+func (f *fakeEnv) answer(path string, args ...string) {
+	f.answers[strings.Join(append([]string{path}, args...), " ")] = true
 }
 
 // install makes a binary resolvable and gives it a real file on disk, so
@@ -76,6 +89,13 @@ func (f *fakeEnv) detector() *Detector {
 				return v, nil
 			}
 			return "", errors.New("no version")
+		},
+		RunProbe: func(_ context.Context, bin string, args []string) error {
+			f.probeCalls.Add(1)
+			if f.answers[strings.Join(append([]string{bin}, args...), " ")] {
+				return nil
+			}
+			return errors.New("unrecognized subcommand")
 		},
 	}
 }
@@ -385,5 +405,215 @@ func TestTruncate_MatchesTheEngineBound(t *testing.T) {
 	}
 	if got := Truncate("2.1.4"); got != "2.1.4" {
 		t.Errorf("a short value was altered: %q", got)
+	}
+}
+
+// TestDetect_ClaudeCodeDescriptorNeedsNoProbe. Claude Code has exactly
+// one protocol, so its descriptor is a constant. Probing for it would
+// fork a subprocess on every beat to answer a question that is written
+// down in Specs().
+func TestDetect_ClaudeCodeDescriptorNeedsNoProbe(t *testing.T) {
+	env := newFakeEnv(t)
+	env.install(t, "claude", "2.1.4")
+
+	entry := find(t, env.detector().Detect(context.Background(), nil), IDClaudeCode)
+	if entry.Harness != HarnessClaudeHeadless {
+		t.Errorf("harness = %q, want %q", entry.Harness, HarnessClaudeHeadless)
+	}
+	if !entry.StructuredResult || !entry.FollowUps {
+		t.Errorf("descriptor = %+v, want both capabilities", entry)
+	}
+	if got := env.probeCalls.Load(); got != 0 {
+		t.Errorf("claude-code cost %d harness probes, want 0", got)
+	}
+}
+
+// TestDetect_CodexHarnessComesFromThisMachine is the reason the harness
+// is REPORTED rather than derived from the app id.
+//
+// Two harnesses answer to the id `codex`, and only this machine can see
+// which one its binary has. An engine that inferred the protocol from the
+// id would be right on half the fleet.
+func TestDetect_CodexHarnessComesFromThisMachine(t *testing.T) {
+	t.Run("app-server present", func(t *testing.T) {
+		env := newFakeEnv(t)
+		path := env.install(t, "codex", "0.9.1")
+		env.answer(path, "app-server", "--help")
+
+		entry := find(t, env.detector().Detect(context.Background(), nil), IDCodex)
+		if entry.Harness != HarnessCodexAppServer {
+			t.Errorf("harness = %q, want %q", entry.Harness, HarnessCodexAppServer)
+		}
+		if !entry.StructuredResult {
+			t.Error("the app-server returns a schema'd result; the descriptor must say so or the app door is shut for structured calls")
+		}
+		if !entry.FollowUps {
+			t.Error("the app-server continues a thread, which is what a follow-up is")
+		}
+	})
+
+	t.Run("app-server absent", func(t *testing.T) {
+		env := newFakeEnv(t)
+		env.install(t, "codex", "0.7.0")
+
+		entry := find(t, env.detector().Detect(context.Background(), nil), IDCodex)
+		if entry.Harness != HarnessCodexMCP {
+			t.Errorf("harness = %q, want the fallback %q", entry.Harness, HarnessCodexMCP)
+		}
+		if entry.StructuredResult {
+			t.Error("the mcp-server tool pair returns a transcript, not a schema'd answer")
+		}
+		if !entry.FollowUps {
+			t.Error("codex-reply continues a thread by id")
+		}
+	})
+}
+
+// TestDetect_HarnessProbeFailsTowardTheFallback. A probe that hangs, is
+// killed by its timeout, or fails for any reason the cockpit cannot read
+// reports the FALLBACK. Both directions of the error cost something, and
+// they do not cost the same: driving an app-server-capable Codex through
+// the mcp-server tools loses usage numbers, while driving an old Codex
+// through a protocol it does not have kills the session at Start, after
+// the engine has committed a turn to this machine.
+func TestDetect_HarnessProbeFailsTowardTheFallback(t *testing.T) {
+	env := newFakeEnv(t)
+	path := env.install(t, "codex", "0.9.1")
+	// The binary HAS the app-server, but the probe cannot establish it.
+	env.answer(path, "app-server", "--help")
+	d := env.detector()
+	d.RunProbe = func(ctx context.Context, _ string, _ []string) error {
+		return context.DeadlineExceeded
+	}
+
+	entry := find(t, d.Detect(context.Background(), nil), IDCodex)
+	if entry.Harness != HarnessCodexMCP {
+		t.Errorf("harness = %q; a probe that cannot tell must not claim the app-server", entry.Harness)
+	}
+}
+
+// TestDetect_BlockedAppStillCarriesItsDescriptor. An app present but
+// missing from apps.allow is REPORTED with allowed=false rather than
+// omitted, and a descriptor for a blocked app is still a descriptor: the
+// portal can then say "present, blocked, would be driven through
+// codex-app-server" instead of rendering it identically to "not
+// installed".
+func TestDetect_BlockedAppStillCarriesItsDescriptor(t *testing.T) {
+	env := newFakeEnv(t)
+	path := env.install(t, "codex", "0.9.1")
+	env.answer(path, "app-server", "--help")
+
+	entry := find(t, env.detector().Detect(context.Background(), nil), IDCodex)
+	if entry.Allowed {
+		t.Fatal("precondition: apps.allow is empty, so this app is blocked")
+	}
+	if entry.Harness != HarnessCodexAppServer {
+		t.Errorf("harness = %q on a blocked app, want it reported anyway", entry.Harness)
+	}
+}
+
+// TestDetect_HarnessProbeIsCachedInBothDirections pins the cadence
+// bargain for the second subprocess this package forks.
+//
+// Unlike the version probe, a FAILED harness probe is an answer -- this
+// binary has no app-server -- rather than "cannot tell", so both outcomes
+// are cached. Re-forking `codex app-server --help` on a 15-second beat
+// forever, to re-learn that a Codex from last year is still a Codex from
+// last year, is exactly the churn the TTL exists to prevent.
+func TestDetect_HarnessProbeIsCachedInBothDirections(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		hasAppSrv   bool
+		wantHarness string
+	}{
+		{"yes is cached", true, HarnessCodexAppServer},
+		{"no is cached", false, HarnessCodexMCP},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newFakeEnv(t)
+			path := env.install(t, "codex", "0.9.1")
+			if tc.hasAppSrv {
+				env.answer(path, "app-server", "--help")
+			}
+			d := env.detector()
+
+			for range 5 {
+				if h := find(t, d.Detect(context.Background(), nil), IDCodex).Harness; h != tc.wantHarness {
+					t.Fatalf("harness = %q, want %q", h, tc.wantHarness)
+				}
+			}
+			if got := env.probeCalls.Load(); got != 1 {
+				t.Errorf("harness probed %d times across 5 beats, want 1", got)
+			}
+		})
+	}
+}
+
+// TestDetect_UpgradingCodexInPlaceReprobesTheHarness. Installing a Codex
+// that has the app-server must not leave the fallback on the wire until
+// the TTL expires -- the whole point of the upgrade is that the operator
+// did something and expects it to take. The cache key carries the
+// binary's size and mtime for exactly this.
+func TestDetect_UpgradingCodexInPlaceReprobesTheHarness(t *testing.T) {
+	env := newFakeEnv(t)
+	path := env.install(t, "codex", "0.7.0")
+	d := env.detector()
+
+	if h := find(t, d.Detect(context.Background(), nil), IDCodex).Harness; h != HarnessCodexMCP {
+		t.Fatalf("harness = %q, want the fallback before the upgrade", h)
+	}
+
+	// Upgrade in place, well inside the TTL.
+	env.answer(path, "app-server", "--help")
+	env.versions[path] = "0.9.1"
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n# upgraded\n"), 0o755); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if err := os.Chtimes(path, env.now.Add(time.Hour), env.now.Add(time.Hour)); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	if h := find(t, d.Detect(context.Background(), nil), IDCodex).Harness; h != HarnessCodexAppServer {
+		t.Errorf("harness = %q after an in-place upgrade, want %q", h, HarnessCodexAppServer)
+	}
+}
+
+// TestResolveSpec_IsTheSameAnswerTheInventoryReports. The app-session
+// runner needs the harness for ONE app at the moment it starts a session,
+// and it must be the same answer the registration carried -- a second
+// implementation could disagree with the first, and nothing on the
+// machine would say which one lied.
+func TestResolveSpec_IsTheSameAnswerTheInventoryReports(t *testing.T) {
+	env := newFakeEnv(t)
+	path := env.install(t, "codex", "0.9.1")
+	env.answer(path, "app-server", "--help")
+	d := env.detector()
+
+	reported := find(t, d.Detect(context.Background(), nil), IDCodex)
+	spec, ok := d.ResolveSpec(context.Background(), IDCodex)
+	if !ok {
+		t.Fatal("codex is installed, so ResolveSpec must find it")
+	}
+	if spec.Harness != reported.Harness || spec.StructuredResult != reported.StructuredResult || spec.FollowUps != reported.FollowUps {
+		t.Errorf("ResolveSpec = %+v, inventory reported %+v", spec, reported)
+	}
+	// And it reuses the inventory's probe rather than forking its own.
+	if got := env.probeCalls.Load(); got != 1 {
+		t.Errorf("resolving cost %d probes in total, want 1", got)
+	}
+}
+
+// TestResolveSpec_FalseMeansDoNotStartASession. An unknown id and a
+// binary that is not on PATH are the same answer to the only question the
+// caller has, and collapsing them keeps a caller from starting a session
+// against an app this machine cannot run.
+func TestResolveSpec_FalseMeansDoNotStartASession(t *testing.T) {
+	env := newFakeEnv(t)
+	d := env.detector()
+	if _, ok := d.ResolveSpec(context.Background(), "not-an-app"); ok {
+		t.Error("an id outside the closed set must not resolve")
+	}
+	if _, ok := d.ResolveSpec(context.Background(), IDCodex); ok {
+		t.Error("codex is not on PATH here, so it must not resolve")
 	}
 }

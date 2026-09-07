@@ -46,6 +46,36 @@ const (
 	SubscriptionPresent = "present"
 )
 
+// The harness words: which protocol the cockpit drives an app through.
+//
+// They are mirrored by hand from internal/worker/harness rather than
+// imported. This package is the one that puts the word on the wire, and
+// an inventory that only compiles when the process drivers do stops being
+// reportable exactly when something is wrong with them.
+// TestHarnessWordsMirrorTheWire pins the spelling; a rename on one side
+// alone compiles everywhere and fails at the only moment that matters --
+// the session's Start, with "no client for harness <word>".
+//
+// TWO OF THEM ARE CODEX, and that is the reason the engine must READ this
+// word rather than infer it from the app id. A Codex old enough to lack
+// `app-server` is still perfectly drivable through `codex mcp-server`,
+// with a thread id in place of usage; a Codex that has the app-server
+// gives up structured results and real accounting. Nothing off this
+// machine can tell which one is installed here, so a descriptor derived
+// from the id would be right on roughly half the fleet and would fail on
+// the other half only after a turn had been committed to it.
+const (
+	// HarnessClaudeHeadless is `claude -p` with --resume, one process
+	// per turn.
+	HarnessClaudeHeadless = "claude-headless"
+	// HarnessCodexAppServer is `codex app-server`, JSON-RPC over stdio.
+	HarnessCodexAppServer = "codex-app-server"
+	// HarnessCodexMCP is `codex mcp-server`, the codex / codex-reply
+	// tool pair over stdio MCP. The fallback, and the floor: a Codex
+	// that cannot be driven this way cannot be driven at all.
+	HarnessCodexMCP = "codex-mcp"
+)
+
 // MaxFieldLen bounds each reported string. The engine truncates at 200
 // on its side; matching it here means an operator reading the portal sees
 // the same value the cockpit logged, rather than a longer one that got
@@ -58,12 +88,39 @@ const MaxFieldLen = 200
 // before the engine will route to this machine. Allowed is this machine's
 // own policy.yaml verdict; SignedIn is the app's auth state as the
 // cockpit can observe it without spending the user's tokens to ask.
+//
+// THE DESCRIPTOR IS NOT ON THE WIRE YET, and that is a fact about the
+// wire rather than an omission here. Register's AppInfo carries five
+// fields -- id, version, signed_in, subscription, allowed -- and no
+// harness descriptor; engine epic memql#5096 adds one. Until
+// .github/memql-pin carries that merge there is no field for
+// appinventory.go's appsToProto to map the three below into, and
+// inventing one would not compile. When the pin moves, the mapping is
+// three assignments in appsToProto beside the five that are already
+// there. The live consumer meanwhile is on this machine: the app-session
+// runner picks the protocol from ResolveSpec's answer, which is the same
+// answer Detect reports here.
 type Info struct {
 	Id           string
 	Version      string
 	SignedIn     bool
 	Subscription string
 	Allowed      bool
+	// Harness is the protocol word for the harness that can drive this
+	// app ON THIS MACHINE, resolved against the installed binary rather
+	// than assumed from the id.
+	Harness string
+	// StructuredResult reports whether that harness can return a final
+	// answer against a schema. False is the fail-closed answer: the
+	// engine simply does not send this machine a structured call, which
+	// costs a door. A false TRUE costs a parse failure in the engine's
+	// structured path three layers away, naming nothing here.
+	StructuredResult bool
+	// FollowUps reports whether that harness can send a second prompt
+	// into the session it already opened. False means every turn is a
+	// fresh conversation, which the engine can work with; claiming it
+	// falsely turns a follow-up into a stranger with no context.
+	FollowUps bool
 }
 
 // Spec is everything the cockpit needs to detect and drive one app.
@@ -85,6 +142,20 @@ type Spec struct {
 	// the runner sends plain stdout as narration and never synthesises
 	// event chunks out of it.
 	StreamsJSON bool
+	// Harness is the protocol word the app-session runner drives this
+	// app through. What Specs() carries is the FLOOR -- the harness that
+	// works on every machine that has the binary at all. A machine whose
+	// own binary offers a better one earns it through harnessUpgrade;
+	// putting the better one here instead would have a cockpit advertise
+	// a protocol nothing on that machine speaks.
+	Harness string
+	// StructuredResult reports whether Harness can return a final answer
+	// against a schema, and FollowUps whether it can send a second
+	// prompt into the session it already opened. Both belong to the
+	// HARNESS rather than to the app: the two Codex harnesses do not
+	// answer them the same way, so they move together with the word.
+	StructuredResult bool
+	FollowUps        bool
 }
 
 // Specs returns the closed set, in stable id order.
@@ -96,6 +167,14 @@ func Specs() []Spec {
 			// `claude --version` prints e.g. "2.1.4 (Claude Code)".
 			VersionArgs: []string{"--version"},
 			StreamsJSON: true,
+			// Claude Code has exactly one protocol, so there is nothing
+			// to probe: `-p --output-format stream-json` with
+			// `--json-schema` for the answer and `--resume` for the next
+			// turn. Probing for it would fork a subprocess on every beat
+			// to re-read what is written here.
+			Harness:          HarnessClaudeHeadless,
+			StructuredResult: true,
+			FollowUps:        true,
 		},
 		{
 			ID:     IDCodex,
@@ -103,8 +182,44 @@ func Specs() []Spec {
 			// `codex --version` prints e.g. "codex-cli 0.9.1".
 			VersionArgs: []string{"--version"},
 			StreamsJSON: false,
+			// The FLOOR, not the preference. Every Codex has the
+			// mcp-server tool pair; only a recent one has the
+			// app-server, and harnessUpgrade is what finds out.
+			// StructuredResult is false here because the tool pair
+			// returns a transcript rather than an answer against a
+			// schema -- the engine reads the absence as "do not send
+			// this machine a structured call", which is a shut door and
+			// recoverable, where the over-claim is a parse failure it
+			// cannot attribute to anything.
+			Harness:          HarnessCodexMCP,
+			StructuredResult: false,
+			FollowUps:        true,
 		},
 	}
+}
+
+// harnessUpgrade returns the spec this app becomes when the binary on
+// THIS machine answers probe successfully, and ok=false for an app whose
+// harness is a constant and has nothing to ask.
+//
+// The upgraded word and the command that earns it live together, in this
+// file, beside the floor they replace. Splitting them -- the word here
+// and the probe in detect.go -- is how a probe ends up wired to the wrong
+// answer, which reports a harness the binary does not have: the one
+// failure this entire descriptor exists to prevent.
+func (s Spec) harnessUpgrade() (upgraded Spec, probe []string, ok bool) {
+	switch s.ID {
+	case IDCodex:
+		// `codex app-server --help` exits non-zero on a Codex that has
+		// no such subcommand, and printing its help is the cheapest
+		// question that distinguishes the two Codexes without starting
+		// a session.
+		s.Harness = HarnessCodexAppServer
+		s.StructuredResult = true
+		s.FollowUps = true
+		return s, []string{"app-server", "--help"}, true
+	}
+	return s, nil, false
 }
 
 // SpecFor returns the spec for an app id.
