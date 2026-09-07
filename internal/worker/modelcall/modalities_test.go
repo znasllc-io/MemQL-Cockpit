@@ -918,3 +918,95 @@ func TestAModalityTheRuntimeCannotServeNamesTheDisagreement(t *testing.T) {
 		}
 	}
 }
+
+// EVERY FLAG A PROBE OR A DECLARATION CAN SET MUST HAVE A SERVING PATH
+// BEHIND IT. This is the inversion that matters most in this package:
+// a machine that advertises what it cannot serve takes a call and fails
+// it on somebody else's prompt.
+//
+// The table is the whole matrix of (how the flag becomes true) x (which
+// client clientFor then hands the call to), and each row asserts the
+// capability interface is actually implemented.
+func TestEveryAdvertisableModalityHasAServingPath(t *testing.T) {
+	native := &ollamaClient{baseURL: "http://127.0.0.1:1", http: http.DefaultClient}
+	declared := &openAIClient{baseURL: "http://127.0.0.1:1", http: http.DefaultClient}
+
+	for _, tc := range []struct {
+		flag, source string
+		client       any
+		implements   func(any) bool
+	}{
+		// vision and imagegen can be set by the NATIVE probe (Ollama's
+		// /api/show reports both capabilities), so the native client
+		// must serve both.
+		{"vision", "the native Ollama probe", native, func(c any) bool { _, ok := c.(VisionClient); return ok }},
+		{"imagegen", "the native Ollama probe", native, func(c any) bool { _, ok := c.(ImageGenerator); return ok }},
+
+		// All four can be set by an operator's DECLARATION, which
+		// clientFor reaches as an openAIClient.
+		{"vision", "a declared runtime", declared, func(c any) bool { _, ok := c.(VisionClient); return ok }},
+		{"audioin", "a declared runtime", declared, func(c any) bool { _, ok := c.(Transcriber); return ok }},
+		{"audioout", "a declared runtime", declared, func(c any) bool { _, ok := c.(Speaker); return ok }},
+		{"imagegen", "a declared runtime", declared, func(c any) bool { _, ok := c.(ImageGenerator); return ok }},
+	} {
+		t.Run(tc.flag+" via "+tc.source, func(t *testing.T) {
+			if !tc.implements(tc.client) {
+				t.Fatalf("%s can be advertised through %s and the client it routes to cannot serve it",
+					tc.flag, tc.source)
+			}
+		})
+	}
+}
+
+// A declared image runtime reaches /images/generations, whose response
+// is base64 in JSON rather than the raw bytes /audio/speech returns.
+func TestImageCallOnADeclaredRuntime(t *testing.T) {
+	var path string
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"data":[{"b64_json":"` +
+			base64.StdEncoding.EncodeToString([]byte("PNG")) + `"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	res, err := (&openAIClient{baseURL: srv.URL, http: srv.Client()}).GenerateImage(
+		context.Background(), ImageRequest{Model: "flux", Prompt: "a red cube", Width: 1024, Height: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/images/generations" {
+		t.Fatalf("path = %q", path)
+	}
+	if body["size"] != "1024x1024" {
+		t.Fatalf("size = %v", body["size"])
+	}
+	if len(res.Images) != 1 || string(res.Images[0].Data) != "PNG" {
+		t.Fatalf("images = %+v", res.Images)
+	}
+	// Usage is REPORTED, never inferred: this route reports none.
+	if res.Usage.Known {
+		t.Fatalf("usage was claimed known on a route that reports none: %+v", res.Usage)
+	}
+}
+
+// HALF A SIZE IS NOT A SIZE. "1024x0" is a request no server can
+// honour, so a request naming only one dimension sends none.
+func TestImageCallOmitsAHalfSize(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"data":[{"b64_json":"` +
+			base64.StdEncoding.EncodeToString([]byte("x")) + `"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	if _, err := (&openAIClient{baseURL: srv.URL, http: srv.Client()}).GenerateImage(
+		context.Background(), ImageRequest{Model: "m", Prompt: "x", Width: 1024}); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := body["size"]; present {
+		t.Fatalf("a half size was sent: %v", body)
+	}
+}

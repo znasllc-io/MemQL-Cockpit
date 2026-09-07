@@ -326,6 +326,73 @@ func (c *openAIClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult
 }
 
 // -----------------------------------------------------------------------------
+// Image generation
+// -----------------------------------------------------------------------------
+
+// GenerateImage on a declared runtime, through the OpenAI-shaped
+// /images/generations route.
+//
+// It exists for the same reason Vision exists on the native client: an
+// operator can declare `image_gen: true` on a declared runtime, and
+// without this the machine would advertise a modality clientFor's own
+// client could not serve. The refusal it would get instead is honest
+// but useless -- the operator declared the thing, and the machine
+// agreed, and then nothing served it.
+//
+// The response is base64 in JSON (`data[].b64_json`) rather than raw
+// bytes, which is where it differs from /audio/speech next door.
+func (c *openAIClient) GenerateImage(ctx context.Context, req ImageRequest) (ImageResult, error) {
+	if strings.TrimSpace(req.Prompt) == "" {
+		return ImageResult{}, fmt.Errorf("image: no prompt was supplied")
+	}
+	body := map[string]any{
+		"model":           req.Model,
+		"prompt":          req.Prompt,
+		"response_format": "b64_json",
+	}
+	if req.Count > 0 {
+		body["n"] = req.Count
+	}
+	// The route takes ONE size string rather than two numbers, and it
+	// is sent only when BOTH dimensions were asked for: half a size is
+	// not a size, and "1024x0" is a request no server can honour.
+	if req.Width > 0 && req.Height > 0 {
+		body["size"] = fmt.Sprintf("%dx%d", req.Width, req.Height)
+	}
+
+	resp, err := c.post(ctx, "/images/generations", body)
+	if err != nil {
+		return ImageResult{}, err
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Data []struct {
+			B64JSON string `json:"b64_json"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return ImageResult{}, fmt.Errorf("image: the runtime's response could not be read: %w", err)
+	}
+	if len(out.Data) == 0 {
+		return ImageResult{}, fmt.Errorf("image: the runtime returned no image")
+	}
+
+	// NO USAGE. This route reports none, and the package's rule is that
+	// usage is reported and never inferred -- so Known stays false and
+	// the engine records billing "unknown", which is the truth.
+	var res ImageResult
+	for _, d := range out.Data {
+		data, err := decodeBase64(d.B64JSON)
+		if err != nil {
+			return ImageResult{}, fmt.Errorf("image: the runtime returned an image that could not be decoded: %w", err)
+		}
+		res.Images = append(res.Images, ImagePart{MediaType: "image/png", Data: data})
+	}
+	return res, nil
+}
+
+// -----------------------------------------------------------------------------
 // Image generation -- Ollama's own route
 // -----------------------------------------------------------------------------
 
