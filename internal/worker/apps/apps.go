@@ -28,7 +28,11 @@
 // reason for this package to invent any.
 package apps
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
+)
 
 // The app ids the engine can drive. Closed set, mirrored from
 // component/worker/apps.go in the engine repo.
@@ -64,16 +68,24 @@ const (
 // machine can tell which one is installed here, so a descriptor derived
 // from the id would be right on roughly half the fleet and would fail on
 // the other half only after a turn had been committed to it.
+// The words are ALIASED from internal/worker/harness rather than
+// re-spelled here, and that is the one place this package does not follow
+// its own mirroring convention. Mirroring exists for strings that live in
+// the ENGINE repo, where importing is not possible; harness is in this
+// module, so a copy here would be two definitions that a rename can pull
+// apart in silence -- the detector would report a word, the runner would
+// answer to a different one, and every session for that app would fail at
+// Start with "no client for harness".
 const (
 	// HarnessClaudeHeadless is `claude -p` with --resume, one process
 	// per turn.
-	HarnessClaudeHeadless = "claude-headless"
+	HarnessClaudeHeadless = harness.HarnessClaudeHeadless
 	// HarnessCodexAppServer is `codex app-server`, JSON-RPC over stdio.
-	HarnessCodexAppServer = "codex-app-server"
+	HarnessCodexAppServer = harness.HarnessCodexAppServer
 	// HarnessCodexMCP is `codex mcp-server`, the codex / codex-reply
 	// tool pair over stdio MCP. The fallback, and the floor: a Codex
 	// that cannot be driven this way cannot be driven at all.
-	HarnessCodexMCP = "codex-mcp"
+	HarnessCodexMCP = harness.HarnessCodexMCP
 )
 
 // MaxFieldLen bounds each reported string. The engine truncates at 200
