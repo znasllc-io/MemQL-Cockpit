@@ -18,10 +18,21 @@ import (
 	"github.com/znasllc-io/memql-cockpit/internal/config"
 )
 
-// callTimeout bounds the whole dial-handshake-ask-answer round trip. A person
-// is waiting at a prompt; a cluster that has not answered by now is a fact
-// worth printing rather than something to keep waiting for.
+// callTimeout bounds the dial-handshake-ask-answer round trip. A person is
+// waiting at a prompt; a cluster that has not answered by now is a fact worth
+// printing rather than something to keep waiting for.
+//
+// IT DELIBERATELY DOES NOT COVER THE SIGN-IN. EnsureValidToken is the
+// interactive one here, so an expired token opens a browser -- and that is
+// human-paced: find the window, pick an account, approve. Twenty seconds is a
+// good ceiling for "the cluster did not answer" and a terrible one for "the
+// human has not finished logging in", where it would kill the sign-in partway
+// through with a deadline error naming nothing the person did wrong.
 const callTimeout = 20 * time.Second
+
+// ensureToken is auth.EnsureValidToken, indirected so the deadline placement
+// above is testable without a cluster or a browser.
+var ensureToken = auth.EnsureValidToken
 
 // HandleCommand runs `memql access`.
 func HandleCommand(args []string) int {
@@ -62,10 +73,9 @@ func run(args []string, out, errOut io.Writer) int {
 		return 1
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
-	defer cancel()
-
-	summary, err := Fetch(ctx, cluster)
+	// Background, not a deadlined context: Fetch bounds its own round trip and
+	// leaves the sign-in unbounded on purpose.
+	summary, err := Fetch(context.Background(), cluster)
 	if err != nil {
 		fmt.Fprintf(errOut, "ERROR: %v\n", err)
 		return 1
@@ -99,13 +109,17 @@ func Fetch(ctx context.Context, cluster config.ClusterConfig) (Summary, error) {
 	// INTERACTIVE on purpose, unlike the worker's paths: a person typed this,
 	// so a browser sign-in is the right answer to an expired token rather than
 	// a window nobody will open.
-	token, err := auth.EnsureValidToken(ctx, cluster)
+	token, err := ensureToken(ctx, cluster)
 	if err != nil {
 		// Named, because the cluster is often IMPLICIT here -- resolved from
 		// selected_cluster rather than typed -- and "login: context deadline
 		// exceeded" on its own does not say which one is unreachable.
 		return Summary{}, fmt.Errorf("sign in to %q: %w", cluster.Name, err)
 	}
+
+	// The deadline starts HERE, once the human part is done.
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
 
 	conn, err := sdkclient.Connect(ctx, sdkclient.ConnectConfig{
 		Endpoint: cluster.Endpoint,
