@@ -6,11 +6,12 @@ import (
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
-// At the current pin MyAccessResult carries no `role` field, so the role
-// must come back UNREPORTED -- not as an empty slug, and never as a legacy
-// enum read through cluster_role. The two are different facts and the
-// renderer says different things about them.
-func TestDecodeReportsNoRoleWhenTheClusterCarriesNoRoleField(t *testing.T) {
+// A record that SETS no role must come back UNREPORTED -- not as an empty
+// slug, and never as a legacy enum read through cluster_role. The two are
+// different facts and the renderer says different things about them. (Until
+// the 2026-09-08 pin bump the descriptor carried no `role` field at all; now
+// it does, and an unset value is the cluster reporting nothing.)
+func TestDecodeReportsNoRoleWhenTheClusterSetsNone(t *testing.T) {
 	got := Decode(&memqlv1.MyAccessResult{
 		UserId:       "u_ada",
 		PrimaryEmail: "ada@example.com",
@@ -31,7 +32,7 @@ func TestDecodeReportsNoRoleWhenTheClusterCarriesNoRoleField(t *testing.T) {
 		t.Errorf("SessionID = %q, want %q", got.SessionID, "sess_7")
 	}
 	if got.Role.Reported {
-		t.Errorf("Role.Reported = true, want false: the pinned wire has no `role` field")
+		t.Errorf("Role.Reported = true, want false: the record set no role")
 	}
 	if got.Role.Slug != "" {
 		t.Errorf("Role.Slug = %q, want empty", got.Role.Slug)

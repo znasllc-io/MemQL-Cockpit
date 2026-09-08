@@ -46,4 +46,18 @@
 # integrations/agent/worker/model_routing.go, and the params / quant / tools
 # attributes this repository now advertises are more text inside that same
 # map value. Only the SERVING half of tool calling depends on memql#5096.
-5c4f6ae9679e97609c115ec484ed1aa16edebd7a
+
+# BUMPED 2026-09-08 to memql main at the merge of the guided cockpit install
+# (memql PR #5229, epic memql#5218). THIS bump carries the wire the previous
+# paragraphs said it did not: the ModelPullStart / Progress / End / Cancel
+# family (memql#5103) and the ModelProbe family (memql#5146), the tool fields
+# on the ModelCall family and the app descriptors on Register (memql#5096),
+# the hardware inventory on Register and Heartbeat (memql#5146), the `role`
+# field on the access record (memql#5181), and -- new in that epic -- Ping on
+# the server envelope and Pong on the client envelope (memql#5225, D11 of
+# docs/superpowers/specs/2026-09-08-cockpit-install-wizard-design.md in the
+# engine repository). The runner answers the Ping and runs the ModelPull arm
+# (internal/worker/modelpull.go) against this pin; the ModelProbe arm is still
+# not written. `go mod tidy` moved the indirect set to what the engine now
+# requires (openai-go in, go-openai out, gjson up) and nothing else.
+546dfb116c252ee5e166e9b4dccd4f33c398828e

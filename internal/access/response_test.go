@@ -99,7 +99,13 @@ func TestSummaryFromResponseDecodesAnAccessRecord(t *testing.T) {
 	if got.UserID != "u_ada" {
 		t.Errorf("UserID = %q, want u_ada", got.UserID)
 	}
-	if got.Role.OnTheWire {
-		t.Error("Role.OnTheWire = true at the current pin, which has no `role` field")
+	// The pin carries `role` (memql#5181) since the 2026-09-08 bump, so the
+	// field is ON the wire; a record that did not set it is one the cluster
+	// sent EMPTY, which is the other fact and is reported as such.
+	if !got.Role.OnTheWire {
+		t.Error("Role.OnTheWire = false at the current pin, which carries the `role` field")
+	}
+	if got.Role.Reported {
+		t.Error("Role.Reported = true for a record that set no role")
 	}
 }
