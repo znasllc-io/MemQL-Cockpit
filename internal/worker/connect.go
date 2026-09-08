@@ -28,7 +28,7 @@ import (
 // tool-result helpers, and the registration metadata the runner
 // reads after Connect.
 type Connection struct {
-	conn   *sdkworker.Connection
+	conn   stream
 	logger *slog.Logger
 
 	RegistrationId string
@@ -41,6 +41,21 @@ type Connection struct {
 	// the only way to re-advertise, because the engine's stream handler
 	// accepts Register exactly once, at the handshake.
 	ModelFingerprint string
+}
+
+// stream is what Connection needs from the SDK's connection: the three
+// calls the worker protocol makes on it.
+//
+// An interface rather than the SDK's concrete type so a test can put a
+// recorder where the stream would be and assert the wire shape of a REPLY
+// -- a Pong, a ModelPullEnd -- the way buildRegister and buildHeartbeat
+// let it assert the shape of a message the worker originates. The SDK's
+// own stream field is unexported and it ships no fake, so this is the
+// seam. Connect always fills it with the SDK; nothing else does.
+type stream interface {
+	Send(msg *memqlv1.WorkerClientMessage) error
+	Recv() (*memqlv1.WorkerServerMessage, error)
+	Close()
 }
 
 // Connect dials the cluster (via the SDK), opens the stream, and
@@ -160,12 +175,54 @@ func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.
 
 // Send writes a single message on the worker side of the stream.
 func (c *Connection) Send(msg *memqlv1.WorkerClientMessage) error {
+	if c == nil || c.conn == nil {
+		return errors.New("worker: connection is closed")
+	}
 	return c.conn.Send(msg)
 }
 
 // Recv blocks until the next inbound message lands.
 func (c *Connection) Recv() (*memqlv1.WorkerServerMessage, error) {
+	if c == nil || c.conn == nil {
+		return nil, errors.New("worker: connection is closed")
+	}
 	return c.conn.Recv()
+}
+
+// SendPong answers one of the cluster's Pings (epic memql#5218, D11).
+//
+// sent_at is the Ping's own, echoed VERBATIM: the agent measures the round
+// trip against its own clock and never reads the echo for the figure, so
+// nothing this machine's clock says can shape the number. received_at is
+// this machine's clock and is informational for the same reason.
+func (c *Connection) SendPong(requestID string, sentAt *timestamppb.Timestamp) error {
+	return c.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_Pong{
+			Pong: &memqlv1.Pong{
+				RequestId:  requestID,
+				SentAt:     sentAt,
+				ReceivedAt: timestamppb.Now(),
+			},
+		},
+	})
+}
+
+// SendModelPullProgress emits one observation of a pull in flight.
+//
+// Nothing is numbered and nothing is deduplicated, unlike the delta and
+// chunk families: a pull's counters are per LAYER and legitimately go
+// backwards, and the engine delivers every observation for that reason.
+func (c *Connection) SendModelPullProgress(p *memqlv1.ModelPullProgress) error {
+	return c.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_ModelPullProgress{ModelPullProgress: p},
+	})
+}
+
+// SendModelPullEnd closes a pull on the wire.
+func (c *Connection) SendModelPullEnd(end *memqlv1.ModelPullEnd) error {
+	return c.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_ModelPullEnd{ModelPullEnd: end},
+	})
 }
 
 // SendHeartbeat emits a Heartbeat envelope carrying the current app
@@ -298,7 +355,7 @@ func (c *Connection) SendToolResult(callId string, success *memqlv1.Success, fai
 
 // Close terminates the stream and the underlying SDK connection.
 func (c *Connection) Close() {
-	if c == nil {
+	if c == nil || c.conn == nil {
 		return
 	}
 	c.conn.Close()

@@ -72,9 +72,16 @@ type policyModelInventory struct {
 }
 
 // NewModelInventory builds the reporter the worker runs with.
-func NewModelInventory(policy *tools.Policy) ModelInventory {
+//
+// The discoverer is the CALLER's, not built here, because the runner's
+// pull arm needs the base URL this same discoverer resolved -- a second
+// one would read OLLAMA_HOST again, and two readings drift.
+func NewModelInventory(policy *tools.Policy, discoverer *models.Discoverer) ModelInventory {
+	if discoverer == nil {
+		discoverer = &models.Discoverer{}
+	}
 	return &policyModelInventory{
-		discoverer: &models.Discoverer{},
+		discoverer: discoverer,
 		policy:     policy,
 		ttl:        DefaultModelInventoryTTL,
 	}

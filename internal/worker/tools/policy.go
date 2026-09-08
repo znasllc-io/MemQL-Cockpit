@@ -624,8 +624,8 @@ func (p *Policy) ModelsAllow() []string {
 }
 
 // ModelsPullAllowed reports whether this machine will pull a model when
-// it is asked to -- by its own CLI, and by the engine once the model-pull
-// messages exist on the wire (they are not in the pinned proto today).
+// it is asked to -- by its own CLI, and by the engine over ModelPullStart
+// (the arm in internal/worker/modelpull.go reads it before running).
 //
 // TRUE when the key is absent, which is the opposite of every other
 // answer this file gives. The reasoning is on ModelsPolicy: a pull is the

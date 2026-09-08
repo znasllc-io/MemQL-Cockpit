@@ -56,6 +56,7 @@ type Runner struct {
 	modelsInv ModelInventory
 	calls     *modelcall.Manager
 	sessions  *appsession.Manager
+	pulls     *modelPuller
 	heartbeat time.Duration
 	serve     func() string
 	metrics   *Metrics
@@ -110,6 +111,12 @@ type Options struct {
 	// Nil reports tools.ServeOwner, which is the fail-closed default a
 	// build that does not wire this should send.
 	InferenceServe func() string
+	// ModelPull wires the cluster-driven pull (engine epic memql#5103;
+	// the install wizard's D13). Nil, or a Models of nil, means this
+	// build pulls nothing and answers every ModelPullStart with ok=false
+	// and a sentence -- a pull onto a machine that advertises nothing
+	// would fetch gigabytes the cluster is never told about.
+	ModelPull *ModelPullOptions
 }
 
 // NewRunner constructs a Runner. The runner is not yet running; call
@@ -125,7 +132,7 @@ func NewRunner(opts Options) (*Runner, error) {
 	if hb <= 0 {
 		hb = DefaultHeartbeat
 	}
-	return &Runner{
+	r := &Runner{
 		logger:    opts.Logger,
 		cfg:       opts.Config,
 		tools:     opts.Tools,
@@ -142,7 +149,13 @@ func NewRunner(opts Options) (*Runner, error) {
 		// wait for the refresh ticker, which is the wait this exists to
 		// remove.
 		readvertiseNow: make(chan struct{}, 1),
-	}, nil
+	}
+	pull := opts.ModelPull
+	if opts.Models == nil {
+		pull = nil
+	}
+	r.pulls = newModelPuller(opts.Logger, pull, r.RequestImmediateReadvertise)
+	return r, nil
 }
 
 // Run blocks until ctx is cancelled or the runner is closed. It
@@ -254,6 +267,12 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
 			if r.calls != nil {
 				r.calls.StopAll("the worker's stream to the cluster was lost")
 			}
+			// And for pulls, with one difference: the engine has already
+			// given up every pull on this stream (worker_disconnected),
+			// so the download is stopped rather than finished into a
+			// void. The blobs already fetched stay on disk for the next
+			// pull of the same model to resume.
+			r.pulls.StopAll("the worker's stream to the cluster was lost")
 			r.active.Wait()
 			return err
 		}
@@ -366,8 +385,9 @@ func (r *Runner) modelInventory(ctx context.Context) models.Inventory {
 //   - Nothing happens unless the ADVERTISED labels differ. Discovery
 //     running again is not news; a model appearing is.
 //   - Nothing happens while work is in flight. A model finishing its pull
-//     must not kill somebody's hour-long app session or a tool call
-//     halfway through, and the change will still be there in a minute.
+//     must not kill somebody's hour-long app session, a tool call halfway
+//     through, or a sibling pull still downloading -- and the change will
+//     still be there in a minute.
 //   - Nothing happens twice inside modelReadvertiseMinInterval. A runtime
 //     flapping between up and down would otherwise turn this worker into
 //     one that reconnects forever, which is worse than a stale label.
@@ -444,11 +464,10 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 // worker through the SIGHUP they already send after writing
 // models.allow, and the handler in cli.go asks for this after reloading
 // the policy -- a reloaded allow list that nobody re-advertised is a
-// model the cluster still cannot see. The engine's ModelPullStart arm
-// will call it directly. That last is a statement about the wire rather
-// than a plan: ModelPullStart / ModelPullProgress / ModelPullEnd are not
-// in the pinned proto (engine epic memql#5103), so the arm does not
-// exist and is deliberately not written here.
+// model the cluster still cannot see. The cluster's own ModelPullStart
+// arm (modelpull.go) calls it directly, after reloading the policy
+// itself and AFTER sending its End: the reconnect this asks for closes
+// the stream that End rides.
 func (r *Runner) RequestImmediateReadvertise() {
 	if r == nil {
 		return
@@ -485,6 +504,13 @@ func (r *Runner) busy() bool {
 		return true
 	}
 	if r.calls != nil && r.calls.Live() > 0 {
+		return true
+	}
+	// A pull holds this guard until AFTER its End is sent, so the
+	// re-advertise one model earns cannot close the stream under its
+	// sibling's download -- the recommended set is a pair, asked for at
+	// once -- and cannot lose the End that reports its own success.
+	if r.pulls.Live() > 0 {
 		return true
 	}
 	return false
@@ -539,6 +565,14 @@ func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memql
 		if r.sessions != nil {
 			r.sessions.Control(payload.AppSessionControl)
 		}
+	case *memqlv1.WorkerServerMessage_Ping:
+		r.answerPing(conn, payload.Ping)
+	case *memqlv1.WorkerServerMessage_ModelPullStart:
+		// Nil-safe: a runner built without the seam refuses in a
+		// sentence rather than dropping the request.
+		r.pulls.Start(ctx, conn, payload.ModelPullStart)
+	case *memqlv1.WorkerServerMessage_ModelPullCancel:
+		r.pulls.Cancel(payload.ModelPullCancel)
 	case *memqlv1.WorkerServerMessage_Drain:
 		r.logger.Info("worker received drain; will exit after in-flight calls finish")
 		// App sessions are not tool calls and are not in r.active: a
@@ -551,12 +585,32 @@ func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memql
 		if r.calls != nil {
 			r.calls.StopAll("the cluster asked this worker to drain")
 		}
+		r.pulls.StopAll("the cluster asked this worker to drain")
 		r.active.Wait()
 		return fmt.Errorf("server requested drain")
 	case *memqlv1.WorkerServerMessage_RotationResponse:
 		r.logger.Info("worker received rotation response (ignored in MVP)")
 	}
 	return nil
+}
+
+// answerPing is the Pong (epic memql#5218, D11): the cluster's evidence
+// that the return path to this machine works, and how fast. It is
+// answered at once, on the recv goroutine, because anything queued behind
+// a tool dispatch would measure the queue rather than the path.
+//
+// DEBUG, NEVER INFO. The cluster pings every machine once a minute for as
+// long as it is connected; an info line for each is a log that says
+// nothing forever.
+func (r *Runner) answerPing(conn *Connection, ping *memqlv1.Ping) {
+	if ping == nil {
+		return
+	}
+	if err := conn.SendPong(ping.GetRequestId(), ping.GetSentAt()); err != nil {
+		r.logger.Debug("pong not sent", "request_id", ping.GetRequestId(), "error", err)
+		return
+	}
+	r.logger.Debug("answered the cluster's ping", "request_id", ping.GetRequestId())
 }
 
 func (r *Runner) runToolDispatch(ctx context.Context, conn *Connection, dispatch *memqlv1.ToolDispatch) {
