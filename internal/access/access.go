@@ -29,11 +29,18 @@ type Group struct {
 	AccountName string
 }
 
-// Groups is the caller's memberships, with Reported false when the cluster
-// carried no `groups` field -- distinct from a caller who is in none.
+// Groups is the caller's memberships.
 type Groups struct {
-	Items    []Group
+	Items []Group
+	// Reported is true when at least one group arrived. proto3 cannot tell an
+	// EMPTY repeated field from an absent one -- they are the same bytes --
+	// which is the same limitation the worker's `apps_present` exists for. So
+	// "in no groups" and "sent no groups" collapse here, and they collapse
+	// toward the safe reading: a person told "not reported" looks further,
+	// where one told "none" believes they hold nothing.
 	Reported bool
+	// OnTheWire is true when THIS BUILD's descriptor carries `groups` at all.
+	OnTheWire bool
 }
 
 // Scope is the account scope the caller's memberships resolve to.
@@ -44,24 +51,37 @@ type Groups struct {
 type Scope struct {
 	AccountIDs   []string
 	EveryAccount bool
-	Reported     bool
+	// Reported is true when a scope actually arrived: a non-empty account list,
+	// or every_account set. A false bool is wire-identical to an absent one in
+	// proto3, so it is never itself evidence that the cluster answered.
+	Reported bool
+	// OnTheWire is true when THIS BUILD's descriptor carries the scope fields.
+	OnTheWire bool
 }
 
 // Role is the caller's cluster-wide role as a CATALOG SLUG, the role's
 // display name, and its rank.
-//
-// Reported is false when the cluster's MyAccessResult carried no `role`
-// field at all. That is a different fact from a role whose slug is empty,
-// and the renderer says something different about each.
 type Role struct {
 	Slug string
 	Name string
 	Rank int32
-	// HasRank exists because 0 IS A RANK -- the design record gives an
-	// unknown slug `rankOf` 0, meaning "holds nothing". A plain int32
-	// cannot tell that apart from a rank the cluster never sent.
-	HasRank  bool
+	// HasRank is true when a rank travelled WITH a role. It is not read on its
+	// own: proto3 sends no bytes for an int32 of 0, so "rank 0" and "no rank"
+	// are indistinguishable in isolation. Tied to the role's arrival they stop
+	// being ambiguous -- a role that arrived carries whatever rank came with
+	// it, and 0 then means what the record says it means: holds nothing.
+	HasRank bool
+	// Reported is true when a role slug actually ARRIVED in this response.
 	Reported bool
+	// OnTheWire is true when THIS BUILD's descriptor carries `role` at all.
+	//
+	// It is the ONE thing the cockpit can tell apart, and the reason it is
+	// separate from Reported: a descriptor is a property of this binary, not
+	// of the cluster that answered. False means the contract predates the
+	// field, so no cluster could have sent one. True with Reported false means
+	// a cluster on this contract sent nothing -- an older node, or a
+	// credential with no role row. Those get different sentences.
+	OnTheWire bool
 }
 
 // Decode reads a MyAccessResult into a Summary.
@@ -80,30 +100,92 @@ func Decode(m *memqlv1.MyAccessResult) Summary {
 }
 
 // decodePending reads the fields the engine has not landed yet.
+//
+// PRESENCE COMES FROM THE RESPONSE, NOT FROM THE DESCRIPTOR. Reading it off
+// the descriptor would mean reading it off this BINARY: the moment the pin
+// moves past memql#5181, every build carries `role` and every response would
+// claim to have reported one -- including from a node a release behind, which
+// sends nothing. A cluster that said nothing would render as a person who
+// holds nothing everywhere, which is the inversion this package exists to
+// prevent. So the descriptor decides only whether the field COULD arrive
+// (OnTheWire); the value decides whether it DID.
 func decodePending(m protoreflect.Message, s *Summary) {
-	if slug, ok := stringByName(m, fieldRole); ok {
-		s.Role.Reported = true
-		s.Role.Slug = slug
+	decodeRole(m, &s.Role)
+	decodeGroups(m, &s.Groups)
+	decodeScope(m, &s.Scope)
+}
+
+func decodeRole(m protoreflect.Message, r *Role) {
+	fd := lookupByName(m, fieldRole, protoreflect.StringKind)
+	if fd == nil {
+		return
 	}
-	if name, ok := stringByName(m, fieldRoleName); ok {
-		s.Role.Name = name
+	r.OnTheWire = true
+	slug := m.Get(fd).String()
+	if slug == "" {
+		// An empty slug is wire-identical to an unsent one, and every user row
+		// carries a role -- so empty means the cluster did not send it.
+		return
 	}
-	if rank, ok := int32ByName(m, fieldRank); ok {
-		s.Role.HasRank = true
-		s.Role.Rank = rank
+	r.Reported = true
+	r.Slug = slug
+
+	// The name and the rank are only meaningful ALONGSIDE a slug, which is
+	// also what makes rank 0 readable: on its own it is indistinguishable
+	// from silence, and next to an arrived role it is the record's "holds
+	// nothing".
+	if nameFd := lookupByName(m, fieldRoleName, protoreflect.StringKind); nameFd != nil {
+		r.Name = m.Get(nameFd).String()
 	}
-	if groups, ok := groupsByName(m, fieldGroups); ok {
-		s.Groups.Reported = true
-		s.Groups.Items = groups
+	if rankFd := lookupByName(m, fieldRank, protoreflect.Int32Kind); rankFd != nil {
+		r.HasRank = true
+		r.Rank = int32(m.Get(rankFd).Int())
 	}
-	if ids, ok := stringListByName(m, fieldAccountIDs); ok {
-		s.Scope.Reported = true
-		s.Scope.AccountIDs = ids
+}
+
+func decodeGroups(m protoreflect.Message, g *Groups) {
+	fd := lookupListByName(m, fieldGroups, protoreflect.MessageKind)
+	if fd == nil {
+		return
 	}
-	if every, ok := boolByName(m, fieldEveryAccount); ok {
-		s.Scope.Reported = true
-		s.Scope.EveryAccount = every
+	g.OnTheWire = true
+	list := m.Get(fd).List()
+	if list.Len() == 0 {
+		return
 	}
+	g.Reported = true
+	g.Items = make([]Group, 0, list.Len())
+	for i := 0; i < list.Len(); i++ {
+		item := list.Get(i).Message()
+		var one Group
+		one.ID, _ = stringByName(item, fieldID)
+		one.Name, _ = stringByName(item, fieldName)
+		one.Kind, _ = stringByName(item, fieldKind)
+		one.AccountID, _ = stringByName(item, fieldAccountID)
+		one.AccountName, _ = stringByName(item, fieldAccountName)
+		g.Items = append(g.Items, one)
+	}
+}
+
+func decodeScope(m protoreflect.Message, sc *Scope) {
+	idsFd := lookupListByName(m, fieldAccountIDs, protoreflect.StringKind)
+	everyFd := lookupByName(m, fieldEveryAccount, protoreflect.BoolKind)
+	if idsFd == nil && everyFd == nil {
+		return
+	}
+	sc.OnTheWire = true
+	if idsFd != nil {
+		list := m.Get(idsFd).List()
+		for i := 0; i < list.Len(); i++ {
+			sc.AccountIDs = append(sc.AccountIDs, list.Get(i).String())
+		}
+	}
+	if everyFd != nil {
+		sc.EveryAccount = m.Get(everyFd).Bool()
+	}
+	// A false bool and an empty list are both wire-identical to silence, so
+	// neither is evidence on its own that the cluster answered.
+	sc.Reported = len(sc.AccountIDs) > 0 || sc.EveryAccount
 }
 
 // The field NAMES are the contract; see the comment on lookupByName.
@@ -124,68 +206,15 @@ const (
 	fieldAccountName = "account_name"
 )
 
-// stringByName reads a string field BY NAME, or reports absence.
+// stringByName reads a string field BY NAME. The bool reports whether the
+// DESCRIPTOR carries it, which is all a nested group field needs -- an empty
+// name inside a group that did arrive is just an empty name.
 func stringByName(m protoreflect.Message, name string) (string, bool) {
 	fd := lookupByName(m, name, protoreflect.StringKind)
 	if fd == nil {
 		return "", false
 	}
 	return m.Get(fd).String(), true
-}
-
-// int32ByName reads an int32 field BY NAME, or reports absence.
-func int32ByName(m protoreflect.Message, name string) (int32, bool) {
-	fd := lookupByName(m, name, protoreflect.Int32Kind)
-	if fd == nil {
-		return 0, false
-	}
-	return int32(m.Get(fd).Int()), true
-}
-
-// boolByName reads a bool field BY NAME, or reports absence.
-func boolByName(m protoreflect.Message, name string) (bool, bool) {
-	fd := lookupByName(m, name, protoreflect.BoolKind)
-	if fd == nil {
-		return false, false
-	}
-	return m.Get(fd).Bool(), true
-}
-
-// stringListByName reads a repeated string field BY NAME, or reports absence.
-func stringListByName(m protoreflect.Message, name string) ([]string, bool) {
-	fd := lookupListByName(m, name, protoreflect.StringKind)
-	if fd == nil {
-		return nil, false
-	}
-	list := m.Get(fd).List()
-	out := make([]string, 0, list.Len())
-	for i := 0; i < list.Len(); i++ {
-		out = append(out, list.Get(i).String())
-	}
-	return out, true
-}
-
-// groupsByName reads the repeated MyAccessGroup field BY NAME. The nested
-// message's own fields are read by name for the same reason the outer ones
-// are: record A settles `MyAccessGroup`'s field names, not its numbers.
-func groupsByName(m protoreflect.Message, name string) ([]Group, bool) {
-	fd := lookupListByName(m, name, protoreflect.MessageKind)
-	if fd == nil {
-		return nil, false
-	}
-	list := m.Get(fd).List()
-	out := make([]Group, 0, list.Len())
-	for i := 0; i < list.Len(); i++ {
-		item := list.Get(i).Message()
-		g := Group{}
-		g.ID, _ = stringByName(item, fieldID)
-		g.Name, _ = stringByName(item, fieldName)
-		g.Kind, _ = stringByName(item, fieldKind)
-		g.AccountID, _ = stringByName(item, fieldAccountID)
-		g.AccountName, _ = stringByName(item, fieldAccountName)
-		out = append(out, g)
-	}
-	return out, true
 }
 
 // lookupListByName is lookupByName for a REPEATED field.

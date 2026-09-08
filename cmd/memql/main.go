@@ -80,11 +80,12 @@ func main() {
 	case "logout":
 		handleLogoutCmd(os.Args[2:])
 	case "access":
-		// Reads a cached credential, so the store has to be resolved first --
-		// same as login / logout. The worker path deliberately does not do
-		// this, but a person at a prompt can answer a Keychain dialog.
-		installCredStore()
-		os.Exit(access.HandleCommand(os.Args[2:]))
+		// installCredStore is HANDED OVER rather than called here, so it runs
+		// after argv is validated -- the order every sibling command uses.
+		// Resolving the OS keyring costs D-Bus round trips and can exit
+		// non-zero when MEMQL_COCKPIT_CRED_STORE names an unavailable backend,
+		// which `memql access --help` should not pay for or die of.
+		os.Exit(access.HandleCommand(os.Args[2:], installCredStore))
 	case "worker":
 		worker.HandleCommand(os.Args[2:])
 	case "creds":

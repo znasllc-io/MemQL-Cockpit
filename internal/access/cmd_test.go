@@ -75,6 +75,21 @@ func TestResolveClusterRefusesToGuessBetweenSeveral(t *testing.T) {
 	}
 }
 
+// A stale selection with exactly ONE cluster left is not ambiguous, and the
+// usage text promises "the selected cluster ... or the only registered one".
+// `memql cluster remove` does not clear selected_cluster, so remove-then-add
+// reaches this state through ordinary use -- and refusing there dead-ends the
+// command with nothing the reader can act on but a name they did not choose.
+func TestResolveClusterUsesTheOnlyClusterEvenWhenTheSelectionIsStale(t *testing.T) {
+	got, err := resolveCluster(file("removed", "beta"), "")
+	if err != nil {
+		t.Fatalf("resolveCluster refused with one cluster left: %v", err)
+	}
+	if got.Name != "beta" {
+		t.Errorf("Name = %q, want beta", got.Name)
+	}
+}
+
 func TestResolveClusterPointsAtClusterAddWhenNothingIsRegistered(t *testing.T) {
 	_, err := resolveCluster(file(""), "")
 	if err == nil {

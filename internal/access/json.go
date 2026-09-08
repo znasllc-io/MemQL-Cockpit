@@ -13,13 +13,23 @@ import (
 // "may this machine deploy?" must not read a cluster that never mentioned
 // roles as a person who holds none.
 //
-// So every block that can be absent is an OBJECT with an explicit `reported`,
-// and its contents are omitted entirely when `reported` is false -- there is no
-// shape in which a caller sees `"slug": ""` and has to guess which it means.
+// So every block that can be absent carries BOTH flags the text report
+// distinguishes, and they answer different questions:
 //
-// `rank` is a POINTER for the same reason it carries HasRank in Go: 0 is a real
-// rank meaning "holds nothing", and `omitempty` on a plain int would delete
-// precisely the value a caller most needs to see.
+//	on_wire   does THIS BUILD's wire carry the field at all? False means no
+//	          cluster could have sent one -- the contract predates it.
+//	reported  did a value actually arrive in THIS response?
+//
+// A block's contents appear only when `reported` is true, so there is no shape
+// in which a caller sees `"slug": ""` and has to guess which it means.
+//
+// TWO THINGS ARE DELIBERATELY NOT `omitempty`. `rank` is a POINTER because 0 is
+// a real rank meaning "holds nothing", and `omitempty` on a plain int would
+// delete precisely the value a caller most needs. `items` and `account_ids`
+// are emitted as `[]` rather than dropped, because a dropped key is a THIRD
+// shape that means the opposite of the second: a jq script doing
+// `.groups.items[]` would die on the ordinary account-less user, and a caller
+// could not tell "in no groups" from "asked a cluster that does not answer".
 
 type jsonSummary struct {
 	Cluster      string     `json:"cluster"`
@@ -33,6 +43,7 @@ type jsonSummary struct {
 }
 
 type jsonRole struct {
+	OnWire   bool   `json:"on_wire"`
 	Reported bool   `json:"reported"`
 	Slug     string `json:"slug,omitempty"`
 	Name     string `json:"name,omitempty"`
@@ -40,8 +51,9 @@ type jsonRole struct {
 }
 
 type jsonGroups struct {
+	OnWire   bool        `json:"on_wire"`
 	Reported bool        `json:"reported"`
-	Items    []jsonGroup `json:"items,omitempty"`
+	Items    []jsonGroup `json:"items"`
 }
 
 type jsonGroup struct {
@@ -53,8 +65,9 @@ type jsonGroup struct {
 }
 
 type jsonScope struct {
+	OnWire       bool     `json:"on_wire"`
 	Reported     bool     `json:"reported"`
-	AccountIDs   []string `json:"account_ids,omitempty"`
+	AccountIDs   []string `json:"account_ids"`
 	EveryAccount *bool    `json:"every_account,omitempty"`
 }
 
@@ -66,9 +79,9 @@ func RenderJSON(w io.Writer, s Summary, cluster string) error {
 		PrimaryEmail: s.PrimaryEmail,
 		DisplayName:  s.DisplayName,
 		SessionID:    s.SessionID,
-		Role:         jsonRole{Reported: s.Role.Reported},
-		Groups:       jsonGroups{Reported: s.Groups.Reported},
-		Scope:        jsonScope{Reported: s.Scope.Reported},
+		Role:         jsonRole{OnWire: s.Role.OnTheWire, Reported: s.Role.Reported},
+		Groups:       jsonGroups{OnWire: s.Groups.OnTheWire, Reported: s.Groups.Reported},
+		Scope:        jsonScope{OnWire: s.Scope.OnTheWire, Reported: s.Scope.Reported},
 	}
 	if s.Role.Reported {
 		out.Role.Slug = s.Role.Slug
@@ -78,13 +91,20 @@ func RenderJSON(w io.Writer, s Summary, cluster string) error {
 			out.Role.Rank = &rank
 		}
 	}
+	// ALWAYS a list, never nil and never absent -- in every state, reported or
+	// not. `null` would be a third shape, and `.groups.items[]` dies on it just
+	// as it dies on a missing key.
+	out.Groups.Items = []jsonGroup{}
+	out.Scope.AccountIDs = []string{}
 	if s.Groups.Reported {
 		for _, g := range s.Groups.Items {
 			out.Groups.Items = append(out.Groups.Items, jsonGroup(g))
 		}
 	}
 	if s.Scope.Reported {
-		out.Scope.AccountIDs = s.Scope.AccountIDs
+		if s.Scope.AccountIDs != nil {
+			out.Scope.AccountIDs = s.Scope.AccountIDs
+		}
 		every := s.Scope.EveryAccount
 		out.Scope.EveryAccount = &every
 	}

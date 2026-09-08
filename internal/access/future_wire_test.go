@@ -127,6 +127,29 @@ func setInt32(t *testing.T, m protoreflect.Message, name string, v int32) {
 	m.Set(fd, protoreflect.ValueOfInt32(v))
 }
 
+// roleOnlyResult carries `role` but no `rank`, which is what a split landing of
+// memql#5181 would look like.
+func roleOnlyResult(t *testing.T) protoreflect.Message {
+	t.Helper()
+	file := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("cockpit_role_only_my_access.proto"),
+		Package: proto.String("cockpit.roleonly"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("MyAccessResult"),
+			Field: []*descriptorpb.FieldDescriptorProto{
+				strField("user_id", 2),
+				strField("role", 41),
+			},
+		}},
+	}
+	fd, err := protodesc.NewFile(file, nil)
+	if err != nil {
+		t.Fatalf("build role-only descriptor: %v", err)
+	}
+	return dynamicpb.NewMessage(fd.Messages().ByName("MyAccessResult"))
+}
+
 // A CUSTOM slug is none of the five legacy names, and its rank is what says
 // where it stands. It must arrive intact, with no fallback to "reader".
 func TestDecodeReadsRoleSlugNameAndRankByNameNotByNumber(t *testing.T) {
@@ -157,19 +180,37 @@ func TestDecodeReadsRoleSlugNameAndRankByNameNotByNumber(t *testing.T) {
 
 // Rank 0 is a REAL rank: the record gives an unknown slug rankOf 0, meaning
 // "holds nothing". It must not read as "the cluster sent no rank".
+//
+// The comparison is against a message built WITHOUT the field, which is the
+// only thing that makes the claim mean anything. An earlier version of this
+// test asserted HasRank against a message that always declared `rank`, so it
+// passed with its own setup deleted -- it was measuring the descriptor, not
+// the decode.
 func TestDecodeTellsRankZeroApartFromNoRank(t *testing.T) {
-	m := futureResult(t)
-	setStr(t, m, "role", "orphaned-slug")
-	setInt32(t, m, "rank", 0)
+	withRank := futureResult(t)
+	setStr(t, withRank, "role", "orphaned-slug")
+	setInt32(t, withRank, "rank", 0)
 
 	var got Summary
-	decodePending(m, &got)
-
+	decodePending(withRank, &got)
 	if !got.Role.HasRank {
 		t.Fatal("Role.HasRank = false for an explicit rank of 0: zero is a rank, not an absence")
 	}
 	if got.Role.Rank != 0 {
 		t.Errorf("Role.Rank = %d, want 0", got.Role.Rank)
+	}
+
+	// The same slug on a wire that carries no rank at all.
+	noRank := roleOnlyResult(t)
+	setStr(t, noRank, "role", "orphaned-slug")
+
+	var got2 Summary
+	decodePending(noRank, &got2)
+	if !got2.Role.Reported {
+		t.Fatal("Role.Reported = false; the role itself should still arrive")
+	}
+	if got2.Role.HasRank {
+		t.Error("Role.HasRank = true for a wire with no `rank` field: absence and zero must not collapse")
 	}
 }
 
@@ -223,6 +264,11 @@ func TestDecodeReadsEveryAccountWithAnEmptyAccountList(t *testing.T) {
 	if len(got.Scope.AccountIDs) != 0 {
 		t.Errorf("Scope.AccountIDs = %v, want empty", got.Scope.AccountIDs)
 	}
+	// This message declares `role` too and sets nothing in it. The role must
+	// stay absent -- the field existing is not the cluster having answered.
+	if got.Role.Reported {
+		t.Error("Role.Reported = true from a declared-but-unset field")
+	}
 }
 
 func setBool(t *testing.T, m protoreflect.Message, name string, v bool) {
@@ -258,4 +304,31 @@ func appendGroup(t *testing.T, m protoreflect.Message, id, name, kind, acctID, a
 		item.Set(item.Descriptor().Fields().ByName(protoreflect.Name(field)), protoreflect.ValueOfString(value))
 	}
 	list.Append(protoreflect.ValueOfMessage(item))
+}
+
+// pinnedResult is MyAccessResult as it exists at the CURRENT pin: no role, no
+// groups, no scope. Built the same way as futureResult so the two differ only
+// in the fields under test.
+func pinnedResult(t *testing.T) protoreflect.Message {
+	t.Helper()
+	file := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("cockpit_pinned_my_access.proto"),
+		Package: proto.String("cockpit.pinned"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("MyAccessResult"),
+			Field: []*descriptorpb.FieldDescriptorProto{
+				strField("request_id", 1),
+				strField("user_id", 2),
+				strField("primary_email", 3),
+				strField("session_id", 6),
+				strField("display_name", 7),
+			},
+		}},
+	}
+	fd, err := protodesc.NewFile(file, nil)
+	if err != nil {
+		t.Fatalf("build pinned descriptor: %v", err)
+	}
+	return dynamicpb.NewMessage(fd.Messages().ByName("MyAccessResult"))
 }

@@ -16,6 +16,22 @@ func mainSource(t *testing.T) string {
 	return string(body)
 }
 
+// mainSwitch returns the body of main()'s dispatch switch, so the scan below
+// cannot wander into a sub-command's switch.
+func mainSwitch(t *testing.T, src string) string {
+	t.Helper()
+	start := strings.Index(src, "func main() {")
+	if start < 0 {
+		t.Fatal("main.go has no main()")
+	}
+	rest := src[start:]
+	end := strings.Index(rest, "\nfunc ")
+	if end < 0 {
+		t.Fatal("could not find the end of main()")
+	}
+	return rest[:end]
+}
+
 // usageBody returns just printUsage's body, so "the usage text mentions it"
 // cannot be satisfied by a mention somewhere else in the file.
 func usageBody(t *testing.T, src string) string {
@@ -57,7 +73,13 @@ func TestEveryDispatchedCommandAppearsInTheUsage(t *testing.T) {
 		"-v": true, "--version": true, "-h": true, "--help": true, "help": true,
 	}
 
-	verbs := regexp.MustCompile(`case "([a-z-]+)"`).FindAllStringSubmatch(src, -1)
+	// Scoped to main()'s OWN switch. An unanchored scan over the whole file also
+	// captures the cluster sub-switch's add / list / remove, which pass only
+	// because those words happen to be substrings of unrelated usage lines --
+	// so a future top-level `run` arm would pass undocumented on "runs as a
+	// service", and a new cluster subcommand would fail this test blaming the
+	// wrong thing.
+	verbs := regexp.MustCompile(`case "([a-z-]+)"`).FindAllStringSubmatch(mainSwitch(t, src), -1)
 	if len(verbs) < 5 {
 		t.Fatalf("found only %d dispatch arms; the regexp is not matching main.go's switch", len(verbs))
 	}

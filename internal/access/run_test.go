@@ -8,19 +8,67 @@ import (
 func runCmd(t *testing.T, args ...string) (code int, out, errOut string) {
 	t.Helper()
 	var o, e strings.Builder
-	code = run(args, &o, &e)
+	code = run(args, &o, &e, nil)
 	return code, o.String(), e.String()
 }
 
-// An asked-for help text is a SUCCESS. Exiting non-zero for it breaks
-// `memql access --help && ...` and makes the command look broken in a script.
-func TestHelpExitsZero(t *testing.T) {
-	code, _, errOut := runCmd(t, "--help")
+// An asked-for help text is a SUCCESS, and it belongs on STDOUT. Exiting
+// non-zero breaks `memql access --help && ...`; writing to stderr makes
+// `memql access --help > usage.txt` produce an empty file, which no sibling
+// verb does.
+func TestHelpExitsZeroOnStdout(t *testing.T) {
+	code, out, errOut := runCmd(t, "--help")
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(errOut, "Usage: memql access") {
-		t.Errorf("help text not printed:\n%s", errOut)
+	if !strings.Contains(out, "Usage: memql access") {
+		t.Errorf("help text not on stdout:\nstdout=%q\nstderr=%q", out, errOut)
+	}
+	if errOut != "" {
+		t.Errorf("asked-for help wrote to stderr: %q", errOut)
+	}
+}
+
+// Finding 2: Go's flag package stops at the first positional, so a flag AFTER
+// the cluster name was silently dropped -- `memql access prod --json | jq`
+// printed a table and exited 0.
+func TestFlagsAreHonouredAfterTheClusterName(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	// --json after the name must not be swallowed. With no clusters the command
+	// fails before rendering, so the observable proof is that --help placed
+	// after a positional is still seen.
+	code, out, _ := runCmd(t, "somecluster", "--help")
+	if code != 0 {
+		t.Errorf("`access <name> --help` exit code = %d, want 0", code)
+	}
+	if !strings.Contains(out, "Usage: memql access") {
+		t.Errorf("help after a positional was swallowed:\n%s", out)
+	}
+}
+
+// A typo'd flag is a USAGE error (2), distinct from an unregistered cluster
+// (1), so a wrapper can tell them apart.
+func TestUnknownFlagAfterAPositionalStillExitsTwo(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	code, _, errOut := runCmd(t, "acme", "--bogus")
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(errOut, "--bogus") {
+		t.Errorf("stderr does not name the bad flag: %q", errOut)
+	}
+}
+
+// A second positional is a mistake worth naming rather than ignoring.
+func TestASecondPositionalIsRefused(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	code, _, errOut := runCmd(t, "acme", "beta")
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(errOut, "too many positional arguments") {
+		t.Errorf("stderr does not explain: %q", errOut)
 	}
 }
 

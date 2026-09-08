@@ -516,49 +516,71 @@ ENGINE repository's `docs/superpowers/specs/2026-09-07-roles-as-data-design.md`
 section G, and this repository has no separate record. Operator doc:
 [docs/access.md](docs/access.md).
 
-**BY NAME, NEVER BY NUMBER, and this is the whole design.** Both records
-that add fields to `MyAccessResult` settle the NAMES and hand the NUMBERS
-to whoever writes the engine change -- "field numbers are chosen by the
-implementer against the current message; the names are the contract". A
-number written down here is therefore a GUESS the engine is free to
-contradict, and the failure is the worst kind: whatever the landed message
-puts at field 11 would render as somebody's role. It also rules out the
-obvious alternative -- proto keeps unrecognised fields as `unknownFields`
-BYTES KEYED BY NUMBER ONLY, the name never travels, so `role` cannot be
-pulled out of an unknown-field blob without already knowing the number the
-records decline to settle. Reading the descriptor by name is the only
-correct option, and it is why nothing here changes when the field lands.
+**BY NAME, NEVER BY NUMBER.** Both records that add fields to
+`MyAccessResult` settle the NAMES and hand the NUMBERS to whoever writes
+the engine change -- "field numbers are chosen by the implementer against
+the current message; the names are the contract". A number written down
+here is a GUESS the engine is free to contradict, and the failure is the
+worst kind: whatever the landed message puts at field 11 would render as
+somebody's role. It also rules out the obvious alternative -- proto keeps
+unrecognised fields as `unknownFields` BYTES KEYED BY NUMBER ONLY, the
+name never travels, so `role` cannot be pulled out of an unknown-field
+blob without already knowing the number the records decline to settle.
+
+**PRESENCE COMES FROM THE RESPONSE, NEVER FROM THE DESCRIPTOR**, and this
+is the trap the by-name design sets for itself. The descriptor is compiled
+into the binary, so the moment the pin moves past memql#5181 EVERY build
+carries `role` -- and a check that only asked "does the field exist?"
+would report every answer as reported, including from a node one release
+behind that sends nothing. A cluster that said nothing would render as a
+person who holds nothing everywhere, which is the exact inversion this
+surface exists to prevent. So the descriptor decides only whether a field
+COULD arrive (`OnTheWire`); the value decides whether it DID (`Reported`).
+The two get different sentences, because only the first is explained by a
+pending engine issue and telling somebody to wait for a change their
+cluster already has is its own wrong answer.
+
+**What proto3 cannot tell apart, this package does not claim to.** An
+empty repeated field and an absent one are THE SAME BYTES, and so are a
+false bool and an unsent one -- the limitation `apps_present` exists for.
+So "in no groups" and "sent no groups" collapse, and they collapse toward
+the SAFE reading: a person told "not reported" looks further, where one
+told "none" believes they hold nothing. `rank` is never read alone for the
+same reason -- an int32 of 0 puts no bytes on the wire, so rank 0 and no
+rank are one silence; attached to a slug that did arrive it becomes the
+record's "holds nothing", which is the sentence that explains every
+refusal the reader is about to hit.
 
 **Nothing in this repository names the retired enum, and a test says so.**
 `TestNoCockpitCodePathNamesTheRetiredRoleEnum` walks every Go file with
-NOTHING excluded (its needles are assembled from fragments so it does not
-match itself). The criterion holds vacuously today -- the slim-down deleted
-the TUI that read the enum -- which is exactly why it is worth pinning: the
-next person needing a role will find the generated getter for `cluster_role`
-sitting on the pinned proto and use it because it compiles. That renders
-identically for the five predefined roles and breaks only for the custom
-role the epic exists for.
+nothing excluded but build and vendor directories (its needles are
+assembled from fragments so it does not match itself). The criterion holds
+vacuously today -- the slim-down deleted the TUI that read the enum --
+which is exactly why it is worth pinning: the next person needing a role
+will find the generated getter for `cluster_role` sitting on the pinned
+proto and use it because it compiles. That renders identically for the
+five predefined roles and breaks only for the custom role the epic exists
+for.
 
-**AN ABSENCE IS A SENTENCE, NEVER A BLANK.** Every line has a state where
-the cluster said nothing, and a blank reads as the OPPOSITE claim -- "you
-hold no role" rather than "this cluster did not say" -- which sends
-somebody to ask for a grant they already have. The same rule holds in
-`--json`, where it is easier to get wrong: every absent-able block is an
-object with an explicit `reported`, because a missing key and a false one
-are both falsey to the caller. `rank` is a POINTER there and carries
-`HasRank` in Go, because **0 IS A RANK** -- the record's unknown slug, "holds
-nothing, everywhere, until re-roled" -- and `omitempty` on a plain int
-would delete precisely the value that explains every refusal the reader is
-about to hit.
+**The ceiling is enforced by a `select`, not by the context.** The SDK
+opens its stream on `context.Background()` BY DESIGN -- the stream must
+outlive the connect timeout -- so a deadlined context handed to
+`sdkclient.Connect` never reaches the stream open. Against a peer that
+completes a TCP handshake and then says nothing, which is precisely the
+"cluster is not answering" case the ceiling is for, the deadline passes
+unnoticed and the command waits forever at a prompt somebody is sitting in
+front of. The sign-in is deliberately OUTSIDE the ceiling in the other
+direction: it opens a browser, and twenty seconds is a terrible limit on a
+person finding a window.
 
 **The fields do not exist at the current pin** (memql#5181 and memql#5165
-are both unmerged), so `memql access` reports the role as not reported and
-names the engine issue. That is the expected state, not a failure, and the
-cockpit does NOT fall back to the five-value enum -- a guess would be wrong
-in exactly the case the command exists for. `future_wire_test.go` builds
-the message the records describe, at field numbers DELIBERATELY not the
-ones they illustrate, and runs the real decode against it; that is the only
-way to test a wire this repository cannot yet see.
+are both unmerged), so `memql access` reports them as not reported and
+names the engine issue. No cockpit CODE changes when they land, but the
+binary must be rebuilt at a pin that carries them -- the generated
+descriptor is compiled in. `future_wire_test.go` builds the message the
+records describe, at field numbers DELIBERATELY not the ones they
+illustrate, and runs the real decode against it; that is the only way to
+test a wire this repository cannot yet see.
 
 ## Worker + auth notes
 

@@ -48,7 +48,14 @@ func TestNoCockpitCodePathNamesTheRetiredRoleEnum(t *testing.T) {
 			return walkErr
 		}
 		if d.IsDir() {
-			if name := d.Name(); name == ".git" || name == "bin" || name == "dist" {
+			// `vendor` is skipped for a different reason than the build
+			// directories beside it: `go mod vendor` would drop the engine's
+			// generated memql.pb.go in here, where the retired enum legitimately
+			// appears dozens of times. Scanning it fails the guard three times
+			// over a file nobody can edit, with repair advice that means nothing
+			// for generated vendored code.
+			switch d.Name() {
+			case ".git", "bin", "dist", "vendor", "node_modules":
 				return filepath.SkipDir
 			}
 			return nil
@@ -58,12 +65,16 @@ func TestNoCockpitCodePathNamesTheRetiredRoleEnum(t *testing.T) {
 		}
 		body, readErr := os.ReadFile(path)
 		if readErr != nil {
-			return readErr
+			// One unreadable file is not a reason to abandon the sweep and
+			// report a guard failure that names the wrong problem.
+			t.Logf("skipping %s: %v", path, readErr)
+			return nil
 		}
 		scanned++
 		rel, _ := filepath.Rel(root, path)
+		text := string(body)
 		for needle, what := range needles {
-			if strings.Contains(string(body), needle) {
+			if strings.Contains(text, needle) {
 				t.Errorf("%s names %q (%s).\n"+
 					"The role is a catalog slug with a rank. Read it through internal/access, "+
 					"which takes the slug, its name and its rank off the wire by field name.",

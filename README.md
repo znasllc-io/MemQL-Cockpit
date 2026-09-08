@@ -85,6 +85,8 @@ up local models is still a working worker.
 memql cluster add <domain|url>    Register a cluster (discovery + OAuth login)
 memql cluster list | remove       Manage saved clusters
 memql login | logout <cluster>    (Re-)authenticate / drop credentials
+memql access [<cluster>]          What this cluster says you are: role slug,
+                                  name and rank, groups, account scope (--json)
 memql creds <subcommand>          Inspect / migrate the credential store
 memql worker pair <code>          Redeem a pairing code, write worker.yaml, run
 memql worker run                  Run the worker (what the service invokes)
