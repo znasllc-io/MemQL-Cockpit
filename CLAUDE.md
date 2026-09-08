@@ -91,8 +91,10 @@ checkout of the pinned sha is the reference state.
 ```
 memql-cockpit/
 ├── cmd/memql/              Binary entry point: dispatch, cluster add/list/
-│                           remove, login/logout, creds; variant consts
+│                           remove, login/logout, access, creds; variant consts
 ├── internal/
+│   ├── access/             `memql access` — what the cluster says you are:
+│   │                       role slug / name / rank, groups, account scope
 │   ├── auth/               Identity-service auth: browser code grant with
 │   │                       loopback callback; RFC 8628 device flow fallback
 │   │                       (device.go) for SSH / headless machines
@@ -122,7 +124,7 @@ memql-cockpit/
 │                           one-liner. install.sh at the root is the plain
 │                           binary installer from GitHub releases
 ├── deploy/systemd/         memql-worker.service template (user systemd)
-├── docs/                   computer-use.md, local-apps.md,
+├── docs/                   access.md, computer-use.md, local-apps.md,
 │                           local-models.md, watched-folders.md;
 │                           docs/superpowers/specs/ designs (the plans
 │                           beside them are deleted by the PR that
@@ -504,6 +506,81 @@ an `errors` array, so a client that only checked the status would read "you may
 not see these rows" as "you are watching nothing" -- and a backup with nothing
 to do looks exactly like one that is up to date. Every call reads `errors`
 first.
+
+## The role is a slug with a rank (memql-cockpit#403)
+
+`memql access` prints what a cluster says about the credential on THIS
+machine: the user it resolves to, the role held, the groups, the account
+scope. `internal/access/`. Engine epic memql#5166; the record is the
+ENGINE repository's `docs/superpowers/specs/2026-09-07-roles-as-data-design.md`
+section G, and this repository has no separate record. Operator doc:
+[docs/access.md](docs/access.md).
+
+**BY NAME, NEVER BY NUMBER.** Both records that add fields to
+`MyAccessResult` settle the NAMES and hand the NUMBERS to whoever writes
+the engine change -- "field numbers are chosen by the implementer against
+the current message; the names are the contract". A number written down
+here is a GUESS the engine is free to contradict, and the failure is the
+worst kind: whatever the landed message puts at field 11 would render as
+somebody's role. It also rules out the obvious alternative -- proto keeps
+unrecognised fields as `unknownFields` BYTES KEYED BY NUMBER ONLY, the
+name never travels, so `role` cannot be pulled out of an unknown-field
+blob without already knowing the number the records decline to settle.
+
+**PRESENCE COMES FROM THE RESPONSE, NEVER FROM THE DESCRIPTOR**, and this
+is the trap the by-name design sets for itself. The descriptor is compiled
+into the binary, so the moment the pin moves past memql#5181 EVERY build
+carries `role` -- and a check that only asked "does the field exist?"
+would report every answer as reported, including from a node one release
+behind that sends nothing. A cluster that said nothing would render as a
+person who holds nothing everywhere, which is the exact inversion this
+surface exists to prevent. So the descriptor decides only whether a field
+COULD arrive (`OnTheWire`); the value decides whether it DID (`Reported`).
+The two get different sentences, because only the first is explained by a
+pending engine issue and telling somebody to wait for a change their
+cluster already has is its own wrong answer.
+
+**What proto3 cannot tell apart, this package does not claim to.** An
+empty repeated field and an absent one are THE SAME BYTES, and so are a
+false bool and an unsent one -- the limitation `apps_present` exists for.
+So "in no groups" and "sent no groups" collapse, and they collapse toward
+the SAFE reading: a person told "not reported" looks further, where one
+told "none" believes they hold nothing. `rank` is never read alone for the
+same reason -- an int32 of 0 puts no bytes on the wire, so rank 0 and no
+rank are one silence; attached to a slug that did arrive it becomes the
+record's "holds nothing", which is the sentence that explains every
+refusal the reader is about to hit.
+
+**Nothing in this repository names the retired enum, and a test says so.**
+`TestNoCockpitCodePathNamesTheRetiredRoleEnum` walks every Go file with
+nothing excluded but build and vendor directories (its needles are
+assembled from fragments so it does not match itself). The criterion holds
+vacuously today -- the slim-down deleted the TUI that read the enum --
+which is exactly why it is worth pinning: the next person needing a role
+will find the generated getter for `cluster_role` sitting on the pinned
+proto and use it because it compiles. That renders identically for the
+five predefined roles and breaks only for the custom role the epic exists
+for.
+
+**The ceiling is enforced by a `select`, not by the context.** The SDK
+opens its stream on `context.Background()` BY DESIGN -- the stream must
+outlive the connect timeout -- so a deadlined context handed to
+`sdkclient.Connect` never reaches the stream open. Against a peer that
+completes a TCP handshake and then says nothing, which is precisely the
+"cluster is not answering" case the ceiling is for, the deadline passes
+unnoticed and the command waits forever at a prompt somebody is sitting in
+front of. The sign-in is deliberately OUTSIDE the ceiling in the other
+direction: it opens a browser, and twenty seconds is a terrible limit on a
+person finding a window.
+
+**The fields do not exist at the current pin** (memql#5181 and memql#5165
+are both unmerged), so `memql access` reports them as not reported and
+names the engine issue. No cockpit CODE changes when they land, but the
+binary must be rebuilt at a pin that carries them -- the generated
+descriptor is compiled in. `future_wire_test.go` builds the message the
+records describe, at field numbers DELIBERATELY not the ones they
+illustrate, and runs the real decode against it; that is the only way to
+test a wire this repository cannot yet see.
 
 ## Worker + auth notes
 

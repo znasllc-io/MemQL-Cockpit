@@ -9,6 +9,7 @@
 //	memql cluster remove <name>          Remove a saved cluster
 //	memql login <cluster>                (Re-)authenticate a saved cluster
 //	memql logout <cluster>               Remove cached credentials
+//	memql access [<cluster>]             Show your role, rank, groups and scope
 //	memql creds <subcommand>             Inspect / migrate the credential store
 //	memql worker <subcommand>            Pair / run / configure this machine's worker
 //	memql lint [path]                    Validate a .memql file or DSL tree
@@ -31,6 +32,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/znasllc-io/memql-cockpit/internal/access"
 	"github.com/znasllc-io/memql-cockpit/internal/auth"
 	"github.com/znasllc-io/memql-cockpit/internal/config"
 	"github.com/znasllc-io/memql-cockpit/internal/lint"
@@ -77,6 +79,13 @@ func main() {
 		handleLoginCmd(os.Args[2:])
 	case "logout":
 		handleLogoutCmd(os.Args[2:])
+	case "access":
+		// installCredStore is HANDED OVER rather than called here, so it runs
+		// after argv is validated -- the order every sibling command uses.
+		// Resolving the OS keyring costs D-Bus round trips and can exit
+		// non-zero when MEMQL_COCKPIT_CRED_STORE names an unavailable backend,
+		// which `memql access --help` should not pay for or die of.
+		os.Exit(access.HandleCommand(os.Args[2:], installCredStore))
 	case "worker":
 		worker.HandleCommand(os.Args[2:])
 	case "creds":
@@ -425,6 +434,7 @@ func printUsage() {
 	fmt.Println("  memql cluster remove <name>       Remove a saved cluster")
 	fmt.Println("  memql login <cluster>             (Re-)authenticate a saved cluster")
 	fmt.Println("  memql logout <cluster>            Remove cached credentials")
+	fmt.Println("  memql access [<cluster>] [--json] Show your role, rank, groups and account scope")
 	fmt.Println("  memql creds <subcommand>          Inspect / migrate the credential store")
 	fmt.Println("  memql worker <subcommand>         Pair / run / configure this machine's worker")
 	fmt.Println("  memql lint [path]                 Validate a .memql file or DSL tree")
