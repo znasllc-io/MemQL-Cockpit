@@ -19,6 +19,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/internal/worker/consent"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/inference"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/modelcall"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
@@ -244,7 +245,8 @@ func handleRun(args []string) {
 
 	logger := newLogger(cfg.LogLevel)
 
-	policy, err := tools.LoadPolicy(filepath.Join(filepath.Dir(*configPath), "policy.yaml"))
+	policyPath := filepath.Join(filepath.Dir(*configPath), "policy.yaml")
+	policy, err := tools.LoadPolicy(policyPath)
 	if err != nil {
 		logger.Warn("policy load failed; using defaults", "error", err)
 		policy = tools.DefaultPolicy()
@@ -300,7 +302,13 @@ func handleRun(args []string) {
 	// on the hardware floor and on models.allow, so a machine that
 	// offers nothing advertises nothing and the manager below is never
 	// asked for anything.
-	modelInventory := NewModelInventory(policy)
+	//
+	// ONE discoverer, shared with the pull arm wired into the runner
+	// below: the base URL a cluster-driven pull lands on must be the one
+	// discovery probes, or the model arrives somewhere the inventory
+	// never looks and is never advertised.
+	discoverer := &models.Discoverer{}
+	modelInventory := NewModelInventory(policy, discoverer)
 	calls := modelcall.NewManager(modelcall.Options{
 		Logger:    logger,
 		Inventory: modelInventory,
@@ -334,6 +342,16 @@ func handleRun(args []string) {
 		// changed the consent is honoured at the next reconnect
 		// (record D6: "a change takes effect on the next reconnect").
 		InferenceServe: policy.InferenceServe,
+		// The cluster-driven pull (engine epic memql#5103; the install
+		// wizard's D13) runs the path `memql worker models --pull` runs,
+		// from INSIDE this process -- which is why the reload the CLI
+		// obtains by sending this worker a SIGHUP is a function here.
+		ModelPull: &ModelPullOptions{
+			PolicyPath:   policyPath,
+			OllamaBase:   discoverer.ResolvedOllamaBaseURL,
+			PullAllowed:  policy.ModelsPullAllowed,
+			ReloadPolicy: policy.Reload,
+		},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)

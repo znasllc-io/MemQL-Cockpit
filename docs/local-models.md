@@ -331,6 +331,20 @@ prints. Without the re-advertise request the reload would change the file and
 nothing else, and the model would stay invisible for up to the full two
 minutes plus a tick.
 
+### The cluster can ask for the pull
+
+Since the install wizard (engine epic memql#5218, D13) the OS's **Pull the
+recommended models** sends a `ModelPullStart` down the stream this worker
+already holds open, and the worker runs exactly what `memql worker models
+--pull` runs: the pull against the same Ollama the discoverer found, byte
+counts forwarded as they arrive, `models.allow` written and reloaded on
+success, and the same immediate re-advertise request — so the honest sentence
+is still "the cluster will see it shortly". A refusal is a sentence shown in
+the OS rather than a silent absence: a build without local-model support, or
+`models.pull: false`, answers at once and says so. A cancel from the OS stops
+the download; the bytes already fetched are resumed by the next pull of the
+same model.
+
 ---
 
 ## Serving a call

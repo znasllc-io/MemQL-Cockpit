@@ -347,10 +347,19 @@ exactly like a pull that did nothing. It never bypasses the BUSY guard: a
 reconnect that interrupts a running model call is worse than a stale
 label. Never print "your model is available now".
 
-**The `ModelPull*` wire does not exist yet** (memql#5103). Everything its
-dispatch arm would call is live and reachable through
-`memql worker models --pull`; no arm was written for a message type that
-is not there.
+**The cluster can ask for the pull** (memql#5103; the install wizard's
+D13, memql#5218). The `ModelPullStart` / `Progress` / `End` / `Cancel`
+arm in `internal/worker/modelpull.go` runs the SAME path
+`memql worker models --pull` runs -- `inference.Pull` against the
+discoverer's base URL, `inference.Allow`, then the policy reload the CLI
+gets through SIGHUP (done in-process here, because this arm IS the running
+worker), then `RequestImmediateReadvertise` -- and answers `ok=false` in a
+sentence when this build has no inventory or `models.pull` is off. The End
+goes out BEFORE the re-advertise is requested, because the reconnect that
+re-advertises closes the stream the End rides; a live pull counts as BUSY
+for the same reason, so one model landing cannot cut its sibling's
+download short. A pull is not in `Runner.active` (hours, not a tool
+result) and takes no ModelCall slot (bandwidth, not the runner).
 
 
 ## The scanner, the probe, sharing, and the four modalities
@@ -605,6 +614,11 @@ test a wire this repository cannot yet see.
   default.
 - **worker.yaml** (`~/.memql/worker.yaml`) carries cluster URL, worker token,
   name, capabilities. `memql worker config` prints the effective config.
+- **The cluster pings; the worker pongs** (memql#5218, D11). A `Ping`
+  arrives a few seconds after RegisterAck and then once a minute; the
+  answer echoes `sent_at` VERBATIM (the agent measures against its own
+  clock, so nothing here can shape the figure) and is logged at debug,
+  never info -- one line a minute per machine forever is noise.
 
 ## Testing
 
