@@ -26,6 +26,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VERSION_FILE="$REPO_ROOT/VERSION"
 MAIN_GO="$REPO_ROOT/cmd/memql/main.go"
+# The worker's FALLBACK version, for a build that never calls SetVersion.
+# TestWorkerRegistersTheStampedVersion pins it to VERSION, so a cut that
+# bumped only the two files above failed CI on the release PR (v0.11.0).
+CONNECT_GO="$REPO_ROOT/internal/worker/connect.go"
 
 #=============================================================================
 # FUNCTIONS
@@ -123,7 +127,12 @@ function perform_cut() {
         err "failed to bump the version in $MAIN_GO (expected: var version = \"$next\")"
         exit 1
     fi
-    git -C "$REPO_ROOT" add "$VERSION_FILE" "$MAIN_GO"
+    perl -pi -e "s/^var cockpitVersionValue = \".*\"/var cockpitVersionValue = \"$next\"/" "$CONNECT_GO"
+    if ! grep -q "^var cockpitVersionValue = \"$next\"$" "$CONNECT_GO"; then
+        err "failed to bump the fallback version in $CONNECT_GO (expected: var cockpitVersionValue = \"$next\")"
+        exit 1
+    fi
+    git -C "$REPO_ROOT" add "$VERSION_FILE" "$MAIN_GO" "$CONNECT_GO"
     git -C "$REPO_ROOT" commit -q -m "release: $tag"
     git -C "$REPO_ROOT" tag -a "$tag" -m "$tag"
     log "==> pushing main + $tag"
