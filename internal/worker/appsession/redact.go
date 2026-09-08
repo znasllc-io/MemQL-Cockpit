@@ -39,11 +39,21 @@ func newRedactor(secrets ...string) *redactor {
 	return r
 }
 
-// add registers another secret. Short values are ignored: a redactor that
-// matched a two-character string would scribble over ordinary output, and
-// a bearer is never short.
+// minRedactableSecret is the shortest string this redactor will act on.
+//
+// Named rather than inline because it is a real threshold with a real
+// consequence in BOTH directions, and a reader needs to see which one it
+// buys: below it, a redactor matching a two-character string would
+// scribble over ordinary output until a transcript was unreadable; at or
+// above it, every credential this cockpit handles is covered, because a
+// bearer is never short. The fuzz target references this constant rather
+// than a copy of the number, so the two cannot drift.
+const minRedactableSecret = 8
+
+// add registers another secret. Short values are ignored -- see
+// minRedactableSecret.
 func (r *redactor) add(secret string) {
-	if r == nil || len(secret) < 8 {
+	if r == nil || len(secret) < minRedactableSecret {
 		return
 	}
 	r.mu.Lock()

@@ -177,10 +177,21 @@ func (l *Library) Pull(ctx context.Context, id, dir string) (string, error) {
 		return "", fmt.Errorf("library: pull %s: %w", id, err)
 	}
 	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
+		// BOTH errors, joined. A close on a writable handle is where a
+		// short write finally surfaces -- the copy fails with one
+		// message and the close fails with ENOSPC -- and reporting only
+		// the first sends somebody looking at the network for a full
+		// disk. errors.Join with a nil second argument is just the
+		// first, so the ordinary case reads exactly as it did.
+		closeErr := f.Close()
 		_ = os.Remove(path)
-		return "", fmt.Errorf("library: pull %s: %w", id, err)
+		return "", fmt.Errorf("library: pull %s: %w", id, errors.Join(err, closeErr))
 	}
+	// The close is checked on the success path too, and it is the ONE
+	// that decides whether this file is whole: a buffered write that
+	// could not be flushed reports here and nowhere else, so returning
+	// the path without checking would hand back a truncated input for
+	// an agent to work from.
 	if err := f.Close(); err != nil {
 		_ = os.Remove(path)
 		return "", fmt.Errorf("library: pull %s: %w", id, err)

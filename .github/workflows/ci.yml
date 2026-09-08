@@ -68,6 +68,86 @@ jobs:
         working-directory: memql-cockpit
         run: go test -count=1 -timeout=300s ./...
 
+  # fuzz runs every native Go fuzz target for a short burst.
+  #
+  # THE SEEDS ALREADY RUN IN `go test`; this job is what makes the targets
+  # more than a corpus of hand-written cases. Each one asserts a security
+  # PROPERTY rather than a value -- a filename that cannot escape a
+  # directory, a bearer that cannot survive redaction, two tool calls whose
+  # arguments cannot merge -- and those are properties a fixed set of
+  # examples cannot establish.
+  #
+  # A SHORT BURST PER TARGET, not a long one. This runs on every pull
+  # request, so the budget is bounded and the value is regression pressure:
+  # a change that breaks a property is usually caught in the first seconds,
+  # because the corpus in testdata/ is replayed before any new input is
+  # generated. Long campaigns belong on a schedule, not in front of a
+  # reviewer.
+  #
+  # A crasher is written to testdata/fuzz/<Target>/ by `go test` itself, so
+  # the reproducer is committed with the fix rather than described.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for the ../memql replace directive, pinned)
+        uses: ./memql-cockpit/.github/actions/checkout-memql
+        with:
+          token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.6'
+          cache: true
+          cache-dependency-path: memql-cockpit/go.sum
+      - name: go test -fuzz
+        working-directory: memql-cockpit
+        # One target per invocation -- `go test -fuzz` accepts exactly one --
+        # so the list is walked. It is DISCOVERED rather than hard-coded: a
+        # target added without touching this file still runs, which is the
+        # only arrangement that survives somebody adding one.
+        #
+        # Package and name come from ONE grep pass. A second lookup keyed on
+        # the name would have to put `(f *testing.F)` into a pattern, and
+        # the parentheses are a regex group the moment the shell has
+        # unquoted them -- so the lookup silently matches nothing and
+        # dirname is handed an empty string.
+        #
+        # The pairs are collected into a variable BEFORE the loop, not piped
+        # into it. A `while read` on the right of a pipe runs in a subshell,
+        # so a `failed` set inside one is lost when the subshell exits, and
+        # this job would report success no matter what broke. That is the
+        # one failure a fuzz job must not have.
+        run: |
+          set -euo pipefail
+          found="$(
+            grep -rn --include='*_test.go' -oE '^func Fuzz[A-Za-z0-9_]*' . |
+              awk -F: '{ sub(/^func /, "", $3); sub(/\/[^/]*$/, "", $1); print $1, $3 }' |
+              sort -u
+          )"
+          if [ -z "$found" ]; then
+            echo "no fuzz targets found; the discovery pattern has drifted from the code"
+            exit 1
+          fi
+          echo "found $(echo "$found" | wc -l) fuzz targets"
+          failed=""
+          while read -r pkg target; do
+            [ -n "$target" ] || continue
+            echo "== $pkg $target"
+            if ! go test "$pkg" -run '^$' -fuzz "^${target}$" -fuzztime=20s; then
+              failed="$failed $target"
+            fi
+          done <<EOF
+          $found
+          EOF
+          if [ -n "$failed" ]; then
+            echo "fuzz targets failed:$failed"
+            exit 1
+          fi
+
   # gofmt is a pure source-formatting check: it needs neither the memql sibling
   # checkout (no compilation) nor CGO. Fail the build on any unformatted file.
   gofmt:

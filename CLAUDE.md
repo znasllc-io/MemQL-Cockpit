@@ -531,6 +531,23 @@ first.
 `go test ./...` is the whole suite (single module). The installer shell
 library has its own tests: `bash scripts/install/lib_test.sh`.
 
+**Fuzz targets assert a PROPERTY, never "does not panic."** None of the
+fuzzed functions crashes; their failure mode is returning something
+plausible that is wrong, so a target that only checked for panics would
+find nothing. Each one states the thing that would actually go wrong: a
+filename that escapes a workspace, a session id that escapes the ledger
+directory, a bearer that survives redaction, an argv the printed command
+does not describe, a label attribute forged through `quant`, two tool
+calls whose arguments merge. Seeds run in the ordinary suite; the `fuzz`
+CI job walks every target for 20s. It DISCOVERS them (one grep pass for
+package and name together) rather than listing them, so a target added
+without touching the workflow still runs.
+
+Adding one: put it in `fuzz_test.go` beside the code, and write down the
+property in the doc comment. A crasher is written to
+`testdata/fuzz/<Target>/` by `go test` itself, so the reproducer is
+committed with the fix rather than described.
+
 ## Releases
 
 Tag-driven: `make release` recommends the next semver; `ARGS="--cut"` bumps
