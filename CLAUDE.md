@@ -305,19 +305,41 @@ every path is asserted on the exact SENTENCE it prints, which makes
 changing the words a thing somebody does on purpose. Those sentences are
 the entire product for a person who is blocked.
 
-**Docker on Linux, native Ollama on Apple Silicon, and never sudo.** A
-container has no GPU access on macOS, so Ollama there would serve on the
-CPU -- which is what the hardware floor exists to prevent. The cockpit
-RUNS no sudo command; it may PRINT one for the person, and the copy says
-which is which. There is no ROCm equivalent of the NVIDIA container
-toolkit: for AMD the device nodes are the passthrough and the missing
-piece is `amdgpu-dkms`, so reaching for a symmetric package name produces
-a refusal naming something nobody can install.
+**Native Ollama on both platforms, Docker on Linux only by request, and
+never sudo.** On macOS a container has no GPU access, so Ollama there
+would serve on the CPU -- which is what the hardware floor exists to
+prevent -- and Homebrew installs it natively. On Linux the first design
+(2026-09-06 record, D1) was the `ollama/ollama` container, and it stopped
+on every fresh machine at the same place: the NVIDIA container toolkit is a
+root install, Pop!_OS 24.04 has it in no configured repository, and
+NVIDIA's own steps end in a Docker restart that bounces the k3d cluster
+running beside it. The cockpit runs no sudo, so "install end to end" was
+not something it could do. The 2026-09-08 record (engine
+`docs/superpowers/specs/2026-09-08-linux-native-runtime-and-class-defaults-design.md`,
+D1) makes the Linux default the vendor's release archive unpacked under
+`~/.memql/ollama/runtime` and kept up by a user systemd unit
+(`memql-ollama.service`, loopback only, models in `~/.memql/ollama/models`):
+`internal/worker/inference/stage.go` fetches it, checks it against the
+release's `sha256sum.txt`, refuses any archive entry that would land
+outside the runtime directory, and writes the unit -- all after the same
+one consent as the commands, and before the first command runs. The
+container survives as `--runtime docker`, and every refusal it can produce
+names dropping the flag as the way out. The cockpit still RUNS no sudo
+command; it may PRINT one for the person, and the copy says which is
+which. There is no ROCm equivalent of the NVIDIA container toolkit: for
+AMD the device nodes are the passthrough and the missing piece is
+`amdgpu-dkms` for the container, or the `render`/`video` groups for the
+native runtime, so reaching for a symmetric package name produces a
+refusal naming something nobody can install. The Linux uninstaller
+removes the runtime's unit with the worker's, and `--purge` takes
+`~/.memql/ollama` -- runtime and models -- so a machine is never left
+serving models from something Fleet cannot see.
 
 **The pull is `POST /api/pull`, NOT `ollama pull`**, and the design
 record's plan naming a subprocess was wrong on the platform its own D1
-chose: a Linux machine set up by this command runs the runtime in a
-CONTAINER and has no `ollama` on PATH at all. The HTTP route also gives
+chose: a Linux machine set up by this command runs the runtime from
+`~/.memql/ollama/runtime`, off PATH, or in a CONTAINER under `--runtime
+docker`, and neither puts an `ollama` on PATH. The HTTP route also gives
 exact byte counts where the CLI gives a TTY progress bar. **A 200 is not
 success** -- Ollama emits `pulling manifest` before it fetches anything,
 so a failure arrives inside an already-started 200 body, the same trap

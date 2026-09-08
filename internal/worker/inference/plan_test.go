@@ -41,6 +41,22 @@ func metFloor(detail string) models.FloorVerdict {
 	return models.FloorVerdict{Met: true, Detail: detail}
 }
 
+// nativeFacts is a Linux machine whose user can reach its GPU, laid out
+// under /home/op.
+func nativeFacts(vendor GPUVendor) NativeFacts {
+	n := DefaultNativeFacts("/home/op", "")
+	n.Vendor = vendor
+	n.Devices = true
+	return n
+}
+
+const (
+	nativeNote     = "Ollama will run as your user, from ~/.memql, kept running by a user systemd unit. Nothing here needs root and Docker is not involved; --runtime docker chooses the container instead."
+	dropDockerFlag = " Or drop --runtime docker: without it this command runs Ollama as your user, which needs none of that."
+)
+
+var nativeInstall = []string{"systemctl --user daemon-reload", "systemctl --user enable --now memql-ollama.service"}
+
 // ollamaInventory is what Probe returns when Ollama answered with models.
 func ollamaInventory() models.Inventory {
 	return models.Inventory{
@@ -58,6 +74,10 @@ func TestDecide(t *testing.T) {
 		wantInstall []string
 		wantNote    string
 		wantRefusal string
+		// The native Linux stage: which archives it fetches, or that it
+		// reuses an earlier unpack. Nil and false on every other plan.
+		wantArchives []string
+		wantReuse    bool
 	}{
 		{
 			name: "apple silicon with ollama already installed",
@@ -105,10 +125,133 @@ func TestDecide(t *testing.T) {
 			wantPresent: true,
 		},
 		{
-			name: "linux with docker and the nvidia container toolkit",
+			// THE LINUX DEFAULT (2026-09-08 record, D1): Ollama unpacked
+			// under the person's home and kept up by a user unit. Docker is
+			// not consulted at all -- the facts say it is absent and the
+			// plan does not care.
+			name: "linux with an nvidia gpu, no flag: ollama as the user",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor:    metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Native:   nativeFacts(GPUVendorNVIDIA),
+				Docker:   DockerFacts{Reason: "docker is not on PATH"},
+				FreeDisk: 400 * gib,
+				LookPath: lookPath("systemctl", "nvidia-smi"),
+			},
+			wantRuntime:  RuntimeNative,
+			wantInstall:  nativeInstall,
+			wantArchives: []string{"ollama-linux-amd64.tar.zst"},
+			wantNote:     nativeNote,
+		},
+		{
+			name: "linux with an amd gpu, no flag: the rocm add-on rides along",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor:    metFloor("AMD GPU 0x744c, 24 GB VRAM"),
+				Native:   nativeFacts(GPUVendorAMD),
+				LookPath: lookPath("systemctl"),
+			},
+			wantRuntime:  RuntimeNative,
+			wantInstall:  nativeInstall,
+			wantArchives: []string{"ollama-linux-amd64.tar.zst", "ollama-linux-amd64-rocm.tar.zst"},
+			wantNote:     nativeNote,
+		},
+		{
+			name: "linux on arm64 with an nvidia gpu",
+			host: Host{
+				GOOS: "linux", GOARCH: "arm64",
+				Floor:    metFloor("NVIDIA GH200, 96 GB VRAM"),
+				Native:   nativeFacts(GPUVendorNVIDIA),
+				LookPath: lookPath("systemctl", "nvidia-smi"),
+			},
+			wantRuntime:  RuntimeNative,
+			wantInstall:  nativeInstall,
+			wantArchives: []string{"ollama-linux-arm64.tar.zst"},
+			wantNote:     nativeNote,
+		},
+		{
+			name: "linux on arm64 with an amd gpu",
+			host: Host{
+				GOOS: "linux", GOARCH: "arm64",
+				Floor:    metFloor("AMD GPU 0x744c, 24 GB VRAM"),
+				Native:   nativeFacts(GPUVendorAMD),
+				LookPath: lookPath("systemctl"),
+			},
+			wantRefusal: "Ollama ships its ROCm libraries for x86-64 only, so an AMD GPU on this processor cannot be served natively. Install Ollama yourself from https://ollama.com/download and start it, then run this again.",
+		},
+		{
+			name: "linux on a processor ollama does not ship for",
+			host: Host{
+				GOOS: "linux", GOARCH: "riscv64",
+				Floor:    metFloor("NVIDIA something, 16 GB VRAM"),
+				Native:   nativeFacts(GPUVendorNVIDIA),
+				LookPath: lookPath("systemctl", "nvidia-smi"),
+			},
+			wantRefusal: "Ollama ships no Linux build for this processor, so there is nothing to unpack. Install Ollama yourself from https://ollama.com/download and start it, then run this again.",
+		},
+		{
+			name: "linux without a systemd user manager",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor:    metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Native:   nativeFacts(GPUVendorNVIDIA),
+				LookPath: lookPath("nvidia-smi"),
+			},
+			wantRefusal: "The systemd user manager is not available on this machine (no systemctl on PATH), and it is what keeps Ollama running across logins and reboots. Install Ollama yourself from https://ollama.com/download and start it, or run this again with --runtime docker.",
+		},
+		{
+			// The platform file's own sentence, verbatim: it saw the miss.
+			name: "linux whose user cannot open the gpu's device nodes",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor: metFloor("AMD GPU 0x744c, 24 GB VRAM"),
+				Native: NativeFacts{
+					Vendor:        GPUVendorAMD,
+					DevicesReason: "This machine has an AMD GPU and your user cannot open /dev/kfd and a /dev/dri render node. Add yourself to the render and video groups with sudo usermod -aG render,video $USER, log back in, and run this again.",
+				},
+				LookPath: lookPath("systemctl"),
+			},
+			wantRefusal: "This machine has an AMD GPU and your user cannot open /dev/kfd and a /dev/dri render node. Add yourself to the render and video groups with sudo usermod -aG render,video $USER, log back in, and run this again.",
+		},
+		{
+			// Reachable only by hand: a Linux machine that met the floor was
+			// seen by one of the two probes. Decide is total anyway.
+			name: "linux native with no gpu the probes recognised",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Floor:    metFloor("some GPU, 16 GB VRAM"),
+				Native:   DefaultNativeFacts("/home/op", ""),
+				LookPath: lookPath("systemctl"),
+			},
+			wantRefusal: "No GPU this command can drive was found for the native runtime: neither nvidia-smi nor the amdgpu driver answered. Install the vendor's driver and run this again.",
+		},
+		{
+			// An earlier run unpacked the runtime and stopped before the
+			// unit was enabled. Nothing is fetched twice; the unit is
+			// written and the commands run.
+			name: "linux with the runtime unpacked by an interrupted earlier run",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
 				Floor: metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Native: func() NativeFacts {
+					n := nativeFacts(GPUVendorNVIDIA)
+					n.Installed = true
+					return n
+				}(),
+				LookPath: lookPath("systemctl", "nvidia-smi"),
+			},
+			wantRuntime: RuntimeNative,
+			wantInstall: nativeInstall,
+			wantReuse:   true,
+			wantNote:    nativeNote,
+		},
+		{
+			// --runtime docker: the original Linux path, unchanged.
+			name: "linux asked for docker, with the nvidia container toolkit",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Runtime: RuntimeDocker,
+				Floor:   metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
 				Docker: DockerFacts{
 					CLIPresent: true, Present: true, Version: "29.6.1",
 					GPUVendor: GPUVendorNVIDIA, GPUToolkit: true,
@@ -120,10 +263,11 @@ func TestDecide(t *testing.T) {
 			wantInstall: []string{"docker run -d --name ollama --restart unless-stopped --gpus=all -v ollama:/root/.ollama -p 127.0.0.1:11434:11434 ollama/ollama"},
 		},
 		{
-			name: "linux with docker and the rocm device nodes",
+			name: "linux asked for docker, with the rocm device nodes",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
-				Floor: metFloor("AMD GPU 0x744c, 24 GB VRAM"),
+				Runtime: RuntimeDocker,
+				Floor:   metFloor("AMD GPU 0x744c, 24 GB VRAM"),
 				Docker: DockerFacts{
 					CLIPresent: true, Present: true, Version: "29.6.1",
 					GPUVendor: GPUVendorAMD, GPUToolkit: true,
@@ -135,74 +279,95 @@ func TestDecide(t *testing.T) {
 			wantInstall: []string{"docker run -d --name ollama --restart unless-stopped --device /dev/kfd --device /dev/dri -v ollama:/root/.ollama -p 127.0.0.1:11434:11434 ollama/ollama:rocm"},
 		},
 		{
-			name: "linux with docker and no nvidia container toolkit",
+			// Every Docker refusal names the way out, because each is a
+			// root install the default path does not need.
+			name: "linux asked for docker, without the nvidia container toolkit",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
-				Floor: metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Runtime: RuntimeDocker,
+				Floor:   metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
 				Docker: DockerFacts{
 					CLIPresent: true, Present: true, Version: "29.6.1",
 					GPUVendor: GPUVendorNVIDIA, GPUToolkit: false,
 				},
 				LookPath: lookPath("docker", "nvidia-smi"),
 			},
-			wantRefusal: "Docker is installed but cannot pass this machine's NVIDIA GPU into a container. Install the nvidia-container-toolkit package (see https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), run sudo nvidia-ctk runtime configure --runtime=docker and sudo systemctl restart docker, then run this again.",
+			wantRefusal: "Docker is installed but cannot pass this machine's NVIDIA GPU into a container. Install the nvidia-container-toolkit package (see https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), run sudo nvidia-ctk runtime configure --runtime=docker and sudo systemctl restart docker, then run this again." + dropDockerFlag,
 		},
 		{
-			name: "linux with docker and no rocm device nodes",
+			name: "linux asked for docker, without the rocm device nodes",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
-				Floor: metFloor("AMD GPU 0x744c, 24 GB VRAM"),
+				Runtime: RuntimeDocker,
+				Floor:   metFloor("AMD GPU 0x744c, 24 GB VRAM"),
 				Docker: DockerFacts{
 					CLIPresent: true, Present: true, Version: "29.6.1",
 					GPUVendor: GPUVendorAMD, GPUToolkit: false,
 				},
 				LookPath: lookPath("docker"),
 			},
-			wantRefusal: "Docker is installed but cannot pass this machine's AMD GPU into a container, because /dev/kfd is missing. Install the amdgpu-dkms driver (see https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html) and run this again.",
+			wantRefusal: "Docker is installed but cannot pass this machine's AMD GPU into a container, because /dev/kfd is missing. Install the amdgpu-dkms driver (see https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html) and run this again." + dropDockerFlag,
 		},
 		{
-			name: "linux with docker and a GPU neither probe recognised",
+			name: "linux asked for docker, with a GPU neither probe recognised",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
-				Floor: metFloor("some GPU, 16 GB VRAM"),
+				Runtime: RuntimeDocker,
+				Floor:   metFloor("some GPU, 16 GB VRAM"),
 				Docker: DockerFacts{
 					CLIPresent: true, Present: true, Version: "29.6.1",
 					GPUVendor: GPUVendorUnknown, GPUToolkit: false,
 				},
 				LookPath: lookPath("docker"),
 			},
-			wantRefusal: "Docker is installed and no GPU passthrough could be established for it. Install the nvidia-container-toolkit package for an NVIDIA GPU, or the amdgpu-dkms driver for an AMD GPU, then run this again.",
+			wantRefusal: "Docker is installed and no GPU passthrough could be established for it. Install the nvidia-container-toolkit package for an NVIDIA GPU, or the amdgpu-dkms driver for an AMD GPU, then run this again." + dropDockerFlag,
 		},
 		{
-			name: "linux without docker",
+			name: "linux asked for docker, without docker",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
+				Runtime:  RuntimeDocker,
 				Floor:    metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
 				Docker:   DockerFacts{Reason: "docker is not on PATH"},
 				LookPath: lookPath("nvidia-smi"),
 			},
-			wantRefusal: "Docker is not installed, and this machine runs its model runtime in a container. Install Docker Engine from https://docs.docker.com/engine/install/ and run this again.",
+			wantRefusal: "Docker is not installed, and this machine runs its model runtime in a container. Install Docker Engine from https://docs.docker.com/engine/install/ and run this again." + dropDockerFlag,
 		},
 		{
-			name: "linux with the docker command and a daemon that did not answer",
+			name: "linux asked for docker, with the docker command and a daemon that did not answer",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
-				Floor: metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Runtime: RuntimeDocker,
+				Floor:   metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
 				Docker: DockerFacts{
 					CLIPresent: true,
 					Reason:     "permission denied while trying to connect to the Docker daemon socket",
 				},
 				LookPath: lookPath("docker", "nvidia-smi"),
 			},
-			wantRefusal: "The docker command is installed and the Docker daemon did not answer. Start it with sudo systemctl start docker, or add your user to the docker group with sudo usermod -aG docker $USER and log back in, then run this again.",
+			wantRefusal: "The docker command is installed and the Docker daemon did not answer. Start it with sudo systemctl start docker, or add your user to the docker group with sudo usermod -aG docker $USER and log back in, then run this again." + dropDockerFlag,
 		},
 		{
-			// The runtime check runs before the Docker check: a machine
-			// already serving needs nothing installed, so a missing Docker
-			// is not a reason to refuse it.
+			// The runtime check runs before anything else on both Linux
+			// paths: a machine already serving needs nothing installed, so
+			// a missing Docker, or a missing systemd, is not a reason to
+			// refuse it.
 			name: "linux already serving ollama without docker",
 			host: Host{
 				GOOS: "linux", GOARCH: "amd64",
+				Floor:    metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
+				Ollama:   ollamaInventory(),
+				Docker:   DockerFacts{Reason: "docker is not on PATH"},
+				LookPath: lookPath(),
+			},
+			wantRuntime: RuntimeNative,
+			wantPresent: true,
+		},
+		{
+			name: "linux asked for docker while already serving",
+			host: Host{
+				GOOS: "linux", GOARCH: "amd64",
+				Runtime:  RuntimeDocker,
 				Floor:    metFloor("NVIDIA GeForce RTX 4090, 24 GB VRAM"),
 				Ollama:   ollamaInventory(),
 				Docker:   DockerFacts{Reason: "docker is not on PATH"},
@@ -312,6 +477,23 @@ func TestDecide(t *testing.T) {
 					t.Errorf("Install[%d] =\n  %q\nwant\n  %q", i, got.Install[i], tt.wantInstall[i])
 				}
 			}
+			var archives []string
+			reuse := false
+			if got.Stage != nil {
+				reuse = got.Stage.Reuse
+				for _, a := range got.Stage.Archives {
+					archives = append(archives, a.Name)
+				}
+			}
+			if strings.Join(archives, ",") != strings.Join(tt.wantArchives, ",") {
+				t.Errorf("Stage archives = %q, want %q", archives, tt.wantArchives)
+			}
+			if reuse != tt.wantReuse {
+				t.Errorf("Stage.Reuse = %v, want %v", reuse, tt.wantReuse)
+			}
+			if got.Stage != nil && got.Refusal != "" {
+				t.Error("a refusal must not carry a stage")
+			}
 			// Every case in this table leaves Host.Hardware zero, so
 			// every one classes `unsupported` and takes the smallest
 			// set. The assertion is here rather than in
@@ -339,28 +521,44 @@ func TestDecide(t *testing.T) {
 // one a table of happy cases would never catch.
 func TestDecideAlwaysSaysSomething(t *testing.T) {
 	goos := []string{"darwin", "linux", "windows", "freebsd", ""}
+	arches := []string{"amd64", "arm64", "riscv64"}
 	vendors := []GPUVendor{GPUVendorUnknown, GPUVendorNVIDIA, GPUVendorAMD}
-	paths := [][]string{{}, {"brew"}, {"docker"}, {"brew", "ollama"}, {"docker", "nvidia-smi"}}
+	paths := [][]string{{}, {"brew"}, {"docker"}, {"brew", "ollama"}, {"docker", "nvidia-smi"}, {"systemctl"}, {"systemctl", "nvidia-smi"}}
+	prefs := []Runtime{RuntimeNone, RuntimeNative, RuntimeDocker}
 
 	for _, goosName := range goos {
-		for _, met := range []bool{true, false} {
-			for _, vendor := range vendors {
-				for _, toolkit := range []bool{true, false} {
-					for _, cli := range []bool{true, false} {
-						for _, daemon := range []bool{true, false} {
-							for _, p := range paths {
-								h := Host{
-									GOOS: goosName, GOARCH: "amd64",
-									Floor:    models.FloorVerdict{Met: met, Reason: "a floor sentence."},
-									Docker:   DockerFacts{CLIPresent: cli, Present: cli && daemon, GPUVendor: vendor, GPUToolkit: toolkit},
-									LookPath: lookPath(p...),
-								}
-								if met {
-									h.Floor.Reason = ""
-								}
-								plan := Decide(h)
-								if plan.Refusal == "" && !plan.RuntimePresent && len(plan.Install) == 0 {
-									t.Fatalf("silent plan for %+v", h)
+		for _, arch := range arches {
+			for _, met := range []bool{true, false} {
+				for _, vendor := range vendors {
+					for _, toolkit := range []bool{true, false} {
+						for _, devices := range []bool{true, false} {
+							for _, cli := range []bool{true, false} {
+								for _, daemon := range []bool{true, false} {
+									for _, pref := range prefs {
+										for _, p := range paths {
+											native := DefaultNativeFacts("/home/op", "")
+											native.Vendor = vendor
+											native.Devices = devices
+											h := Host{
+												GOOS: goosName, GOARCH: arch,
+												Runtime:  pref,
+												Floor:    models.FloorVerdict{Met: met, Reason: "a floor sentence."},
+												Docker:   DockerFacts{CLIPresent: cli, Present: cli && daemon, GPUVendor: vendor, GPUToolkit: toolkit},
+												Native:   native,
+												LookPath: lookPath(p...),
+											}
+											if met {
+												h.Floor.Reason = ""
+											}
+											plan := Decide(h)
+											if plan.Refusal == "" && !plan.RuntimePresent && len(plan.Install) == 0 {
+												t.Fatalf("silent plan for %+v", h)
+											}
+											if plan.Stage != nil && plan.Refusal != "" {
+												t.Fatalf("a refusal with a stage for %+v", h)
+											}
+										}
+									}
 								}
 							}
 						}
@@ -383,6 +581,15 @@ func TestSentencesAreReadableInATerminal(t *testing.T) {
 		refusalNoNVIDIAToolkit,
 		refusalNoROCmDevices,
 		refusalNoGPUPassthrough,
+		noteDropDockerFlag,
+		noteNativeOnLinux,
+		refusalNoSystemdUser,
+		refusalNoNativeArchive,
+		refusalNoROCmOnArm,
+		refusalNVIDIADriverNotLoaded,
+		refusalNVIDIADevicesNotAccessible,
+		refusalAMDDevicesNotAccessible,
+		refusalNativeGPUUnknown,
 		unsupportedPlatform("freebsd"),
 		unsupportedPlatform(""),
 	}

@@ -53,6 +53,14 @@ readonly SERVICE_LABEL_DARWIN="com.znasllc.memql-worker" \
          SERVICE_LABEL_LINUX="memql-worker" \
          LEGACY_LABEL_LINUX="memql-cockpit-worker"
 
+# The model runtime's own user unit on Linux, written by `memql worker
+# setup --inference` (internal/worker/inference/stage.go, OllamaUnitName)
+# rather than by an installer, and removed by the Linux uninstaller so a
+# machine is not left serving models from a runtime nobody can see in
+# Fleet. It has no macOS twin: there the runtime is Homebrew's service.
+# shellcheck disable=SC2034  # read by uninstall-linux.sh, which sources this file
+readonly OLLAMA_LABEL_LINUX="memql-ollama"
+
 # Detect host os ("darwin" or "linux") and arch ("amd64" or "arm64").
 function detect_os() {
     local raw
@@ -612,6 +620,10 @@ function purge_worker_state() {
     remove_path_if_present "${HOME}/.memql/policy.yaml"
     remove_tree_if_present "$state_dir"
     remove_path_if_present "${HOME}/.memql/worker.sock"
+    # The native model runtime and its models (Linux): gigabytes under
+    # the fence, kept without --purge because the models were pulled on
+    # purpose and cost hours to pull again.
+    remove_tree_if_present "${HOME}/.memql/ollama"
     remove_memql_home_if_empty
 }
 
@@ -621,7 +633,7 @@ function purge_worker_state() {
 function report_kept_state() {
     local state_dir="$1"
     local path
-    for path in "${HOME}/.memql/policy.yaml" "$state_dir"; do
+    for path in "${HOME}/.memql/policy.yaml" "$state_dir" "${HOME}/.memql/ollama"; do
         if [[ -e "$path" ]]; then
             echo "INFO: kept $path (re-run with --purge to remove it)"
             record_kept "$path (--purge removes it)"

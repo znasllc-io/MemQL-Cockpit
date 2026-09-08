@@ -6,16 +6,19 @@
 # Remove memql-worker from a Linux machine: install-linux.sh run
 # backwards, in one line, because an install that is one line and an
 # uninstall that is a runbook leaves the token on machines nobody
-# finishes cleaning up. Stops and removes the user-systemd unit,
-# removes the binary and its symlink, removes worker.yaml (the token)
-# and worker.env; --purge takes policy.yaml, the state dir and an
-# emptied ~/.memql as well. Every step says what it did, or that there
-# was nothing to do, and nothing here prompts except sudo.
+# finishes cleaning up. Stops and removes the user-systemd units -- the
+# worker's and, when `memql worker setup --inference` wrote one, the
+# model runtime's (memql-ollama.service) -- removes the binary and its
+# symlink, removes worker.yaml (the token) and worker.env; --purge takes
+# policy.yaml, the state dir, the native model runtime and its models
+# under ~/.memql/ollama, and an emptied ~/.memql as well. Every step says
+# what it did, or that there was nothing to do, and nothing here prompts
+# except sudo.
 #
 # Usage:
 #   ./uninstall-linux.sh [--purge] [--user-local]
 #
-# What this never touches: anything outside ~/.memql, the two systemd
+# What this never touches: anything outside ~/.memql, the three systemd
 # unit files, and the binary paths under the chosen prefix. The
 # machine's registration on the cluster is revoked from MemQL OS
 # (Fleet -> Machines), not from here -- by the time this script could
@@ -63,19 +66,22 @@ function show_help() {
     cat << EOF
 Usage: $(basename "$0") [options]
 
-Removes memql-worker from this machine: the user-systemd unit, the
-binary and its symlink, and ~/.memql/worker.yaml (the token) and
-worker.env. Nothing outside ~/.memql, the unit files and the binary
-path is touched.
+Removes memql-worker from this machine: the user-systemd units (the
+worker's, and the model runtime's memql-ollama.service when
+\`memql worker setup --inference\` wrote one), the binary and its
+symlink, and ~/.memql/worker.yaml (the token) and worker.env. Nothing
+outside ~/.memql, the unit files and the binary path is touched.
 
 Options:
     --user-local              Remove a --user-local install from
                               \$HOME/.memql/bin instead of the default
                               /usr/local/bin (which needs sudo).
     --purge                   Also remove ~/.memql/policy.yaml, the state
-                              dir (logs, ledgers) and, once it is empty,
-                              ~/.memql itself. Without it they are kept,
-                              and the script says so.
+                              dir (logs, ledgers), the native model
+                              runtime and its models under ~/.memql/ollama
+                              and, once it is empty, ~/.memql itself.
+                              Without it they are kept, and the script
+                              says so.
     --help                    Print this help
 
 The machine's registration on the cluster is revoked from MemQL OS
@@ -104,8 +110,13 @@ function parse_args() {
     done
 }
 
-# remove_systemd_unit stops, disables and removes the user unit, the
-# current name and the pre-rename one. The disable is attempted and
+# remove_systemd_unit stops, disables and removes the user units: the
+# worker's current name, its pre-rename one, and the model runtime's
+# (memql-ollama.service, written by `memql worker setup --inference`
+# and by nothing else -- without this line a --purge would delete the
+# runtime out from under a unit still trying to restart it). The
+# runtime's unit goes BEFORE the runtime directory does, for that
+# reason. The disable is attempted and
 # REPORTED on its own: a machine with no user manager running (an SSH
 # session without lingering, a container) fails it, and the unit file
 # still has to go, so that failure is a WARN and not a stop. A machine
@@ -119,13 +130,13 @@ function remove_systemd_unit() {
         echo "INFO: systemctl not found; not stopping the unit (the unit files are still removed)"
     fi
     local label unit path
-    for label in "$SERVICE_LABEL_LINUX" "$LEGACY_LABEL_LINUX"; do
+    for label in "$SERVICE_LABEL_LINUX" "$LEGACY_LABEL_LINUX" "$OLLAMA_LABEL_LINUX"; do
         unit="${label}.service"
         path="${unit_dir}/${unit}"
         if [[ ! -f "$path" ]]; then
             # The legacy unit is absent on every machine installed after
-            # the rename; only the current one is worth a line.
-            if [[ "$label" == "$SERVICE_LABEL_LINUX" ]]; then
+            # the rename; only the current ones are worth a line.
+            if [[ "$label" != "$LEGACY_LABEL_LINUX" ]]; then
                 echo "INFO: ${path} not present; no unit to stop"
             fi
             continue

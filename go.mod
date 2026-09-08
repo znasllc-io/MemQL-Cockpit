@@ -43,6 +43,7 @@ require (
 	github.com/gsterjov/go-libsecret v0.0.0-20161001094733-a6f4afe4910c // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
+	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/lib/pq v1.12.3 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260324052639-156f7da3f749 // indirect
 	github.com/mtibben/percent v0.2.1 // indirect

@@ -19,3 +19,9 @@ func gatherPlatform(_ context.Context) platformFacts {
 		},
 	}
 }
+
+// availableBytes is the free-space reading the stage consults before a
+// download. No platform other than macOS and Linux serves models, so
+// nothing here is ever staged; zero is "not established", which refuses
+// nothing, and exists so stage.go compiles on every platform.
+func availableBytes(string) uint64 { return 0 }

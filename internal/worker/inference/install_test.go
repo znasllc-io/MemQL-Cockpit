@@ -39,7 +39,7 @@ func TestInstallRuntimeRunsThePlansCommandsInOrder(t *testing.T) {
 	rec := &recorder{}
 	p := Plan{Runtime: RuntimeNative, Install: []string{installBrewOllama, installBrewOllamaStart}}
 
-	if err := InstallRuntime(context.Background(), p, yes, rec.run); err != nil {
+	if err := InstallRuntime(context.Background(), p, yes, rec.run, nil); err != nil {
 		t.Fatalf("InstallRuntime: %v", err)
 	}
 	want := [][]string{
@@ -85,7 +85,7 @@ func TestInstallRuntimeSplitsTheDockerLineWithoutAShell(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := &recorder{}
 			p := Plan{Runtime: RuntimeDocker, Install: []string{tc.line}}
-			if err := InstallRuntime(context.Background(), p, yes, rec.run); err != nil {
+			if err := InstallRuntime(context.Background(), p, yes, rec.run, nil); err != nil {
 				t.Fatalf("InstallRuntime: %v", err)
 			}
 			if !reflect.DeepEqual(rec.ran, [][]string{tc.want}) {
@@ -102,7 +102,7 @@ func TestInstallRuntimeWithARefusingConsentRunsNothing(t *testing.T) {
 	rec := &recorder{}
 	p := Plan{Runtime: RuntimeNative, Install: []string{installBrewOllama, installBrewOllamaStart}}
 
-	err := InstallRuntime(context.Background(), p, no, rec.run)
+	err := InstallRuntime(context.Background(), p, no, rec.run, nil)
 	if !errors.Is(err, ErrConsentRefused) {
 		t.Fatalf("err = %v, want ErrConsentRefused", err)
 	}
@@ -121,7 +121,7 @@ func TestInstallRuntimeWithNoConsentFunctionRunsNothing(t *testing.T) {
 	rec := &recorder{}
 	p := Plan{Runtime: RuntimeDocker, Install: []string{installDockerNVIDIA}}
 
-	err := InstallRuntime(context.Background(), p, nil, rec.run)
+	err := InstallRuntime(context.Background(), p, nil, rec.run, nil)
 	if !errors.Is(err, ErrConsentRefused) {
 		t.Fatalf("err = %v, want ErrConsentRefused", err)
 	}
@@ -143,7 +143,7 @@ func TestInstallRuntimeAsksOnceWithEveryCommand(t *testing.T) {
 	}
 	p := Plan{Runtime: RuntimeNative, Install: []string{installBrewOllama, installBrewOllamaStart}}
 
-	if err := InstallRuntime(context.Background(), p, consent, rec.run); err != nil {
+	if err := InstallRuntime(context.Background(), p, consent, rec.run, nil); err != nil {
 		t.Fatalf("InstallRuntime: %v", err)
 	}
 	if len(asked) != 1 {
@@ -162,7 +162,7 @@ func TestInstallRuntimeStopsAtTheFirstFailure(t *testing.T) {
 	rec := &recorder{fail: map[int]error{0: boom}}
 	p := Plan{Runtime: RuntimeNative, Install: []string{installBrewOllama, installBrewOllamaStart}}
 
-	err := InstallRuntime(context.Background(), p, yes, rec.run)
+	err := InstallRuntime(context.Background(), p, yes, rec.run, nil)
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v, want the runner's own error", err)
 	}
@@ -183,7 +183,7 @@ func TestInstallRuntimeNeverRunsSudo(t *testing.T) {
 	rec := &recorder{}
 	p := Plan{Runtime: RuntimeDocker, Install: []string{"sudo systemctl start docker"}}
 
-	err := InstallRuntime(context.Background(), p, yes, rec.run)
+	err := InstallRuntime(context.Background(), p, yes, rec.run, nil)
 	if !errors.Is(err, ErrSudo) {
 		t.Fatalf("err = %v, want ErrSudo", err)
 	}
@@ -209,7 +209,7 @@ func TestInstallRuntimeRefusesACommandThatNeedsAShell(t *testing.T) {
 	} {
 		rec := &recorder{}
 		p := Plan{Runtime: RuntimeNative, Install: []string{line}}
-		err := InstallRuntime(context.Background(), p, yes, rec.run)
+		err := InstallRuntime(context.Background(), p, yes, rec.run, nil)
 		if !errors.Is(err, ErrUnsafeCommand) {
 			t.Errorf("%q: err = %v, want ErrUnsafeCommand", line, err)
 		}
@@ -229,7 +229,7 @@ func TestInstallRuntimeChecksEveryCommandBeforeItAsks(t *testing.T) {
 	consent := func([]string) bool { asked = true; return true }
 	p := Plan{Runtime: RuntimeNative, Install: []string{installBrewOllama, "brew services start ollama && echo done"}}
 
-	if err := InstallRuntime(context.Background(), p, consent, rec.run); !errors.Is(err, ErrUnsafeCommand) {
+	if err := InstallRuntime(context.Background(), p, consent, rec.run, nil); !errors.Is(err, ErrUnsafeCommand) {
 		t.Fatalf("err = %v, want ErrUnsafeCommand", err)
 	}
 	if asked {
@@ -249,7 +249,7 @@ func TestInstallRuntimeOnAPlanThatRefuses(t *testing.T) {
 	asked := false
 	p := Plan{Refusal: refusalNoDocker}
 
-	err := InstallRuntime(context.Background(), p, func([]string) bool { asked = true; return true }, rec.run)
+	err := InstallRuntime(context.Background(), p, func([]string) bool { asked = true; return true }, rec.run, nil)
 	if !errors.Is(err, ErrRefused) {
 		t.Fatalf("err = %v, want ErrRefused", err)
 	}
@@ -270,7 +270,7 @@ func TestInstallRuntimeIsANoOpWhenTheRuntimeIsPresent(t *testing.T) {
 	asked := false
 	p := Plan{Runtime: RuntimeNative, RuntimePresent: true}
 
-	if err := InstallRuntime(context.Background(), p, func([]string) bool { asked = true; return true }, rec.run); err != nil {
+	if err := InstallRuntime(context.Background(), p, func([]string) bool { asked = true; return true }, rec.run, nil); err != nil {
 		t.Fatalf("InstallRuntime: %v", err)
 	}
 	if asked || len(rec.ran) != 0 {
@@ -284,7 +284,7 @@ func TestInstallRuntimeIsANoOpWhenTheRuntimeIsPresent(t *testing.T) {
 // must not report a successful install of nothing.
 func TestInstallRuntimeOnASilentPlan(t *testing.T) {
 	rec := &recorder{}
-	if err := InstallRuntime(context.Background(), Plan{Runtime: RuntimeNative}, yes, rec.run); !errors.Is(err, ErrNothingToRun) {
+	if err := InstallRuntime(context.Background(), Plan{Runtime: RuntimeNative}, yes, rec.run, nil); !errors.Is(err, ErrNothingToRun) {
 		t.Fatalf("err = %v, want ErrNothingToRun", err)
 	}
 }
@@ -298,7 +298,7 @@ func TestInstallRuntimeOnACancelledContext(t *testing.T) {
 	rec := &recorder{}
 	p := Plan{Runtime: RuntimeNative, Install: []string{installBrewOllama}}
 
-	if err := InstallRuntime(ctx, p, yes, rec.run); !errors.Is(err, context.Canceled) {
+	if err := InstallRuntime(ctx, p, yes, rec.run, nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 	if len(rec.ran) != 0 {
@@ -312,7 +312,7 @@ func TestInstallRuntimeOnACancelledContext(t *testing.T) {
 // in it: plan_test.go asserts the STRING, and only this asserts that the
 // string is one this process can execute without a shell.
 func TestEveryPlanThisPackageProducesIsRunnable(t *testing.T) {
-	for _, line := range []string{installBrewOllama, installBrewOllamaStart, installDockerNVIDIA, installDockerAMD} {
+	for _, line := range []string{installBrewOllama, installBrewOllamaStart, installDockerNVIDIA, installDockerAMD, installSystemdReload, installSystemdEnable} {
 		argv, err := splitCommand(line)
 		if err != nil {
 			t.Errorf("%q: %v", line, err)
@@ -380,4 +380,70 @@ func TestInstallHelperProcess(t *testing.T) {
 		code = 7
 	}
 	os.Exit(code)
+}
+
+// TestInstallRuntimeStagesBeforeTheFirstCommand. The unit file and the
+// archive are what `systemctl --user enable --now` starts; enabling a
+// unit whose file is not there yet is the half-built machine the ordering
+// exists to prevent.
+func TestInstallRuntimeStagesBeforeTheFirstCommand(t *testing.T) {
+	var events []string
+	run := func(_ context.Context, argv []string) error {
+		events = append(events, "run "+strings.Join(argv, " "))
+		return nil
+	}
+	stage := func(_ context.Context, s Stage, _ func(Progress)) error {
+		events = append(events, "stage "+s.RuntimeDir)
+		return nil
+	}
+	p := Plan{
+		Runtime: RuntimeNative,
+		Install: []string{installSystemdReload, installSystemdEnable},
+		Stage:   &Stage{RuntimeDir: "/home/op/.memql/ollama/runtime"},
+	}
+	if err := InstallRuntime(context.Background(), p, yes, run, stage); err != nil {
+		t.Fatalf("InstallRuntime: %v", err)
+	}
+	want := []string{
+		"stage /home/op/.memql/ollama/runtime",
+		"run systemctl --user daemon-reload",
+		"run systemctl --user enable --now memql-ollama.service",
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Errorf("events %v, want %v", events, want)
+	}
+}
+
+// TestInstallRuntimeAFailedStageRunsNoCommand. A checksum that did not
+// match, a download that stopped: no unit is enabled over it.
+func TestInstallRuntimeAFailedStageRunsNoCommand(t *testing.T) {
+	boom := errors.New("the downloaded archive does not match the release's checksum")
+	rec := &recorder{}
+	stage := func(context.Context, Stage, func(Progress)) error { return boom }
+	p := Plan{Runtime: RuntimeNative, Install: []string{installSystemdReload, installSystemdEnable}, Stage: &Stage{}}
+
+	err := InstallRuntime(context.Background(), p, yes, rec.run, stage)
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the stage's own error", err)
+	}
+	if len(rec.ran) != 0 {
+		t.Errorf("ran %v after a failed stage, want nothing", rec.ran)
+	}
+}
+
+// TestInstallRuntimeStagesNothingWithoutConsent. The stage is a 1.4 GB
+// download and a file under ~/.config; both are behind the same yes as
+// the commands.
+func TestInstallRuntimeStagesNothingWithoutConsent(t *testing.T) {
+	staged := false
+	stage := func(context.Context, Stage, func(Progress)) error { staged = true; return nil }
+	p := Plan{Runtime: RuntimeNative, Install: []string{installSystemdReload}, Stage: &Stage{}}
+	for _, consent := range []func([]string) bool{no, nil} {
+		if err := InstallRuntime(context.Background(), p, consent, (&recorder{}).run, stage); !errors.Is(err, ErrConsentRefused) {
+			t.Fatalf("err = %v, want ErrConsentRefused", err)
+		}
+	}
+	if staged {
+		t.Error("staged without consent")
+	}
 }

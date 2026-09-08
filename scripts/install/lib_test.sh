@@ -554,6 +554,12 @@ function uninstall_fixture() {
             mkdir -p "${home}/.config/systemd/user"
             printf '[Unit]\n' > "${home}/.config/systemd/user/${SERVICE_LABEL_LINUX}.service"
             : > "${home}/.memql/worker.env"
+            # A machine `memql worker setup --inference` set up: the
+            # runtime's unit, its unpacked binary, and a pulled model.
+            printf '[Unit]\n' > "${home}/.config/systemd/user/${OLLAMA_LABEL_LINUX}.service"
+            mkdir -p "${home}/.memql/ollama/runtime/bin" "${home}/.memql/ollama/models/blobs"
+            printf '#!/bin/sh\nexit 0\n' > "${home}/.memql/ollama/runtime/bin/ollama"
+            : > "${home}/.memql/ollama/models/blobs/sha256-fixture"
             ;;
     esac
 }
@@ -636,6 +642,18 @@ for _platform in mac linux; do
         else
             fail "$_un --user-local left worker.env behind"
         fi
+        # The model runtime's unit goes with the worker's; the runtime and
+        # its models stay without --purge, and the summary names them.
+        if [[ ! -e "${_uh}/.config/systemd/user/${OLLAMA_LABEL_LINUX}.service" ]]; then
+            pass "$_un removes ${OLLAMA_LABEL_LINUX}.service"
+        else
+            fail "$_un left ${OLLAMA_LABEL_LINUX}.service behind"
+        fi
+        if [[ -f "${_uh}/.memql/ollama/runtime/bin/ollama" && "$_out" == *"kept ${_uh}/.memql/ollama"* ]]; then
+            pass "$_un keeps the model runtime and its models without --purge, and says so"
+        else
+            fail "$_un removed ~/.memql/ollama without --purge, or did not name it; got: $_out"
+        fi
     fi
     if [[ -f "${_uh}/.memql/policy.yaml" && -f "${_uh}/.memql/state/worker.log" ]]; then
         pass "$_un keeps policy.yaml and the state dir without --purge"
@@ -660,6 +678,13 @@ for _platform in mac linux; do
         pass "$_un --purge removes policy.yaml and the state dir"
     else
         fail "$_un --purge left policy.yaml or the state dir: $(ls -laR "${_ph}/.memql" 2>&1)"
+    fi
+    if [[ "$_platform" == "linux" ]]; then
+        if [[ ! -e "${_ph}/.memql/ollama" ]]; then
+            pass "$_un --purge removes the model runtime and its models"
+        else
+            fail "$_un --purge left ~/.memql/ollama: $(ls -laR "${_ph}/.memql/ollama" 2>&1)"
+        fi
     fi
     if [[ ! -e "${_ph}/.memql" ]]; then
         pass "$_un --purge removes an emptied ~/.memql"

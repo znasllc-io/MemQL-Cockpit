@@ -76,7 +76,10 @@ var (
 //
 // run may be nil, which takes ExecRunner(os.Stdout): the person is
 // watching, and `brew install ollama` is worth watching.
-func InstallRuntime(ctx context.Context, p Plan, consent func(commands []string) bool, run Runner) error {
+//
+// stage runs the plan's Stage, when it has one, between the consent and
+// the first command; nil takes StageRuntime, which fetches for real.
+func InstallRuntime(ctx context.Context, p Plan, consent func(commands []string) bool, run Runner, stage Stager) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -106,6 +109,18 @@ func InstallRuntime(ctx context.Context, p Plan, consent func(commands []string)
 
 	if consent == nil || !consent(p.Install) {
 		return ErrConsentRefused
+	}
+	// The stage runs FIRST, after the one consent: the archive and the
+	// unit file are what `systemctl --user enable --now` starts, and
+	// enabling a unit whose file is not there yet is the half-built
+	// machine this ordering exists to prevent.
+	if p.Stage != nil {
+		if stage == nil {
+			stage = StageRuntime
+		}
+		if err := stage(ctx, *p.Stage, nil); err != nil {
+			return fmt.Errorf("staging the runtime: %w", err)
+		}
 	}
 	return runAll(ctx, p.Install, argvs, run)
 }

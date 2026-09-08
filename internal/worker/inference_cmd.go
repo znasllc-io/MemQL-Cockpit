@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/inference"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
@@ -55,6 +56,14 @@ const (
 	// the bar does not reflow when a terminal is resized mid-pull --
 	// a redraw at a new width leaves the tail of the old line on screen.
 	pullBarCells = 40
+
+	// runtimeReadyWithin is how long a freshly started runtime gets to
+	// answer before the setup calls it a failure. An install command
+	// exiting zero says a service was asked to start, not that anything
+	// listens, and the very next step pulls against that socket. Thirty
+	// seconds covers a first `ollama serve` discovering its GPU on a
+	// slow disk; a runtime silent past that is not coming.
+	runtimeReadyWithin = 30 * time.Second
 )
 
 // repeatedFlag collects a flag the operator may give more than once
@@ -109,9 +118,14 @@ type inferenceSetup struct {
 	runtimeFlag    string
 	policyPath     string
 
-	gather      func(ctx context.Context) (inference.Host, error)
-	base        func() string
-	install     func(ctx context.Context, p inference.Plan, consent func([]string) bool, run inference.Runner) error
+	gather  func(ctx context.Context) (inference.Host, error)
+	base    func() string
+	install func(ctx context.Context, p inference.Plan, consent func([]string) bool, run inference.Runner, stage inference.Stager) error
+	// stage fetches and unpacks a native Linux runtime; ready waits for
+	// whatever was just started to answer. Both are seams so the flow
+	// runs on a CI runner with no network and nothing listening.
+	stage       inference.Stager
+	ready       func(ctx context.Context, base string) error
 	pull        func(ctx context.Context, base, model string, onProgress func(inference.Progress)) error
 	allow       func(policyPath string, ids ...string) error
 	readvertise func(ctx context.Context) error
@@ -139,8 +153,12 @@ func newInferenceSetup(configPath string, ids []string, nonInteractive bool, run
 		// OLLAMA_HOST: two resolvers drift, and the failure is a pull
 		// that lands where discovery will never look, so the model
 		// arrives and is never advertised.
-		base:        discoverer.ResolvedOllamaBaseURL,
-		install:     inference.InstallRuntime,
+		base:    discoverer.ResolvedOllamaBaseURL,
+		install: inference.InstallRuntime,
+		stage:   inference.StageRuntime,
+		ready: func(ctx context.Context, base string) error {
+			return inference.WaitReady(ctx, base, runtimeReadyWithin)
+		},
 		pull:        inference.Pull,
 		allow:       inference.Allow,
 		readvertise: inference.Readvertise,
@@ -192,6 +210,20 @@ func (s *inferenceSetup) run(ctx context.Context) error {
 	host, err := s.gather(ctx)
 	if err != nil {
 		return setupFailed("this machine could not be inspected: %v", err)
+	}
+	// The preference goes INTO the host before the decision, because on
+	// Linux it chooses between two plans rather than vetoing one: the
+	// native runtime by default, the container under --runtime docker.
+	// The disk figure follows it -- the two runtimes keep models on
+	// different volumes, and the pull path refuses on the wrong one
+	// otherwise.
+	pref, err := s.runtimePreference()
+	if err != nil {
+		return err
+	}
+	host.Runtime = pref
+	if pref == inference.RuntimeDocker && host.DockerFreeDisk != 0 {
+		host.FreeDisk = host.DockerFreeDisk
 	}
 	plan := inference.Decide(host)
 	plan, err = s.applyRuntimeFlag(host, plan)
@@ -253,33 +285,11 @@ func (s *inferenceSetup) run(ctx context.Context) error {
 // nothing about the platform is being worked around -- the machine is
 // simply reporting what it has.
 func (s *inferenceSetup) applyRuntimeFlag(h inference.Host, p inference.Plan) (inference.Plan, error) {
-	switch strings.ToLower(strings.TrimSpace(s.runtimeFlag)) {
-	case "":
-		return p, nil
-
-	case "native":
-		if p.Runtime == inference.RuntimeNative {
-			return p, nil
-		}
-		if p.RuntimePresent {
-			// Serving already. The runtime is a fact rather than a
-			// choice, and Install is empty either way.
-			p.Runtime = inference.RuntimeNative
-			p.Install = nil
-			return p, nil
-		}
-		s.paragraph("This machine has no native runtime to use. On " + platformName(h.GOOS) +
-			" the model runtime runs in a container with the GPU passed through, which is the" +
-			" reproducible path and the one this command can take without sudo.")
-		s.line("")
-		s.paragraph("Install Ollama yourself and start it, then run this again -- or drop" +
-			" --runtime native and let this command install the container:")
-		s.line("")
-		s.line("  https://ollama.com/download")
-		return p, alreadySaid(SetupExitUsage)
-
-	case "docker":
-		if p.Runtime == inference.RuntimeDocker {
+	switch h.Runtime {
+	case inference.RuntimeDocker:
+		if p.Runtime == inference.RuntimeDocker || p.Refusal != "" {
+			// Honoured (Linux), or refused by the plan itself in words
+			// that already name the flag's way out.
 			return p, nil
 		}
 		s.paragraph("This machine cannot serve models from Docker: on " + platformName(h.GOOS) +
@@ -291,7 +301,26 @@ func (s *inferenceSetup) applyRuntimeFlag(h inference.Host, p inference.Plan) (i
 		return p, alreadySaid(SetupExitUsage)
 
 	default:
-		return p, setupUsage("--runtime takes docker or native, not %q", s.runtimeFlag)
+		// Native is every platform's own default now, so asking for it
+		// by name changes nothing -- and a machine already serving from
+		// a container keeps doing so, since the runtime is a fact rather
+		// than a choice and Install is empty either way.
+		return p, nil
+	}
+}
+
+// runtimePreference reads --runtime into the value Decide takes, or
+// refuses a spelling it does not know as a usage error.
+func (s *inferenceSetup) runtimePreference() (inference.Runtime, error) {
+	switch strings.ToLower(strings.TrimSpace(s.runtimeFlag)) {
+	case "":
+		return inference.RuntimeNone, nil
+	case "native":
+		return inference.RuntimeNative, nil
+	case "docker":
+		return inference.RuntimeDocker, nil
+	default:
+		return inference.RuntimeNone, setupUsage("--runtime takes docker or native, not %q", s.runtimeFlag)
 	}
 }
 
@@ -438,7 +467,19 @@ func (s *inferenceSetup) ensureRuntime(ctx context.Context, p inference.Plan) er
 		s.paragraph(note)
 	}
 	s.line("")
-	s.line("These commands will run:")
+	// A native Linux plan does two kinds of thing, and both are on the
+	// screen before the one question: the download and the file it
+	// writes as sentences, the commands as the lines that will run. The
+	// contract is the same for both -- nothing happens that was not shown.
+	if p.Stage != nil {
+		s.line("This will:")
+		for _, l := range p.Stage.Lines() {
+			s.line("  " + l)
+		}
+		s.line("and then run:")
+	} else {
+		s.line("These commands will run:")
+	}
 	for _, cmd := range p.Install {
 		s.line("  " + cmd)
 	}
@@ -452,9 +493,26 @@ func (s *inferenceSetup) ensureRuntime(ctx context.Context, p inference.Plan) er
 		consent = s.askToInstall
 	}
 
-	err := s.install(ctx, p, consent, inference.ExecRunner(s.out))
+	// The stager gets this command's display, so a 1.4 GB download draws
+	// the way a pull does rather than going silent for minutes.
+	stage := func(ctx context.Context, st inference.Stage, _ func(inference.Progress)) error {
+		d := newStageDisplay(s.out, s.tty)
+		err := s.stage(ctx, st, d.handle)
+		d.finish()
+		return err
+	}
+	err := s.install(ctx, p, consent, inference.ExecRunner(s.out), stage)
 	switch {
 	case err == nil:
+		if s.ready != nil {
+			if rerr := s.ready(ctx, s.base()); rerr != nil {
+				where := ""
+				if p.Stage != nil {
+					where = " Its log is " + p.Stage.LogPath + "."
+				}
+				return setupFailed("the runtime was installed and started, but %v.%s", rerr, where)
+			}
+		}
 		s.line("")
 		s.line("The runtime is installed and started.")
 		s.line("")
@@ -861,6 +919,58 @@ func progressBar(percent int) string {
 // a fresh one. It runs on the failure paths too: an error message that
 // began halfway along a progress bar is one nobody can read.
 func (d *pullDisplay) finish() { d.endLine() }
+
+// stageDisplay draws a runtime archive download: one heading per
+// archive, then the same bar a pull gets on a terminal or one line per
+// decile in a log. It is not the pull display because that one reads
+// Ollama's per-layer statuses, and an archive has one stream of bytes.
+type stageDisplay struct {
+	w      io.Writer
+	tty    bool
+	name   string
+	decile int
+	drawn  bool
+}
+
+func newStageDisplay(w io.Writer, tty bool) *stageDisplay {
+	return &stageDisplay{w: w, tty: tty, decile: -1}
+}
+
+func (d *stageDisplay) handle(p inference.Progress) {
+	if p.Model != d.name {
+		d.endLine()
+		d.name = p.Model
+		d.decile = -1
+		fmt.Fprintf(d.w, "  %s\n", p.Status)
+		if p.Total > 0 {
+			fmt.Fprintf(d.w, "  %s total\n", humanBytes(p.Total))
+		}
+	}
+	if p.Total == 0 {
+		return
+	}
+	percent := int(p.Completed * 100 / p.Total)
+	if d.tty {
+		fmt.Fprintf(d.w, "\r  %-*s", inferenceWrapWidth,
+			fmt.Sprintf("%s %3d%%   %s / %s", progressBar(percent), percent, humanBytes(p.Completed), humanBytes(p.Total)))
+		d.drawn = true
+		return
+	}
+	if decile := percent / 10; decile > d.decile {
+		d.decile = decile
+		fmt.Fprintf(d.w, "  %3d%%   %s / %s\n", percent, humanBytes(p.Completed), humanBytes(p.Total))
+	}
+}
+
+func (d *stageDisplay) finish() { d.endLine() }
+
+func (d *stageDisplay) endLine() {
+	if !d.drawn {
+		return
+	}
+	fmt.Fprintln(d.w, "")
+	d.drawn = false
+}
 
 func (d *pullDisplay) endLine() {
 	if !d.drawn {
