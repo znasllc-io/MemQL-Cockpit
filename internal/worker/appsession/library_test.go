@@ -351,3 +351,74 @@ func TestPushReportsA401TheSameWayAPullDoes(t *testing.T) {
 		t.Errorf("push must point at renewal the way pull does; got:\n%s", err)
 	}
 }
+
+// A CLOSE ON A WRITABLE HANDLE IS WHERE A SHORT WRITE SURFACES, so both
+// the failure path and the success path check it.
+//
+// The success path is the one that decides whether the pulled file is
+// WHOLE: a buffered write that could not be flushed reports at Close and
+// nowhere else, so returning the path without checking would hand an
+// agent a truncated input to work from. The failure path joins the close
+// error onto the copy error, because a copy that failed AND a close that
+// failed together say "the disk is full", where either alone sends
+// somebody looking at the network.
+func TestPull_ChecksTheCloseOnBothPaths(t *testing.T) {
+	// A body that ends early makes io.Copy fail, which is the path that
+	// used to drop the close error on the floor.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "64")
+		_, _ = w.Write([]byte("short"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Hijack and drop the connection so the body is truncated.
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, err := hj.Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	l := NewLibrary(srv.URL, testBearer, srv.Client())
+	path, err := l.Pull(context.Background(), "artifact-1", dir)
+	if err == nil {
+		t.Fatalf("a truncated body was accepted, writing %q", path)
+	}
+	// AND THE PARTIAL FILE IS REMOVED. A half-written input left on
+	// disk is one an agent would read as complete.
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("a partial download was left behind: %v", entries)
+	}
+}
+
+// The ordinary success path is unchanged by the joined error: with a
+// close that succeeds, errors.Join returns just the first error, so the
+// message an operator reads is the one it always was.
+func TestPull_SucceedsAndWritesTheWholeBody(t *testing.T) {
+	body := strings.Repeat("payload-", 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	l := NewLibrary(srv.URL, testBearer, srv.Client())
+	path, err := l.Pull(context.Background(), "artifact-1", dir)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body {
+		t.Fatalf("pulled %d bytes, want %d", len(got), len(body))
+	}
+}

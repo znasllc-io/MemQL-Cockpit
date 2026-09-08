@@ -120,16 +120,59 @@ func waitForOpen(ctx context.Context, c *child, exitFile string, readersDone <-c
 	}
 }
 
+// The bounds a real process exit status can occupy.
+//
+// A shell reports 0-255 -- `exit 256` wraps to 0 before anyone sees it,
+// and a signalled process reports 128+n, which tops out at 255. Go's own
+// ExitCode() reports -1 for "no exit status", which exitCode() in
+// process.go passes through, so the file is allowed to say that too.
+const (
+	minOpenExitCode = -1
+	maxOpenExitCode = 255
+)
+
+// readOpenExitFile reads the exit code the launcher script recorded.
+//
+// IT REFUSES ANYTHING THE WIRE CANNOT CARRY, and that is a correctness
+// bound rather than a tidy-up. AppSessionEnd.ExitCode is an int32 and
+// this function returns an int, so a file containing 4294967296
+// truncates to exactly 0 at the conversion -- and the engine reads 0 as
+// a run that SUCCEEDED. A failed session would be filed as a good one,
+// in a record people read back later when deciding whether the thing
+// worked, and nothing downstream could detect it. The same file also
+// feeds a log line, so a number nobody can produce would be printed as
+// though a process had returned it.
+//
+// Refusing costs nothing, because the caller has a better answer: this
+// is one of two signals, and settle() falls back to the launcher
+// PROCESS's own exit status whenever the file says nothing usable. The
+// file is preferred when it is trustworthy, not when it is merely
+// present.
+//
+// The value is NOT clamped into range, for the reason sendEnd and
+// exitCode both give about normalising: flattening a number to 1 -- or
+// worse to 0 -- invents an outcome. A file outside the range is not a
+// large exit code, it is not an exit code, and saying so is the honest
+// answer.
 func readOpenExitFile(path string) (int, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false
 	}
-	code, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	// ParseInt with an explicit bit size rather than Atoi: Atoi returns
+	// an int, which is 64 bits on every platform this cockpit ships to,
+	// so the range check would be the only thing standing between the
+	// file and the conversion. Asking for 32 bits makes the parser
+	// itself refuse what cannot travel, and the range check below is
+	// then about what an exit code IS rather than about arithmetic.
+	code, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 32)
 	if err != nil {
 		return 0, false
 	}
-	return code, true
+	if code < minOpenExitCode || code > maxOpenExitCode {
+		return 0, false
+	}
+	return int(code), true
 }
 
 // writeOpenLauncher renders the shell script the terminal runs.

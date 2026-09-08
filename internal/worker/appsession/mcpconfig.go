@@ -455,13 +455,17 @@ func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
 	defer func() {
 		_ = os.Remove(tmpName)
 	}()
+	// The two error paths join the close error rather than dropping it,
+	// the same way Library.Pull does and for the same reason: a close
+	// on a writable handle is where a short write surfaces, and this
+	// file is the one carrying the session's bearer. `_ =` would be
+	// enough to silence a linter and would still throw away the one
+	// message that says the disk is full.
 	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return fmt.Errorf("mcp config: chmod: %w", err)
+		return fmt.Errorf("mcp config: chmod: %w", errors.Join(err, tmp.Close()))
 	}
 	if _, err := tmp.Write(body); err != nil {
-		tmp.Close()
-		return fmt.Errorf("mcp config: write: %w", err)
+		return fmt.Errorf("mcp config: write: %w", errors.Join(err, tmp.Close()))
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("mcp config: close: %w", err)
