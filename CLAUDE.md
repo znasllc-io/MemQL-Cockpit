@@ -121,8 +121,11 @@ memql-cockpit/
 │                           workspace (stdin prompts when flags are absent)
 ├── scripts/install/        Worker-machine installers (mac / linux): binary +
 │                           service + worker.yaml; the portal composes the
-│                           one-liner. install.sh at the root is the plain
-│                           binary installer from GitHub releases
+│                           one-liner. uninstall-{mac,linux}.sh are their
+│                           inverse, one line too (--purge takes policy.yaml
+│                           and the state dir as well). install.sh at the
+│                           root is the plain binary installer from GitHub
+│                           releases
 ├── deploy/systemd/         memql-worker.service template (user systemd)
 ├── docs/                   access.md, computer-use.md, local-apps.md,
 │                           local-models.md, watched-folders.md;

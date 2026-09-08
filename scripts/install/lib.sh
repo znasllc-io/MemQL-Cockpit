@@ -5,10 +5,13 @@
 #
 # Shared function library for the worker install scripts --
 # function-based helpers sourced by the OS-specific drivers
-# install-mac.sh and install-linux.sh. write_worker_yaml (below) is
+# install-mac.sh and install-linux.sh, and by their inverses
+# uninstall-mac.sh and uninstall-linux.sh. write_worker_yaml (below) is
 # the single renderer for ~/.memql/worker.yaml, so the config layout
-# can never drift between the two platforms. The pure-logic helpers
-# are exercised by lib_test.sh, wired into CI via
+# can never drift between the two platforms; the uninstall helpers at
+# the bottom are the single statement of what an uninstall removes,
+# for the same reason. The pure-logic helpers are exercised by
+# lib_test.sh, wired into CI via
 # .github/workflows/install-scripts-lint.yml.
 
 set -uo pipefail
@@ -31,6 +34,24 @@ readonly STATE_DIR_DEFAULT="${HOME}/.memql/state"
 # the installed file never does. `memql --version` is what answers "which
 # build is this", which only works because the path cannot.
 readonly INSTALLED_COMMAND="memql"
+
+# The pre-rename binary names the installers retire in place and the
+# uninstallers remove (znasllc-io/memql#4553). The root install.sh
+# carries its own copy under the same variable name -- it is fetched
+# alone by `curl | sh` and has no lib.sh to source -- and lib_test.sh
+# reads both files to hold the two copies together.
+readonly LEGACY_BINARIES="memql-cockpit memql-cockpit-computeruse"
+
+# The service names, current and pre-rename, on each platform. The
+# installers write the current one and retire the legacy one; the
+# uninstallers stop and remove both. install.sh restates these four
+# too, under these names, for the reason above. Nothing in this file
+# reads them -- the drivers that source it do -- hence the directive.
+# shellcheck disable=SC2034  # read by the uninstallers, which source this file
+readonly SERVICE_LABEL_DARWIN="com.znasllc.memql-worker" \
+         LEGACY_LABEL_DARWIN="com.znasllc.memql-cockpit-worker" \
+         SERVICE_LABEL_LINUX="memql-worker" \
+         LEGACY_LABEL_LINUX="memql-cockpit-worker"
 
 # Detect host os ("darwin" or "linux") and arch ("amd64" or "arm64").
 function detect_os() {
@@ -186,22 +207,36 @@ function install_mode_dir() {
 # or auth fails. Already-root processes succeed immediately. Used by
 # install_binary_with_mode for the system install path so a
 # /usr/local/bin write attempt fails fast with a clear message
-# instead of failing in the middle of the download.
+# instead of failing in the middle of the download, and by
+# remove_binaries_with_mode for the same directory on the way out.
+#
+# $1 is the action being gated, "install" (the default) or
+# "uninstall", and it changes the WORDING only: the way out of a
+# missing sudo is --user-local in both cases, but telling a person who
+# is removing a worker to "install under ~/.memql/bin instead" sends
+# them the wrong way.
 function require_sudo() {
+    local action="${1:-install}"
+    local need="the immutable install at $INSTALL_PREFIX_SYSTEM"
+    local way_out="install under $INSTALL_PREFIX_USER"
+    if [[ "$action" == "uninstall" ]]; then
+        need="removing the immutable install at $INSTALL_PREFIX_SYSTEM"
+        way_out="remove a --user-local install from $INSTALL_PREFIX_USER"
+    fi
     if [[ $EUID -eq 0 ]]; then
         return 0
     fi
     if ! command -v sudo >/dev/null 2>&1; then
-        echo "ERROR: sudo required for the immutable install at $INSTALL_PREFIX_SYSTEM but is not available." >&2
-        echo "       Pass --user-local to install under $INSTALL_PREFIX_USER instead." >&2
+        echo "ERROR: sudo required for ${need} but is not available." >&2
+        echo "       Pass --user-local to ${way_out} instead." >&2
         return 1
     fi
     if sudo -n true 2>/dev/null; then
         return 0
     fi
-    echo "INFO: $INSTALL_PREFIX_SYSTEM install requires sudo; you'll be prompted for your password..."
+    echo "INFO: $INSTALL_PREFIX_SYSTEM ${action} requires sudo; you'll be prompted for your password..."
     if ! sudo -v; then
-        echo "ERROR: sudo authentication failed. Pass --user-local for a passwordless install." >&2
+        echo "ERROR: sudo authentication failed. Pass --user-local for a passwordless ${action}." >&2
         return 1
     fi
     return 0
@@ -263,15 +298,20 @@ function install_binary_with_mode() {
     esac
 
     # Migrate: drop the pre-rename binaries/symlinks beside the new one
-    # (znasllc-io/memql#4553). Harmless when absent.
-    case "$mode" in
-        system)
-            sudo rm -f "$dest_dir/memql-cockpit" "$dest_dir/memql-cockpit-computeruse" 2>/dev/null || true
-            ;;
-        *)
-            rm -f "$dest_dir/memql-cockpit" "$dest_dir/memql-cockpit-computeruse" 2>/dev/null || true
-            ;;
-    esac
+    # (znasllc-io/memql#4553). Harmless when absent. The names come from
+    # LEGACY_BINARIES so the uninstaller removes exactly the set this
+    # retires.
+    local legacy
+    for legacy in $LEGACY_BINARIES; do
+        case "$mode" in
+            system)
+                sudo rm -f "$dest_dir/$legacy" 2>/dev/null || true
+                ;;
+            *)
+                rm -f "$dest_dir/$legacy" 2>/dev/null || true
+                ;;
+        esac
+    done
 }
 
 # write_worker_yaml renders ~/.memql/worker.yaml from the supplied
@@ -380,4 +420,286 @@ function setup_inference() {
             ;;
     esac
     return 0
+}
+
+# ---------------------------------------------------------------
+# Uninstall helpers -- shared by uninstall-mac.sh and uninstall-linux.sh
+# ---------------------------------------------------------------
+#
+# The uninstallers are the installers run backwards, and everything
+# that is the same on both platforms lives here so the two cannot
+# disagree about what "uninstalled" means: which binaries go, which
+# files under ~/.memql go always, which go only under --purge, and
+# the one fence every recursive delete is checked against. The
+# service half (launchctl against systemctl) stays in the drivers, as
+# the install half does.
+#
+# Two ledgers, appended to by every helper that removes or keeps
+# something and printed by print_uninstall_summary. Newline-joined
+# strings rather than arrays: macOS ships bash 3.2, where expanding an
+# EMPTY array under `set -u` is an unbound-variable error, and an
+# empty ledger is the common case for half of these helpers.
+UNINSTALL_REMOVED=""
+UNINSTALL_KEPT=""
+
+function record_removed() {
+    UNINSTALL_REMOVED="${UNINSTALL_REMOVED}  $1"$'\n'
+}
+
+function record_kept() {
+    UNINSTALL_KEPT="${UNINSTALL_KEPT}  $1"$'\n'
+}
+
+# under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
+# ONLY tree the uninstallers delete recursively. It is strict about
+# shape on purpose -- absolute, no `..` segment -- because a state_dir
+# read out of worker.yaml is operator-authored text, and the one thing
+# an uninstaller must never do is `rm -rf` wherever a file it did not
+# write points.
+function under_memql_home() {
+    local path="$1"
+    local fence="${HOME}/.memql"
+    [[ "$path" == /* ]] || return 1
+    [[ "$path" != *"/../"* && "$path" != *"/.." ]] || return 1
+    [[ "$path" == "$fence" || "$path" == "$fence"/* ]]
+}
+
+# remove_path_if_present deletes ONE file or symlink and says so, or
+# says there was nothing there. Never recursive -- a directory handed
+# to it is reported and left -- so the drivers can name paths outside
+# the ~/.memql fence (the LaunchAgent plist, the systemd unit) without
+# the fence being all that stands between them and a tree.
+function remove_path_if_present() {
+    local path="$1"
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        echo "WARN: $path is a directory; not removed by this step"
+        return 0
+    fi
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        echo "INFO: $path not present; nothing to remove"
+        return 0
+    fi
+    rm -f "$path"
+    echo "INFO: removed $path"
+    record_removed "$path"
+}
+
+# remove_tree_if_present deletes a directory recursively, inside the
+# ~/.memql fence and nowhere else. Outside it the directory is KEPT
+# and reported with its path, so the person can decide. That is not
+# an error: the uninstall still did everything it was allowed to.
+function remove_tree_if_present() {
+    local dir="$1"
+    if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+        echo "INFO: $dir not present; nothing to remove"
+        return 0
+    fi
+    if ! under_memql_home "$dir"; then
+        echo "WARN: $dir is outside ${HOME}/.memql; not touched. Delete it by hand if you want it gone."
+        record_kept "$dir (outside ${HOME}/.memql; not touched)"
+        return 0
+    fi
+    rm -rf "$dir"
+    echo "INFO: removed $dir"
+    record_removed "$dir"
+}
+
+# worker_state_dir_from_yaml prints the state_dir worker.yaml names,
+# or the default when the file or the key is absent. The drivers call
+# it BEFORE worker.yaml is removed: --purge has to delete the
+# directory the worker actually used, and write_worker_yaml's default
+# is only where that usually is. A leading `~/` is expanded the way
+# the shell would have; anything else reaches the fence as written.
+function worker_state_dir_from_yaml() {
+    local path="$1"
+    local dir=""
+    if [[ -f "$path" ]]; then
+        dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$path" | head -1)"
+    fi
+    case "$dir" in
+        "")   dir="$STATE_DIR_DEFAULT" ;;
+        \~/*) dir="${HOME}/${dir#\~/}" ;;
+    esac
+    echo "$dir"
+}
+
+# remove_binaries_with_mode is install_binary_with_mode's inverse: from
+# the mode's directory it deletes the installed command, the two
+# download-named binaries beside it (headless and computer-use, for
+# this platform) and the pre-rename names. Every name derives from the
+# constants the install used, so a rename moves both or neither.
+#
+# Scoped to that ONE directory on purpose, as install.sh's
+# remove_legacy_binaries is: a PATH-wide sweep would delete a memql
+# this installer never placed. Sudo is asked for only once something
+# is actually there to remove -- a machine with nothing at
+# /usr/local/bin must not raise a password prompt to find that out.
+# When sudo is needed and cannot be had, the paths are printed for the
+# person to delete by hand and the function returns 4 (prerequisite
+# missing, the capability-script convention preflight_asset uses); the
+# drivers carry on to the token, which matters more than the binary,
+# and exit with that code at the end.
+function remove_binaries_with_mode() {
+    local mode="$1"
+    local dest_dir
+    dest_dir="$(install_mode_dir "$mode")" || return 1
+    local headless computeruse
+    headless="$(binary_name_for headless)" || return 1
+    computeruse="$(binary_name_for computeruse)" || return 1
+    local names="${INSTALLED_COMMAND} ${headless} ${computeruse} ${LEGACY_BINARIES}"
+
+    local name path present="no"
+    for name in $names; do
+        path="${dest_dir}/${name}"
+        if [[ -e "$path" || -L "$path" ]]; then
+            present="yes"
+        fi
+    done
+    if [[ "$present" == "no" ]]; then
+        echo "INFO: no ${INSTALLED_COMMAND} binary at ${dest_dir}; nothing to remove"
+        return 0
+    fi
+
+    local privileged="no"
+    if [[ "$mode" == "system" && $EUID -ne 0 ]]; then
+        if ! require_sudo uninstall; then
+            echo "ERROR: cannot remove from ${dest_dir} without sudo. Delete these by hand:" >&2
+            for name in $names; do
+                path="${dest_dir}/${name}"
+                if [[ -e "$path" || -L "$path" ]]; then
+                    echo "       $path" >&2
+                    record_kept "$path (needs sudo; delete it by hand)"
+                fi
+            done
+            return 4
+        fi
+        privileged="yes"
+    fi
+
+    # The command's symlink goes first (it is first in the list), so no
+    # moment leaves a `memql` pointing at a file already gone.
+    for name in $names; do
+        path="${dest_dir}/${name}"
+        [[ -e "$path" || -L "$path" ]] || continue
+        if [[ "$privileged" == "yes" ]]; then
+            sudo rm -f "$path"
+        else
+            rm -f "$path"
+        fi
+        echo "INFO: removed $path"
+        record_removed "$path"
+    done
+    # The user-local bin dir was the installer's to create, so it is
+    # taken away again when nothing is left in it. /usr/local/bin is
+    # nobody's to remove, and rmdir refuses a non-empty directory.
+    if [[ "$mode" == "user-local" ]]; then
+        rmdir "$dest_dir" 2>/dev/null || true
+    fi
+}
+
+# purge_worker_state is what --purge adds: policy.yaml (the owner's
+# apps.allow / models.allow / backup.roots -- kept by default because
+# it is authored, not generated), the state dir (logs, ledgers, the
+# recorded registration id), the consent socket, and then ~/.memql
+# itself once nothing is left in it. The CLI's clusters.yaml and
+# credentials/ are never on this list: they belong to `memql cluster`,
+# not to the worker, and an uninstall of the worker that signed the
+# person out of every cluster would be a second thing nobody asked
+# for. When they are there ~/.memql stays, and the summary says what
+# kept it.
+function purge_worker_state() {
+    local state_dir="$1"
+    remove_path_if_present "${HOME}/.memql/policy.yaml"
+    remove_tree_if_present "$state_dir"
+    remove_path_if_present "${HOME}/.memql/worker.sock"
+    remove_memql_home_if_empty
+}
+
+# report_kept_state is the no-purge counterpart: it names what stays
+# and the flag that removes it, so a token-less ~/.memql is never left
+# behind unexplained.
+function report_kept_state() {
+    local state_dir="$1"
+    local path
+    for path in "${HOME}/.memql/policy.yaml" "$state_dir"; do
+        if [[ -e "$path" ]]; then
+            echo "INFO: kept $path (re-run with --purge to remove it)"
+            record_kept "$path (--purge removes it)"
+        fi
+    done
+}
+
+# remove_memql_home_if_empty takes ~/.memql away only when it is
+# empty -- rmdir, never rm -rf, so whatever is still in there decides.
+# What kept it is named, because "kept ~/.memql" alone reads as a
+# purge that did not work.
+function remove_memql_home_if_empty() {
+    local dir="${HOME}/.memql"
+    [[ -d "$dir" ]] || return 0
+    if rmdir "$dir" 2>/dev/null; then
+        echo "INFO: removed $dir (empty)"
+        record_removed "$dir"
+        return 0
+    fi
+    # A glob walk rather than `ls`: no external tool, and a name with
+    # a space or a newline in it is listed rather than split. The three
+    # patterns are the visible entries, the dotfiles, and the `..x`
+    # names the second pattern cannot reach; an unmatched pattern stays
+    # literal and fails the existence test.
+    local left="" entry
+    for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        if [[ -e "$entry" || -L "$entry" ]]; then
+            left="${left}${entry##*/} "
+        fi
+    done
+    echo "INFO: kept $dir; it still holds: ${left}"
+    record_kept "$dir (still holds: ${left})"
+}
+
+# print_uninstall_summary is the closing block, the uninstall's
+# counterpart to the installers' SUCCESS block: what went, what stayed
+# and why, and the one thing this script cannot do. The registration
+# row lives on the cluster, and the token that could have spoken for
+# this machine has just been deleted -- Fleet -> Machines in MemQL OS
+# is where a machine is revoked, and a worker retrying with a dead
+# token is the reason to revoke there first. $1 is the binary step's
+# return code: non-zero means something is still on disk, and the
+# heading says so rather than claiming success over a leftover.
+function print_uninstall_summary() {
+    local rc="${1:-0}"
+    local heading="SUCCESS: memql-worker uninstalled."
+    if [[ "$rc" -ne 0 ]]; then
+        heading="PARTIAL: memql-worker uninstalled, with leftovers (see Kept)."
+    fi
+    echo ""
+    echo "================================================================"
+    echo "$heading"
+    echo ""
+    echo "Removed:"
+    if [[ -n "$UNINSTALL_REMOVED" ]]; then
+        printf '%s' "$UNINSTALL_REMOVED"
+    else
+        echo "  (nothing)"
+    fi
+    echo ""
+    echo "Kept:"
+    if [[ -n "$UNINSTALL_KEPT" ]]; then
+        printf '%s' "$UNINSTALL_KEPT"
+    else
+        echo "  (nothing)"
+    fi
+    # A memql still resolving on PATH after this is one this script did
+    # not install -- the system copy after a --user-local run, or a
+    # `go install` -- and saying so beats a person typing `memql` and
+    # concluding the uninstall did nothing.
+    local other
+    if other="$(command -v "$INSTALLED_COMMAND" 2>/dev/null)" && [[ -n "$other" ]]; then
+        echo ""
+        echo "NOTE: a ${INSTALLED_COMMAND} is still on your PATH at ${other}."
+        echo "      This script did not put it there and has not touched it."
+    fi
+    echo ""
+    echo "This machine's registration on the cluster is revoked from MemQL OS"
+    echo "(Fleet -> Machines), not from here."
+    echo "================================================================"
 }

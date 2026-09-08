@@ -79,6 +79,26 @@ source (below) remains the alternative. Their `--inference` flag runs
 never fails the install over it — a machine that paired fine and could not set
 up local models is still a working worker.
 
+### Uninstall
+
+One line, like the install. It stops and removes the service, removes the
+binary and its symlink, and removes `~/.memql/worker.yaml` — the file that
+holds the token:
+
+```bash
+# Linux
+curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-linux.sh | bash -s -- [--purge] [--user-local]
+
+# macOS
+curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-mac.sh | bash -s -- [--purge] [--user-local]
+```
+
+Without `--purge`, `~/.memql/policy.yaml` and the state directory (logs,
+ledgers) stay, and the script says so; `--user-local` removes a `--user-local`
+install from `~/.memql/bin` instead of `/usr/local/bin`. The machine's
+registration on the cluster is not touched from here — revoke it from MemQL OS
+(Fleet -> Machines).
+
 ## Commands
 
 ```

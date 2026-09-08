@@ -22,6 +22,12 @@
 # on ONE physical line, anything else reported), that it never fails the
 # install, and that both installers accept the flag and call it after
 # worker.yaml and the service.
+# And the uninstallers: --help and the unknown-flag exit, lib.sh
+# sourcing (they join the installers' loop), and real runs against a
+# throwaway HOME with launchctl / systemctl / sudo cut out of PATH --
+# what --user-local removes and keeps, what --purge adds, the
+# nothing-installed run, ~/.memql kept for the CLI's clusters.yaml, and
+# the fence that keeps a state_dir outside ~/.memql from being deleted.
 #
 # Run: bash scripts/install/lib_test.sh
 # Wired into CI by .github/workflows/install-scripts-lint.yml.
@@ -197,6 +203,38 @@ if [[ -f "$_install_sh" ]]; then
         "$(install_sh_value LEGACY_LABEL_DARWIN)" "com.znasllc.memql-cockpit-worker"
     expect_eq "install.sh LEGACY_LABEL_LINUX" \
         "$(install_sh_value LEGACY_LABEL_LINUX)" "memql-cockpit-worker"
+    expect_eq "install.sh LEGACY_BINARIES" \
+        "$(install_sh_value LEGACY_BINARIES)" "$LEGACY_BINARIES"
+
+    # lib.sh OWNS the four labels now (the uninstallers read them from
+    # it), so its constants must agree with install.sh's copy too: the
+    # literal expectations above pin the names, these pin the two files
+    # to each other.
+    expect_eq "lib.sh SERVICE_LABEL_DARWIN agrees with install.sh" \
+        "$SERVICE_LABEL_DARWIN" "$(install_sh_value SERVICE_LABEL_DARWIN)"
+    expect_eq "lib.sh SERVICE_LABEL_LINUX agrees with install.sh" \
+        "$SERVICE_LABEL_LINUX" "$(install_sh_value SERVICE_LABEL_LINUX)"
+    expect_eq "lib.sh LEGACY_LABEL_DARWIN agrees with install.sh" \
+        "$LEGACY_LABEL_DARWIN" "$(install_sh_value LEGACY_LABEL_DARWIN)"
+    expect_eq "lib.sh LEGACY_LABEL_LINUX agrees with install.sh" \
+        "$LEGACY_LABEL_LINUX" "$(install_sh_value LEGACY_LABEL_LINUX)"
+
+    # And the installers, which still spell the file names inline, must
+    # write the service lib.sh names and retire the legacy one it
+    # names -- or the uninstaller removes a file the installer never
+    # wrote.
+    if grep -qF "${SERVICE_LABEL_DARWIN}.plist" "$(dirname "$0")/install-mac.sh" \
+        && grep -qF "${LEGACY_LABEL_DARWIN}.plist" "$(dirname "$0")/install-mac.sh"; then
+        pass "install-mac.sh writes and retires the plists lib.sh names"
+    else
+        fail "install-mac.sh should name ${SERVICE_LABEL_DARWIN}.plist and ${LEGACY_LABEL_DARWIN}.plist"
+    fi
+    if grep -qF "${SERVICE_LABEL_LINUX}.service" "$(dirname "$0")/install-linux.sh" \
+        && grep -qF "${LEGACY_LABEL_LINUX}.service" "$(dirname "$0")/install-linux.sh"; then
+        pass "install-linux.sh writes and retires the units lib.sh names"
+    else
+        fail "install-linux.sh should name ${SERVICE_LABEL_LINUX}.service and ${LEGACY_LABEL_LINUX}.service"
+    fi
 
     # The new label must not BE the old one -- a migration that renames
     # nothing would satisfy every other assertion here.
@@ -219,13 +257,14 @@ fi
 # what keeps these tests offline: the real lib.sh in this directory IS
 # the fixture, reached over file://, and the failure case points at a
 # path that cannot resolve. `--help` is the probe because it exits 0
-# before any download / sudo / service work.
+# before any download / sudo / service work. The uninstallers carry
+# the same source_lib and travel the same way, so they are in the loop.
 
 _script_dir="$(cd "$(dirname "$0")" && pwd)"
 _piped_cwd="${_tmp}/piped-cwd"
 mkdir -p "$_piped_cwd"
 
-for _installer in install-mac.sh install-linux.sh; do
+for _installer in install-mac.sh install-linux.sh uninstall-mac.sh uninstall-linux.sh; do
     # Piped from a cwd holding no lib.sh, with RAW_BASE at the real
     # lib.sh: must survive sourcing and reach flag handling.
     if _out="$(cd "$_piped_cwd" && MEMQL_INSTALL_RAW_BASE="file://${_script_dir}" \
@@ -462,6 +501,254 @@ for _installer in install-mac.sh install-linux.sh; do
         fail "$_installer should guard setup_inference behind --inference"
     fi
 done
+
+# ---------------------------------------------------------------
+# Uninstallers -- flags, the missing-tool path, and what is left on disk
+# ---------------------------------------------------------------
+#
+# Driven as the installers are: real subprocesses against a throwaway
+# HOME, never this machine's ~/.memql. PATH is cut down to a directory
+# holding only the utilities the scripts need, which makes launchctl
+# and systemctl ABSENT in every environment this runs in (a developer's
+# Linux box has systemctl, CI has it too) and keeps sudo out of reach
+# -- a --user-local run must never want it. Every run is checked on the
+# ARTIFACTS, which files are gone and which are still there, not on
+# what the script said it did.
+
+_nobin="${_tmp}/nobin"
+mkdir -p "$_nobin"
+for _tool in bash dirname basename uname rm rmdir sed head ls tr cat mktemp; do
+    if _real="$(command -v "$_tool")"; then
+        ln -s "$_real" "${_nobin}/${_tool}"
+    else
+        fail "uninstall fixture: ${_tool} not on PATH"
+    fi
+done
+if (PATH="$_nobin"; command -v systemctl || command -v launchctl || command -v sudo) >/dev/null 2>&1; then
+    fail "uninstall fixture: the reduced PATH still resolves systemctl, launchctl or sudo"
+else
+    pass "uninstall fixture: reduced PATH has no launchctl, systemctl or sudo"
+fi
+
+# uninstall_fixture lays down what an install leaves behind, for the
+# platform under test: worker.yaml with a token, policy.yaml, a state
+# dir with a log, a --user-local binary with its symlink, and the
+# service file (plus worker.env on linux).
+function uninstall_fixture() {
+    local home="$1"
+    local platform="$2"
+    mkdir -p "${home}/.memql/state" "${home}/.memql/bin"
+    printf 'cluster_url: https://c.example\ntoken: mql_wkr_fixture\nstate_dir: %s/.memql/state\n' \
+        "$home" > "${home}/.memql/worker.yaml"
+    printf 'apps:\n  allow: []\n' > "${home}/.memql/policy.yaml"
+    printf 'log line\n' > "${home}/.memql/state/worker.log"
+    printf '#!/bin/sh\nexit 0\n' > "${home}/.memql/bin/${_pf_headless}"
+    chmod +x "${home}/.memql/bin/${_pf_headless}"
+    ln -s "${home}/.memql/bin/${_pf_headless}" "${home}/.memql/bin/${INSTALLED_COMMAND}"
+    case "$platform" in
+        mac)
+            mkdir -p "${home}/Library/LaunchAgents"
+            printf '<plist/>\n' > "${home}/Library/LaunchAgents/${SERVICE_LABEL_DARWIN}.plist"
+            ;;
+        linux)
+            mkdir -p "${home}/.config/systemd/user"
+            printf '[Unit]\n' > "${home}/.config/systemd/user/${SERVICE_LABEL_LINUX}.service"
+            : > "${home}/.memql/worker.env"
+            ;;
+    esac
+}
+
+# run_uninstaller runs one uninstaller against a HOME with the reduced
+# PATH, from the script dir so the sibling lib.sh is what gets sourced.
+# Output (both streams) on stdout; the caller reads $? for the code.
+function run_uninstaller() {
+    local script="$1"
+    local home="$2"
+    shift 2
+    (cd "$_script_dir" && HOME="$home" PATH="$_nobin" bash "./${script}" "$@" 2>&1)
+}
+
+for _platform in mac linux; do
+    _un="uninstall-${_platform}.sh"
+    case "$_platform" in
+        mac)
+            _svc="Library/LaunchAgents/${SERVICE_LABEL_DARWIN}.plist"
+            _tool_line="INFO: launchctl not found"
+            ;;
+        linux)
+            _svc=".config/systemd/user/${SERVICE_LABEL_LINUX}.service"
+            _tool_line="INFO: systemctl not found"
+            ;;
+    esac
+
+    # --help exits 0 with usage; an unknown flag is exit 2 (bad
+    # parameter), naming the flag.
+    _out="$(cd "$_script_dir" && "./${_un}" --help 2>&1)"
+    _rc=$?
+    expect_eq "$_un --help exits 0" "$_rc" "0"
+    if [[ "$_out" == *"Usage:"* && "$_out" == *"--purge"* && "$_out" == *"--user-local"* ]]; then
+        pass "$_un --help documents --purge and --user-local"
+    else
+        fail "$_un --help should print usage with both flags; got: $_out"
+    fi
+    _out="$(cd "$_script_dir" && "./${_un}" --bogus 2>&1)"
+    _rc=$?
+    expect_eq "$_un unknown flag exits 2" "$_rc" "2"
+    if [[ "$_out" == *"ERROR: unknown flag --bogus"* ]]; then
+        pass "$_un unknown flag is named"
+    else
+        fail "$_un should name the unknown flag; got: $_out"
+    fi
+
+    # --user-local without --purge: the token, the binary + symlink, the
+    # service file (and worker.env) go; policy.yaml and the state dir
+    # stay, and the flag that removes them is named.
+    _uh="${_tmp}/un-home-${_platform}"
+    mkdir -p "$_uh"
+    uninstall_fixture "$_uh" "$_platform"
+    _out="$(run_uninstaller "$_un" "$_uh" --user-local)"
+    _rc=$?
+    expect_eq "$_un --user-local exits 0 with launchctl/systemctl absent" "$_rc" "0"
+    if [[ "$_out" == *"$_tool_line"* ]]; then
+        pass "$_un says the service tool is missing and carries on"
+    else
+        fail "$_un should print '$_tool_line'; got: $_out"
+    fi
+    if [[ ! -e "${_uh}/.memql/worker.yaml" ]]; then
+        pass "$_un --user-local removes worker.yaml (the token)"
+    else
+        fail "$_un --user-local left worker.yaml behind"
+    fi
+    if [[ ! -e "${_uh}/.memql/bin/${INSTALLED_COMMAND}" && ! -L "${_uh}/.memql/bin/${INSTALLED_COMMAND}" \
+        && ! -e "${_uh}/.memql/bin/${_pf_headless}" ]]; then
+        pass "$_un --user-local removes the binary and its symlink"
+    else
+        fail "$_un --user-local left the binary or its symlink: $(ls -la "${_uh}/.memql/bin" 2>&1)"
+    fi
+    if [[ ! -e "${_uh}/${_svc}" ]]; then
+        pass "$_un --user-local removes the service file"
+    else
+        fail "$_un --user-local left ${_svc} behind"
+    fi
+    if [[ "$_platform" == "linux" ]]; then
+        if [[ ! -e "${_uh}/.memql/worker.env" ]]; then
+            pass "$_un --user-local removes worker.env"
+        else
+            fail "$_un --user-local left worker.env behind"
+        fi
+    fi
+    if [[ -f "${_uh}/.memql/policy.yaml" && -f "${_uh}/.memql/state/worker.log" ]]; then
+        pass "$_un keeps policy.yaml and the state dir without --purge"
+    else
+        fail "$_un removed policy.yaml or the state dir without --purge"
+    fi
+    if [[ "$_out" == *"--purge"* && "$_out" == *"Fleet -> Machines"* && "$_out" == *"SUCCESS:"* ]]; then
+        pass "$_un names --purge, points at MemQL OS for the revoke, and closes with SUCCESS"
+    else
+        fail "$_un closing block is missing --purge, the revoke sentence or SUCCESS; got: $_out"
+    fi
+
+    # --user-local --purge: policy.yaml and the state dir go too, and an
+    # emptied ~/.memql is removed with them.
+    _ph="${_tmp}/un-purge-home-${_platform}"
+    mkdir -p "$_ph"
+    uninstall_fixture "$_ph" "$_platform"
+    _out="$(run_uninstaller "$_un" "$_ph" --user-local --purge)"
+    _rc=$?
+    expect_eq "$_un --user-local --purge exits 0" "$_rc" "0"
+    if [[ ! -e "${_ph}/.memql/policy.yaml" && ! -e "${_ph}/.memql/state" ]]; then
+        pass "$_un --purge removes policy.yaml and the state dir"
+    else
+        fail "$_un --purge left policy.yaml or the state dir: $(ls -laR "${_ph}/.memql" 2>&1)"
+    fi
+    if [[ ! -e "${_ph}/.memql" ]]; then
+        pass "$_un --purge removes an emptied ~/.memql"
+    else
+        fail "$_un --purge left ~/.memql behind: $(ls -laR "${_ph}/.memql" 2>&1)"
+    fi
+
+    # A ~/.memql that still holds the CLI's clusters.yaml is KEPT under
+    # --purge, and the summary names what kept it: an uninstall of the
+    # worker must not sign the person out of every cluster.
+    _ch="${_tmp}/un-clusters-home-${_platform}"
+    mkdir -p "$_ch"
+    uninstall_fixture "$_ch" "$_platform"
+    printf 'clusters: []\n' > "${_ch}/.memql/clusters.yaml"
+    _out="$(run_uninstaller "$_un" "$_ch" --user-local --purge)"
+    _rc=$?
+    expect_eq "$_un --purge beside clusters.yaml exits 0" "$_rc" "0"
+    if [[ -f "${_ch}/.memql/clusters.yaml" && "$_out" == *"clusters.yaml"* ]]; then
+        pass "$_un --purge keeps clusters.yaml and says it kept ~/.memql for it"
+    else
+        fail "$_un --purge should keep clusters.yaml and name it; got: $_out"
+    fi
+
+    # Nothing installed: every step reports nothing to remove, exit 0,
+    # and no ~/.memql is created on the way.
+    _eh="${_tmp}/un-empty-home-${_platform}"
+    mkdir -p "$_eh"
+    _out="$(run_uninstaller "$_un" "$_eh" --user-local)"
+    _rc=$?
+    expect_eq "$_un on a machine with nothing installed exits 0" "$_rc" "0"
+    if [[ "$_out" == *"nothing to remove"* && ! -e "${_eh}/.memql" ]]; then
+        pass "$_un with nothing installed reports it and creates nothing"
+    else
+        fail "$_un with nothing installed should say so and leave HOME untouched; got: $_out"
+    fi
+
+    # The fence: a state_dir worker.yaml points OUTSIDE ~/.memql is never
+    # deleted, purge or not. That path is operator-authored text, and
+    # rm -rf on it is the one thing this script must not do.
+    _fh="${_tmp}/un-fence-home-${_platform}"
+    _outside="${_tmp}/un-outside-${_platform}"
+    mkdir -p "$_fh" "$_outside"
+    uninstall_fixture "$_fh" "$_platform"
+    printf 'keep me\n' > "${_outside}/precious"
+    printf 'cluster_url: https://c.example\ntoken: mql_wkr_fixture\nstate_dir: %s\n' \
+        "$_outside" > "${_fh}/.memql/worker.yaml"
+    _out="$(run_uninstaller "$_un" "$_fh" --user-local --purge)"
+    _rc=$?
+    expect_eq "$_un --purge with an outside state_dir exits 0" "$_rc" "0"
+    if [[ -f "${_outside}/precious" && "$_out" == *"outside"* && "$_out" == *"$_outside"* ]]; then
+        pass "$_un --purge leaves a state_dir outside ~/.memql alone and names it"
+    else
+        fail "$_un --purge touched or failed to name the outside state_dir; got: $_out"
+    fi
+    if [[ ! -e "${_fh}/.memql/policy.yaml" ]]; then
+        pass "$_un --purge still removes policy.yaml when the state_dir was refused"
+    else
+        fail "$_un --purge should still remove policy.yaml"
+    fi
+done
+
+# Default (system) mode with nothing at /usr/local/bin must not reach
+# for sudo: the presence check runs first, and a machine with nothing
+# there is told so rather than asked for a password to find out.
+# Guarded, because a developer's machine may hold a real install at
+# /usr/local/bin and this test must never remove one.
+_sys_present="no"
+for _n in "$INSTALLED_COMMAND" "$_pf_headless" "$_pf_computeruse" $LEGACY_BINARIES; do
+    if [[ -e "/usr/local/bin/${_n}" || -L "/usr/local/bin/${_n}" ]]; then
+        _sys_present="yes"
+    fi
+done
+if [[ "$_sys_present" == "yes" ]]; then
+    echo "INFO: /usr/local/bin holds a memql install; skipping the system-mode no-op check"
+else
+    for _platform in mac linux; do
+        _un="uninstall-${_platform}.sh"
+        _sh="${_tmp}/un-sys-home-${_platform}"
+        mkdir -p "$_sh"
+        _out="$(run_uninstaller "$_un" "$_sh")"
+        _rc=$?
+        expect_eq "$_un system mode with nothing installed exits 0 without sudo" "$_rc" "0"
+        if [[ "$_out" == *"INFO: no ${INSTALLED_COMMAND} binary at /usr/local/bin; nothing to remove"* ]]; then
+            pass "$_un system mode reports the empty prefix rather than asking for sudo"
+        else
+            fail "$_un system mode should report nothing at /usr/local/bin; got: $_out"
+        fi
+    done
+fi
 
 # ---------------------------------------------------------------
 # Summary
