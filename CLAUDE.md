@@ -91,8 +91,10 @@ checkout of the pinned sha is the reference state.
 ```
 memql-cockpit/
 ├── cmd/memql/              Binary entry point: dispatch, cluster add/list/
-│                           remove, login/logout, creds; variant consts
+│                           remove, login/logout, access, creds; variant consts
 ├── internal/
+│   ├── access/             `memql access` — what the cluster says you are:
+│   │                       role slug / name / rank, groups, account scope
 │   ├── auth/               Identity-service auth: browser code grant with
 │   │                       loopback callback; RFC 8628 device flow fallback
 │   │                       (device.go) for SSH / headless machines
@@ -122,7 +124,7 @@ memql-cockpit/
 │                           one-liner. install.sh at the root is the plain
 │                           binary installer from GitHub releases
 ├── deploy/systemd/         memql-worker.service template (user systemd)
-├── docs/                   computer-use.md, local-apps.md,
+├── docs/                   access.md, computer-use.md, local-apps.md,
 │                           local-models.md, watched-folders.md;
 │                           docs/superpowers/specs/ designs (the plans
 │                           beside them are deleted by the PR that
@@ -504,6 +506,59 @@ an `errors` array, so a client that only checked the status would read "you may
 not see these rows" as "you are watching nothing" -- and a backup with nothing
 to do looks exactly like one that is up to date. Every call reads `errors`
 first.
+
+## The role is a slug with a rank (memql-cockpit#403)
+
+`memql access` prints what a cluster says about the credential on THIS
+machine: the user it resolves to, the role held, the groups, the account
+scope. `internal/access/`. Engine epic memql#5166; the record is the
+ENGINE repository's `docs/superpowers/specs/2026-09-07-roles-as-data-design.md`
+section G, and this repository has no separate record. Operator doc:
+[docs/access.md](docs/access.md).
+
+**BY NAME, NEVER BY NUMBER, and this is the whole design.** Both records
+that add fields to `MyAccessResult` settle the NAMES and hand the NUMBERS
+to whoever writes the engine change -- "field numbers are chosen by the
+implementer against the current message; the names are the contract". A
+number written down here is therefore a GUESS the engine is free to
+contradict, and the failure is the worst kind: whatever the landed message
+puts at field 11 would render as somebody's role. It also rules out the
+obvious alternative -- proto keeps unrecognised fields as `unknownFields`
+BYTES KEYED BY NUMBER ONLY, the name never travels, so `role` cannot be
+pulled out of an unknown-field blob without already knowing the number the
+records decline to settle. Reading the descriptor by name is the only
+correct option, and it is why nothing here changes when the field lands.
+
+**Nothing in this repository names the retired enum, and a test says so.**
+`TestNoCockpitCodePathNamesTheRetiredRoleEnum` walks every Go file with
+NOTHING excluded (its needles are assembled from fragments so it does not
+match itself). The criterion holds vacuously today -- the slim-down deleted
+the TUI that read the enum -- which is exactly why it is worth pinning: the
+next person needing a role will find the generated getter for `cluster_role`
+sitting on the pinned proto and use it because it compiles. That renders
+identically for the five predefined roles and breaks only for the custom
+role the epic exists for.
+
+**AN ABSENCE IS A SENTENCE, NEVER A BLANK.** Every line has a state where
+the cluster said nothing, and a blank reads as the OPPOSITE claim -- "you
+hold no role" rather than "this cluster did not say" -- which sends
+somebody to ask for a grant they already have. The same rule holds in
+`--json`, where it is easier to get wrong: every absent-able block is an
+object with an explicit `reported`, because a missing key and a false one
+are both falsey to the caller. `rank` is a POINTER there and carries
+`HasRank` in Go, because **0 IS A RANK** -- the record's unknown slug, "holds
+nothing, everywhere, until re-roled" -- and `omitempty` on a plain int
+would delete precisely the value that explains every refusal the reader is
+about to hit.
+
+**The fields do not exist at the current pin** (memql#5181 and memql#5165
+are both unmerged), so `memql access` reports the role as not reported and
+names the engine issue. That is the expected state, not a failure, and the
+cockpit does NOT fall back to the five-value enum -- a guess would be wrong
+in exactly the case the command exists for. `future_wire_test.go` builds
+the message the records describe, at field numbers DELIBERATELY not the
+ones they illustrate, and runs the real decode against it; that is the only
+way to test a wire this repository cannot yet see.
 
 ## Worker + auth notes
 
