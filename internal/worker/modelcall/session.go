@@ -945,6 +945,7 @@ func paramsFrom(p *memqlv1.ModelCallParams) Params {
 		TopP:            p.GetTopP(),
 		TopPSet:         p.GetTopPSet(),
 		MaxOutputTokens: p.GetMaxOutputTokens(),
+		ContextTokens:   p.GetContextTokens(),
 		Stop:            p.GetStop(),
 		Seed:            p.GetSeed(),
 		SeedSet:         p.GetSeedSet(),

@@ -229,10 +229,10 @@ func (f *fakeSetup) run() (int, string) {
 
 func TestSetupInference_HappyPath(t *testing.T) {
 	f := newFakeSetup(t, macServing())
-	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
+	f.progress["qwen3.8:27b"] = onePull(4_661_211_808)
 	f.progress["qwen3-embedding:0.6b"] = onePull(274_302_450)
 	f.inv = servingInventory(
-		offeredModel("qwen3.5:9b", models.Attributes{
+		offeredModel("qwen3.8:27b", models.Attributes{
 			ContextWindow: 131072, StructuredOutput: true, Tools: true,
 			Params: 8_030_000_000, Quant: "Q4_K_M", MaxConcurrent: 1,
 		}),
@@ -255,7 +255,7 @@ func TestSetupInference_HappyPath(t *testing.T) {
 		"  Hardware   Apple M2 Max, 32 GB, macOS 15 -- meets the floor",
 		"  Runtime    Ollama, already running at http://127.0.0.1:11434",
 		"  Class      24 -- 24.0 GB usable, 75% of 32 GB unified",
-		"  Models     qwen3.5:9b, qwen3-embedding:0.6b",
+		"  Models     qwen3.8:27b, qwen3-embedding:0.6b",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the preamble must carry %q:\n%s", want, out)
@@ -265,10 +265,10 @@ func TestSetupInference_HappyPath(t *testing.T) {
 	// Both defaults, in the order the plan states them: one general
 	// model and one embedding model, because the operations this fleet
 	// serves locally are both kinds.
-	if got := strings.Join(f.pulled, ","); got != "qwen3.5:9b,qwen3-embedding:0.6b" {
+	if got := strings.Join(f.pulled, ","); got != "qwen3.8:27b,qwen3-embedding:0.6b" {
 		t.Errorf("pulled = %q, want the default pair", got)
 	}
-	if got := strings.Join(f.allowed, ","); got != "qwen3.5:9b,qwen3-embedding:0.6b" {
+	if got := strings.Join(f.allowed, ","); got != "qwen3.8:27b,qwen3-embedding:0.6b" {
 		t.Errorf("allowed = %q, want both models", got)
 	}
 	if !f.readvertised {
@@ -303,10 +303,10 @@ func TestSetupInference_HappyPath(t *testing.T) {
 func TestSetupInference_HappyPathOnATerminal(t *testing.T) {
 	f := newFakeSetup(t, macServing())
 	f.setup.tty = true
-	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
+	f.progress["qwen3.8:27b"] = onePull(4_661_211_808)
 	f.progress["qwen3-embedding:0.6b"] = onePull(274_302_450)
 	f.inv = servingInventory(
-		offeredModel("qwen3.5:9b", models.Attributes{
+		offeredModel("qwen3.8:27b", models.Attributes{
 			ContextWindow: 131072, StructuredOutput: true, Tools: true,
 			Params: 8_030_000_000, Quant: "Q4_K_M", MaxConcurrent: 1,
 		}),
@@ -326,7 +326,7 @@ func TestSetupInference_HappyPathOnATerminal(t *testing.T) {
 		t.Errorf("a terminal must be redrawn in place:\n%q", out)
 	}
 	for _, want := range []string{
-		"Pulling qwen3.5:9b",
+		"Pulling qwen3.8:27b",
 		"  4.7 GB total",
 		"[========================================] 100%   4.7 GB / 4.7 GB",
 		"Pulling qwen3-embedding:0.6b",
@@ -354,7 +354,7 @@ func TestSetupInference_ModelFlagOverridesTheDefaults(t *testing.T) {
 	if got := strings.Join(f.pulled, ","); got != "qwen2.5:7b,hf.co/owner/repo:Q4_K_M" {
 		t.Errorf("pulled = %q, want the ids as typed, deduplicated", got)
 	}
-	if strings.Contains(out, "qwen3.5:9b") {
+	if strings.Contains(out, "qwen3.8:27b") {
 		t.Errorf("a default must not be pulled beside an explicit --model:\n%s", out)
 	}
 }
@@ -431,7 +431,7 @@ func TestSetupInference_NoGPUToolkitNamesThePackageAndTheSudoRule(t *testing.T) 
 func TestSetupInference_LinuxDefaultStagesTheRuntimeAsTheUser(t *testing.T) {
 	f := newFakeSetup(t, linuxNative())
 	f.setup.in = strings.NewReader("y\n")
-	f.inv = servingInventory(offeredModel("qwen3.5:9b", models.Attributes{ContextWindow: 131072}))
+	f.inv = servingInventory(offeredModel("qwen3.8:27b", models.Attributes{ContextWindow: 131072}))
 
 	code, out := f.run()
 	t.Logf("transcript:\n%s", out)
@@ -666,7 +666,7 @@ func TestSetupInference_RuntimeNativeOnLinuxIsTheDefault(t *testing.T) {
 	f := newFakeSetup(t, linuxNative())
 	f.setup.runtimeFlag = "native"
 	f.setup.in = strings.NewReader("y\n")
-	f.inv = servingInventory(offeredModel("qwen3.5:9b", models.Attributes{ContextWindow: 131072}))
+	f.inv = servingInventory(offeredModel("qwen3.8:27b", models.Attributes{ContextWindow: 131072}))
 	code, out := f.run()
 	if code != SetupExitOK {
 		t.Errorf("exit code = %d, want %d\n%s", code, SetupExitOK, out)
@@ -684,7 +684,7 @@ func TestSetupInference_RuntimeDockerOnLinuxTakesTheContainer(t *testing.T) {
 	f := newFakeSetup(t, h)
 	f.setup.runtimeFlag = "docker"
 	f.setup.in = strings.NewReader("y\n")
-	f.inv = servingInventory(offeredModel("qwen3.5:9b", models.Attributes{ContextWindow: 131072}))
+	f.inv = servingInventory(offeredModel("qwen3.8:27b", models.Attributes{ContextWindow: 131072}))
 	code, out := f.run()
 	if code != SetupExitOK {
 		t.Fatalf("exit code = %d, want %d\n%s", code, SetupExitOK, out)
@@ -987,8 +987,8 @@ func TestSetupInference_DiskRefusalNamesBothNumbers(t *testing.T) {
 	// flow will actually ask for. A fixture keyed on some other model
 	// fires no progress at all, and the disk refusal this test exists
 	// for is then never reached.
-	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
-	f.pullErr = errors.New("pulling qwen3.5:9b was cancelled: context canceled")
+	f.progress["qwen3.8:27b"] = onePull(4_661_211_808)
+	f.pullErr = errors.New("pulling qwen3.8:27b was cancelled: context canceled")
 
 	code, out := f.run()
 	t.Logf("transcript:\n%s", out)
@@ -1001,7 +1001,7 @@ func TestSetupInference_DiskRefusalNamesBothNumbers(t *testing.T) {
 	if strings.Contains(out, "context canceled") {
 		t.Errorf("the cancellation must not be what is reported:\n%s", out)
 	}
-	for _, want := range []string{"not enough disk", "4.7 GB", "2.1 GB", "qwen3.5:9b"} {
+	for _, want := range []string{"not enough disk", "4.7 GB", "2.1 GB", "qwen3.8:27b"} {
 		if !strings.Contains(strings.ToLower(flat(out)), strings.ToLower(want)) {
 			t.Errorf("the refusal must name %q:\n%s", want, out)
 		}
@@ -1260,5 +1260,22 @@ func TestAlreadySaidPrintsNothingTwice(t *testing.T) {
 	// carries its message, so runInferenceSetup has something to print.
 	if msg := setupFailed("this machine could not be inspected: %v", errors.New("boom")).Error(); msg == "" {
 		t.Error("an unclassified failure must carry a message for stderr")
+	}
+}
+
+func TestSetupInferenceRefusesUnavailableCustomEndpointBeforeInstall(t *testing.T) {
+	for _, base := range []string{"http://127.0.0.1:11435", "http://remote.example:11434", "https://localhost:11434"} {
+		t.Run(base, func(t *testing.T) {
+			f := newFakeSetup(t, linuxNative())
+			f.setup.base = func() string { return base }
+			f.setup.in = strings.NewReader("yes\n")
+			err := f.setup.run(context.Background())
+			if SetupExitCode(err) != SetupExitPrereq || !strings.Contains(err.Error(), "OLLAMA_HOST") {
+				t.Errorf("expected endpoint refusal naming OLLAMA_HOST, got %v", err)
+			}
+			if len(f.staged) > 0 || len(f.ran) > 0 || len(f.pulled) > 0 || len(f.allowed) > 0 {
+				t.Errorf("mutated machine before endpoint refusal: events=%v pulled=%v", f.events, f.pulled)
+			}
+		})
 	}
 }

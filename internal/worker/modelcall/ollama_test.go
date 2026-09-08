@@ -8,6 +8,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // ollamaToolCallStream is a recorded /api/chat response for a call that
@@ -242,5 +245,62 @@ func TestOllamaChat_ToolRoundTripUsesOllamaSpelling(t *testing.T) {
 	}
 	if result.Content != `{"celsius":21}` {
 		t.Errorf("tool content = %q", result.Content)
+	}
+}
+
+// An estimate is not a tokenizer. The runtime must reject a prompt it cannot
+// fit, not return a successful answer or embedding after silently cutting it.
+func TestOllamaContextOverflowIsAWorkerError(t *testing.T) {
+	for _, kind := range []string{KindChat, KindEmbedding} {
+		t.Run(kind, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				// Ollama defaults truncation on. Model its documented response
+				// when input exceeds num_ctx with/without explicit refusal.
+				if truncate, present := body["truncate"]; present && truncate == false {
+					w.WriteHeader(http.StatusBadRequest)
+					io.WriteString(w, `{"error":"the input length exceeds the context length"}`)
+					return
+				}
+				if kind == KindEmbedding {
+					io.WriteString(w, `{"embeddings":[[1,2]],"prompt_eval_count":8192}`)
+				} else {
+					io.WriteString(w, ollamaDoneFrame)
+				}
+			}))
+			defer srv.Close()
+			m := managerFor(inventoryWith(ollamaModel(srv.URL, "m", models.Attributes{
+				ContextWindow: 65536, Embeddings: true, MaxConcurrent: 1,
+			})))
+			rec := newRecorder()
+			request := start("r", "m", kind)
+			request.Params = &memqlv1.ModelCallParams{ContextTokens: 32768}
+			request.EmbeddingInput = []string{strings.Repeat("long ", 10000)}
+			m.Start(context.Background(), rec, request)
+			end := rec.wait(t)
+			if !strings.Contains(end.Error, "input length exceeds the context length") || end.FinishReason != FinishError {
+				t.Errorf("over-context input returned a successful prefix result: %+v", end)
+			}
+			if len(end.Embeddings) != 0 {
+				t.Error("truncated embedding escaped the runtime refusal")
+			}
+			if body["truncate"] != false {
+				t.Errorf("truncate=%v, want explicit false", body["truncate"])
+			}
+			options, _ := body["options"].(map[string]any)
+			if kind == KindChat {
+				if body["shift"] != false {
+					t.Errorf("shift=%v, want explicit false", body["shift"])
+				}
+				if options["num_ctx"] != float64(32768) {
+					t.Errorf("chat context=%v", options["num_ctx"])
+				}
+			} else if options["num_ctx"] != float64(8192) {
+				t.Errorf("embedding working context=%v, want 8192", options["num_ctx"])
+			}
+		})
 	}
 }

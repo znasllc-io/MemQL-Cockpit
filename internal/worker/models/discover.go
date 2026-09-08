@@ -59,7 +59,8 @@ type DeclaredModel struct {
 	MaxConcurrent    int    `yaml:"max_concurrent"`
 	// Params is the parameter COUNT, written out (7620000000), not the
 	// human string a model card prints. It is what the engine ranks on.
-	Params int64 `yaml:"params"`
+	Params       int64 `yaml:"params"`
+	ActiveParams int64 `yaml:"activeparams"`
 	// Quant is the quantization level, an operator-facing string that
 	// gates nothing and breaks the label if it carries a ',' or an '='
 	// -- quantSafe drops such a level rather than emitting it.

@@ -460,6 +460,12 @@ func (s *inferenceSetup) ensureRuntime(ctx context.Context, p inference.Plan) er
 	if p.RuntimePresent || len(p.Install) == 0 {
 		return nil
 	}
+	if p.Stage != nil {
+		base := strings.TrimRight(s.base(), "/")
+		if base != "http://127.0.0.1:11434" && base != "http://localhost:11434" {
+			return setupPrereq("OLLAMA_HOST selects %s, but native setup installs a loopback service at 127.0.0.1:11434. Start your chosen runtime yourself, or unset OLLAMA_HOST and run setup again; nothing was installed.", base)
+		}
+	}
 
 	s.line(runtimeName(p.Runtime) + " is not installed. This machine needs it to serve models.")
 	if note := strings.TrimSpace(p.Note); note != "" {

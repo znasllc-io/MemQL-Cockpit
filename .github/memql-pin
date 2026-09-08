@@ -60,4 +60,8 @@
 # (internal/worker/modelpull.go) against this pin; the ModelProbe arm is still
 # not written. `go mod tidy` moved the indirect set to what the engine now
 # requires (openai-go in, go-openai out, gjson up) and nothing else.
-546dfb116c252ee5e166e9b4dccd4f33c398828e
+# Native inference coordination (memql PR #5238): adds the working-context
+# field on ModelCallParams; this worker maps it to Ollama num_ctx. Model active
+# parameter counts still travel in Register labels. The final merge updates
+# this pin to the engine main commit before the Cockpit release.
+aab0624ee0df485da0a2a50ca482ae2b2e04238f

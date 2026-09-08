@@ -772,3 +772,62 @@ func TestKeepalivesFireOnEveryRun(t *testing.T) {
 		}
 	}
 }
+
+// TestEmbed_SendsTheWorkingContext pins the one option an embedding call
+// carries: without it Ollama loads the embedder at its VRAM-tier default
+// context, which on a 24 GB card is a 3.8 GB cache in front of a 639 MB
+// model, and the embedder cannot sit beside the 27B the class recommends.
+func TestEmbed_SendsTheWorkingContext(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"model": "nomic", "embeddings": [][]float32{{1, 2}}, "prompt_eval_count": 3,
+		})
+	}))
+	defer srv.Close()
+
+	m := managerFor(inventoryWith(ollamaModel(srv.URL, "nomic", models.Attributes{Embeddings: true, MaxConcurrent: 1})))
+	rec := newRecorder()
+	s := start("r", "nomic", KindEmbedding)
+	s.EmbeddingInput = []string{"a"}
+	m.Start(context.Background(), rec, s)
+	rec.wait(t)
+
+	opts, _ := body["options"].(map[string]any)
+	if got, _ := opts["num_ctx"].(float64); int(got) != embedWorkingContext {
+		t.Fatalf("num_ctx = %v, want %d; body %v", opts["num_ctx"], embedWorkingContext, body)
+	}
+}
+
+func TestChatForwardsContextFromWorkerEnvelopeToOllama(t *testing.T) {
+	for _, tokens := range []int64{32768, 0} {
+		t.Run(fmt.Sprint(tokens), func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/chat" {
+					t.Errorf("path = %s", r.URL.Path)
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				io.WriteString(w, `{"model":"chat","message":{"content":"ok"},"done":true}`+"\n")
+			}))
+			defer srv.Close()
+			m := managerFor(inventoryWith(ollamaModel(srv.URL, "chat", models.Attributes{ContextWindow: 65536, MaxConcurrent: 1})))
+			rec := newRecorder()
+			request := start("r", "chat", KindChat)
+			request.Params = &memqlv1.ModelCallParams{ContextTokens: tokens}
+			m.Start(context.Background(), rec, request)
+			if end := rec.wait(t); end.Error != "" {
+				t.Fatalf("call failed: %v", end.Error)
+			}
+			opts, _ := body["options"].(map[string]any)
+			got, exists := opts["num_ctx"]
+			if tokens > 0 && got != float64(tokens) {
+				t.Errorf("num_ctx = %v, want %d", got, tokens)
+			}
+			if tokens == 0 && exists {
+				t.Errorf("absent context became %v", got)
+			}
+		})
+	}
+}

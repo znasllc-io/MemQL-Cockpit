@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -226,16 +227,36 @@ func (s Stage) Unit() string {
 		"\n" +
 		"[Service]\n" +
 		"Type=simple\n" +
-		"ExecStart=" + filepath.Join(s.RuntimeDir, "bin", "ollama") + " serve\n" +
+		// systemd restricts characters in the executable itself even when
+		// quoted. A fixed launcher keeps the operator path in an ordinary
+		// argv slot; it is absolute, so env does no PATH lookup and no shell.
+		"ExecStart=/usr/bin/env " + unitWord(strings.ReplaceAll(filepath.Join(s.RuntimeDir, "bin", "ollama"), "$", "$$")) + " serve\n" +
 		"Environment=OLLAMA_HOST=" + s.Listen + "\n" +
-		"Environment=OLLAMA_MODELS=" + s.ModelsDir + "\n" +
+		"Environment=" + unitWord("OLLAMA_MODELS="+s.ModelsDir) + "\n" +
+		// The cache at eight bits: half the memory of f16 for a loss the
+		// runtime's own docs call very small, and on a 24 GB card the
+		// difference between the 27B and the embedder staying resident
+		// together and a reload on every embed-then-chat pair. Flash
+		// attention, which it needs, is the runtime's default where the
+		// device supports it (2026-09-08 record, D9).
+		"Environment=OLLAMA_KV_CACHE_TYPE=q8_0\n" +
 		"Restart=on-failure\n" +
 		"RestartSec=3\n" +
-		"StandardOutput=append:" + s.LogPath + "\n" +
-		"StandardError=append:" + s.LogPath + "\n" +
+		"StandardOutput=append:" + strings.ReplaceAll(s.LogPath, "%", "%%") + "\n" +
+		"StandardError=append:" + strings.ReplaceAll(s.LogPath, "%", "%%") + "\n" +
 		"\n" +
 		"[Install]\n" +
 		"WantedBy=default.target\n"
+}
+
+// unitWord protects paths from systemd's word splitting, C escapes and
+// specifier expansion. This is systemd syntax, not shell quoting.
+func unitWord(value string) string {
+	value = strings.ReplaceAll(value, "%", "%%")
+	if !strings.ContainsAny(value, " \t\r\n\\\"'") {
+		return value
+	}
+	return strconv.Quote(value)
 }
 
 // Stager runs a Stage. A seam for the same reason Runner is: the tests
@@ -521,10 +542,24 @@ func unpackTarZst(path, dest string) error {
 		return err
 	}
 	defer zr.Close()
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	tr := tar.NewReader(zr)
+	var links []string
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
+			// Check the completed chain, including links never followed
+			// while unpacking. Otherwise a later library load could follow
+			// an escape that the rooted writes never had to resolve.
+			for _, name := range links {
+				if _, err := root.Stat(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("%w: resolving %s: %v", ErrArchiveEscapes, name, err)
+				}
+			}
 			return nil
 		}
 		if err != nil {
@@ -537,16 +572,20 @@ func unpackTarZst(path, dest string) error {
 		if target == "" {
 			continue
 		}
+		name, err := filepath.Rel(dest, target)
+		if err != nil {
+			return err
+		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)|0o700); err != nil {
+			if err := root.MkdirAll(name, os.FileMode(hdr.Mode)&0o777|0o700); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 				return err
 			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)|0o600)
+			out, err := root.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777|0o600)
 			if err != nil {
 				return err
 			}
@@ -565,25 +604,33 @@ func unpackTarZst(path, dest string) error {
 			if filepath.IsAbs(hdr.Linkname) || !strings.HasPrefix(resolved, dest+string(filepath.Separator)) {
 				return fmt.Errorf("%w: %s -> %s", ErrArchiveEscapes, hdr.Name, hdr.Linkname)
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 				return err
 			}
-			_ = os.Remove(target)
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
+			_ = root.Remove(name)
+			if err := root.Symlink(hdr.Linkname, name); err != nil {
 				return err
 			}
+			links = append(links, name)
 		case tar.TypeLink:
 			source, err := insideDir(dest, hdr.Linkname)
 			if err != nil || source == "" {
 				return fmt.Errorf("%w: %s -> %s", ErrArchiveEscapes, hdr.Name, hdr.Linkname)
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
 				return err
 			}
-			_ = os.Remove(target)
-			if err := os.Link(source, target); err != nil {
+			_ = root.Remove(name)
+			sourceName, err := filepath.Rel(dest, source)
+			if err != nil {
 				return err
 			}
+			if err := root.Link(sourceName, name); err != nil {
+				return err
+			}
+			// A hardlink to a symlink relocates its relative target. Check
+			// that new location too before the runtime can follow it.
+			links = append(links, name)
 		default:
 			// Character devices, fifos and the rest have no business in
 			// a runtime archive; skipped rather than refused, since a
@@ -618,7 +665,8 @@ func insideDir(dest, name string) (string, error) {
 // was asked to start, not that anything is listening -- and the very next
 // step pulls against that socket.
 func WaitReady(ctx context.Context, base string, within time.Duration) error {
-	deadline := time.Now().Add(within)
+	ctx, cancel := context.WithTimeout(ctx, within)
+	defer cancel()
 	url := strings.TrimRight(base, "/") + "/api/version"
 	client := &http.Client{Timeout: 2 * time.Second}
 	for {
@@ -628,17 +676,18 @@ func WaitReady(ctx context.Context, base string, within time.Duration) error {
 		}
 		resp, err := client.Do(req)
 		if err == nil {
+			var version struct {
+				Version string `json:"version"`
+			}
+			decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&version)
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			if resp.StatusCode == http.StatusOK && decodeErr == nil && strings.TrimSpace(version.Version) != "" {
 				return nil
 			}
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("nothing answered at %s within %s", base, within)
-		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return fmt.Errorf("nothing answered at %s within %s: %w", base, within, ctx.Err())
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

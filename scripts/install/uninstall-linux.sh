@@ -116,20 +116,20 @@ function parse_args() {
 # and by nothing else -- without this line a --purge would delete the
 # runtime out from under a unit still trying to restart it). The
 # runtime's unit goes BEFORE the runtime directory does, for that
-# reason. The disable is attempted and
-# REPORTED on its own: a machine with no user manager running (an SSH
-# session without lingering, a container) fails it, and the unit file
-# still has to go, so that failure is a WARN and not a stop. A machine
-# with no systemctl on PATH at all is told the same way and gets the
-# file removal only -- lib_test.sh runs this script exactly so.
+# reason. A failed disable (for example an unavailable user manager)
+# reports a partial uninstall and keeps the unit and runtime state
+# for a safe retry while the worker token is still removed. A machine
+# with no systemctl on PATH gets the same preservation: an absent
+# command cannot establish that the service stopped.
 function remove_systemd_unit() {
     local unit_dir="${HOME}/.config/systemd/user"
     local have_systemctl="yes"
     if ! command -v systemctl >/dev/null 2>&1; then
         have_systemctl="no"
-        echo "INFO: systemctl not found; not stopping the unit (the unit files are still removed)"
+        echo "WARN: systemctl not found; installed units and runtime state will be kept because their services cannot be stopped"
     fi
     local label unit path
+    local unit_rc=0
     for label in "$SERVICE_LABEL_LINUX" "$LEGACY_LABEL_LINUX" "$OLLAMA_LABEL_LINUX"; do
         unit="${label}.service"
         path="${unit_dir}/${unit}"
@@ -141,11 +141,19 @@ function remove_systemd_unit() {
             fi
             continue
         fi
+        if [[ "$have_systemctl" == "no" ]]; then
+            record_kept "$path (systemctl missing; retry uninstall with the user manager available)"
+            unit_rc=1
+            continue
+        fi
         if [[ "$have_systemctl" == "yes" ]]; then
             if systemctl --user disable --now "$unit" >/dev/null 2>&1; then
                 echo "INFO: stopped and disabled ${unit}"
             else
-                echo "WARN: systemctl --user disable --now ${unit} failed (no user manager?); removing the unit file anyway"
+                echo "WARN: systemctl --user disable --now ${unit} failed; keeping the unit and runtime state so a running service is not purged"
+                record_kept "$path (stop failed; retry uninstall when the user manager is available)"
+                unit_rc=1
+                continue
             fi
         fi
         rm -f "$path"
@@ -155,6 +163,7 @@ function remove_systemd_unit() {
     if [[ "$have_systemctl" == "yes" ]]; then
         systemctl --user daemon-reload >/dev/null 2>&1 || true
     fi
+    return "$unit_rc"
 }
 
 function main() {
@@ -168,7 +177,8 @@ function main() {
     # leaves the least behind if a step is interrupted -- a
     # Restart=on-failure unit still running would re-exec a binary that
     # is about to go, with a token that is about to go.
-    remove_systemd_unit
+    local unit_rc=0
+    remove_systemd_unit || unit_rc=$?
     # A binary that needs sudo this run cannot get is reported and
     # left; the token still goes, because it matters more, and the exit
     # code carries the leftover.
@@ -176,11 +186,12 @@ function main() {
     remove_binaries_with_mode "$REMOVE_MODE" || binary_rc=$?
     remove_path_if_present "${HOME}/.memql/worker.yaml"
     remove_path_if_present "${HOME}/.memql/worker.env"
-    if [[ "$PURGE" == "yes" ]]; then
+    if [[ "$PURGE" == "yes" && "$unit_rc" -eq 0 ]]; then
         purge_worker_state "$state_dir"
     else
         report_kept_state "$state_dir"
     fi
+    if [[ "$unit_rc" -ne 0 ]]; then binary_rc="$unit_rc"; fi
     print_uninstall_summary "$binary_rc"
     exit "$binary_rc"
 }

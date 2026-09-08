@@ -21,10 +21,8 @@ import (
 //
 // The split matters in one direction: a machine whose /api/show does not
 // answer still states its sizes, because those arrived with the listing.
-// /api/show's model_info carries a more exact general.parameter_count and
-// it is deliberately not used -- params is an ordering signal (D5), and
-// precision bought by making the attribute depend on a second call that
-// can fail is precision that costs the attribute.
+// A successful /api/show refines the total count and supplies tensor shapes
+// for mixture active-parameter accounting; failure keeps the listing's total.
 
 // ollamaTagsResponse is the shape of GET /api/tags.
 type ollamaTagsResponse struct {
@@ -47,6 +45,7 @@ type ollamaTagsResponse struct {
 type ollamaShowResponse struct {
 	Capabilities []string       `json:"capabilities"`
 	ModelInfo    map[string]any `json:"model_info"`
+	Tensors      []ollamaTensor `json:"tensors"`
 }
 
 // probeOllama returns the models Ollama has, and a note when it has
@@ -105,6 +104,10 @@ func (d *Discoverer) probeOllama(ctx context.Context) ([]Info, string) {
 		// listing.
 		var show ollamaShowResponse
 		if err := d.postJSON(ctx, base+"/api/show", map[string]string{"model": id}, &show); err == nil {
+			if total := ollamaParameterCount(show.ModelInfo["general.parameter_count"]); total > 0 {
+				info.Params = total
+			}
+			info.ActiveParams = ollamaActiveParams(show)
 			info.ContextWindow = ollamaContextLength(show.ModelInfo)
 			info.Embeddings = hasCapability(show.Capabilities, "embedding")
 			info.Tools = hasCapability(show.Capabilities, "tools")

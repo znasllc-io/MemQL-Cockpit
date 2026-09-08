@@ -9,6 +9,7 @@ require (
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/jezek/xgb v1.3.1
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a
+	github.com/klauspost/compress v1.19.1
 	github.com/znasllc-io/memql v0.0.0-20260623073124-7c7d1350e667
 	github.com/znasllc-io/memql/component/grpc/gen v0.0.0
 	github.com/znasllc-io/memql/component/identity v0.0.0
@@ -43,7 +44,6 @@ require (
 	github.com/gsterjov/go-libsecret v0.0.0-20161001094733-a6f4afe4910c // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/lib/pq v1.12.3 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260324052639-156f7da3f749 // indirect
 	github.com/mtibben/percent v0.2.1 // indirect

@@ -502,7 +502,7 @@ func TestDecide(t *testing.T) {
 			// refusals, which is the half a table of happy cases would
 			// never reach.
 			if len(got.DefaultModels) != 2 ||
-				got.DefaultModels[0] != "qwen3.5:9b" ||
+				got.DefaultModels[0] != "qwen3.5:4b" ||
 				got.DefaultModels[1] != "qwen3-embedding:0.6b" {
 				t.Errorf("DefaultModels = %q, want the smallest recommended set", got.DefaultModels)
 			}

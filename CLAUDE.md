@@ -333,7 +333,19 @@ native runtime, so reaching for a symmetric package name produces a
 refusal naming something nobody can install. The Linux uninstaller
 removes the runtime's unit with the worker's, and `--purge` takes
 `~/.memql/ollama` -- runtime and models -- so a machine is never left
-serving models from something Fleet cannot see.
+serving models from something Fleet cannot see. If stopping a unit fails or `systemctl` is unavailable,
+uninstall reports a partial result and preserves the unit and runtime for
+a retry; it still removes the worker token.
+
+**Working context is explicit.** Chat forwards the engine's
+`ModelCallParams.context_tokens` to Ollama's `options.num_ctx`; an absent
+value preserves the runtime default. Embedding uses 8192 tokens so the
+0.6B embedder's cache can fit beside the class's chat model. The native unit
+sets `OLLAMA_KV_CACHE_TYPE=q8_0`; Ollama enables Flash Attention itself on
+supported devices. The recommended pairs are 4B below class 16, 9B at 16,
+27B Q4 at 24/32, and 27B Q8 at 64/128, always followed by the same 0.6B
+embedder. The 24 GB pair is budgeted at 32K chat context, not every context
+the model supports.
 
 **The pull is `POST /api/pull`, NOT `ollama pull`**, and the design
 record's plan naming a subprocess was wrong on the platform its own D1

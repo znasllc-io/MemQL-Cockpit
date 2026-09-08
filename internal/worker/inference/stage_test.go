@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -159,9 +160,10 @@ func TestStageRuntimeFetchesVerifiesUnpacksAndWritesTheUnit(t *testing.T) {
 		t.Fatalf("the unit was not written: %v", err)
 	}
 	for _, want := range []string{
-		"ExecStart=" + bin + " serve",
+		"ExecStart=/usr/bin/env " + bin + " serve",
 		"Environment=OLLAMA_HOST=127.0.0.1:11434",
 		"Environment=OLLAMA_MODELS=" + s.ModelsDir,
+		"Environment=OLLAMA_KV_CACHE_TYPE=q8_0",
 		"StandardOutput=append:" + s.LogPath,
 		"WantedBy=default.target",
 	} {
@@ -440,5 +442,110 @@ func TestStageRuntimeRefusesAFullDiskBeforeDownloading(t *testing.T) {
 	}
 	if _, err := os.Stat(s.UnitPath); err == nil {
 		t.Error("no unit may be written when nothing was unpacked")
+	}
+}
+
+func TestUnpackRejectsSymlinkChainEscape(t *testing.T) {
+	home := t.TempDir()
+	dest := filepath.Join(home, "runtime")
+	outside := filepath.Join(home, "outside")
+	for _, d := range []string{dest, outside} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := []fakeEntry{
+		{name: "a/b", typ: tar.TypeDir, mode: 0755},
+		{name: "a/b/up", typ: tar.TypeSymlink, link: ".."},
+		{name: "a/b/up/escape", typ: tar.TypeSymlink, link: "../../outside"},
+		{name: "a/escape/owned", typ: tar.TypeReg, mode: 0644, body: "escaped"},
+	}
+	archive := filepath.Join(home, "archive.zst")
+	if err := os.WriteFile(archive, tarZst(t, entries), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unpackTarZst(archive, dest); err == nil {
+		t.Error("symlink chain escaping extraction root was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "owned")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("archive wrote outside runtime: %v", err)
+	}
+}
+
+func TestWaitReadyRequiresAnOllamaVersion(t *testing.T) {
+	for _, body := range []string{"<html>wrong service</html>", "{}", `{"version":""}`} {
+		t.Run(body, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, body) }))
+			defer srv.Close()
+			if err := WaitReady(context.Background(), srv.URL, time.Millisecond); err == nil {
+				t.Fatal("unrelated HTTP 200 accepted as Ollama readiness")
+			}
+		})
+	}
+}
+
+// A library symlink can escape without the archive ever writing through it.
+// Extraction must reject it before a later runtime load follows that link.
+func TestUnpackRejectsUnusedEscapingSymlinkChain(t *testing.T) {
+	home := t.TempDir()
+	dest := filepath.Join(home, "runtime")
+	for _, dir := range []string{dest, filepath.Join(home, "outside")} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries := []fakeEntry{
+		{name: "a/b", typ: tar.TypeDir, mode: 0755},
+		{name: "a/b/up", typ: tar.TypeSymlink, link: ".."},
+		{name: "a/b/up/escape", typ: tar.TypeSymlink, link: "../../outside"},
+	}
+	archive := filepath.Join(home, "archive.zst")
+	if err := os.WriteFile(archive, tarZst(t, entries), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unpackTarZst(archive, dest); err == nil {
+		t.Fatal("accepted an escaping symlink that the runtime could follow later")
+	}
+}
+
+func TestNativeUnitEscapesOperatorPaths(t *testing.T) {
+	s := stageIn("/home/A Person%u")
+	s.ModelsDir = "/mnt/a \"quoted\" path%u/line\nnext"
+	unit := s.Unit()
+	for _, want := range []string{
+		`ExecStart=/usr/bin/env "/home/A Person%%u/.memql/ollama/runtime/bin/ollama" serve`,
+		`Environment="OLLAMA_MODELS=/mnt/a \"quoted\" path%%u/line\nnext"`,
+		`StandardOutput=append:/home/A Person%%u/.memql/state/ollama.log`,
+	} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("unit missing escaped directive %q:\n%s", want, unit)
+		}
+	}
+}
+
+func TestUnpackRejectsRelocatedSymlinkHardlink(t *testing.T) {
+	dest := t.TempDir()
+	archive := filepath.Join(t.TempDir(), "a.zst")
+	entries := []fakeEntry{
+		{name: "x", typ: tar.TypeDir, mode: 0755},
+		{name: "x/link", typ: tar.TypeSymlink, link: "../x"},
+		{name: "z", typ: tar.TypeLink, link: "x/link"},
+	}
+	if err := os.WriteFile(archive, tarZst(t, entries), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unpackTarZst(archive, dest); !errors.Is(err, ErrArchiveEscapes) {
+		t.Fatalf("relocated relative symlink escaped extraction root: %v", err)
+	}
+}
+
+func TestNativeUnitQuotesApostrophePaths(t *testing.T) {
+	s := stageIn("/home/O'Brien")
+	s.ModelsDir = "/mnt/O'Brien/models"
+	unit := s.Unit()
+	for _, want := range []string{`ExecStart=/usr/bin/env "/home/O'Brien/.memql/ollama/runtime/bin/ollama" serve`, `Environment="OLLAMA_MODELS=/mnt/O'Brien/models"`} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("systemd parses apostrophe as quote; missing %s", want)
+		}
 	}
 }
