@@ -258,34 +258,43 @@ func buildHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.In
 	return beat
 }
 
-// The hardware inventory seams (memql#5146, record D1).
-//
-// THE FIELD DOES NOT EXIST. `Heartbeat` and `Register` carry no
-// `hardware` at the pin (5c4f6ae9) and none on engine main either --
-// memql#5146 has not merged. So the inventory is computed, asserted,
-// rendered by `memql worker hardware`, and consumed locally by the
-// machine class that chooses the recommended set; these two functions
-// are the ONLY places the wire field is written, and landing the engine
-// half is a line each:
-//
-//	beat.Hardware = hardwareToProto(hw)
-//	register.Hardware = hardwareToProto(&inv)
-//
-// It is deliberately NOT smuggled into capability_descriptor_json in
-// the meantime. That field does tolerate unknown keys -- which is what
-// makes inferenceServe travel today -- but the engine's AsMap() drops
-// them, so nothing would arrive, and a shape defined in the wrong place
-// is a shape the engine's own field then has to disagree with. The
-// cadence is the part worth getting right now, and it is tested:
-// hardwareOnBeat in loop.go.
+// A nil snapshot is an ordinary beat between scans. HardwarePresent must
+// remain false so the engine leaves the previous inventory alone.
 func heartbeatHardware(beat *memqlv1.Heartbeat, hw *hardware.Inventory) {
-	_, _ = beat, hw
+	if hw == nil {
+		return
+	}
+	beat.Hardware = hardwareToProto(hw)
+	beat.HardwarePresent = true
 }
 
-// registerHardware is the same seam on the handshake. Register carries
-// the FIRST inventory; the beat carries every refresh after it.
+// Registration carries the first scan; every tenth heartbeat refreshes it.
 func registerHardware(register *memqlv1.Register, inv hardware.Inventory) {
-	_, _ = register, inv
+	register.Hardware = hardwareToProto(&inv)
+}
+
+func hardwareToProto(inv *hardware.Inventory) *memqlv1.HardwareInventory {
+	hw := &memqlv1.HardwareInventory{
+		Chip:          inv.Chip,
+		MemoryBytes:   inv.MemoryBytes,
+		CpuCores:      uint32(inv.CPUCores),
+		OsVersion:     inv.OSVersion,
+		DiskFreeBytes: inv.DiskFreeBytes,
+	}
+	if inv.GPU != nil {
+		hw.Gpu = &memqlv1.GpuInfo{
+			Name:      inv.GPU.Name,
+			VramBytes: inv.GPU.VRAMBytes,
+			Backend:   inv.GPU.Backend,
+		}
+	}
+	for _, runtime := range inv.Runtimes {
+		hw.Runtimes = append(hw.Runtimes, &memqlv1.RuntimeInfo{Name: runtime.Name, Version: runtime.Version})
+	}
+	if !inv.ReportedAt.IsZero() {
+		hw.ReportedAt = timestamppb.New(inv.ReportedAt)
+	}
+	return hw
 }
 
 // SendAppSessionChunk emits one piece of app-session output.
@@ -385,7 +394,7 @@ func SetVersion(v string) {
 // cockpitVersionValue defaults to the VERSION file's contents so a build
 // that never calls SetVersion -- a test, or `go run` -- reports something
 // truthful rather than empty.
-var cockpitVersionValue = "0.12.0"
+var cockpitVersionValue = "0.12.1"
 
 func cockpitVersion() string { return cockpitVersionValue }
 func cockpitBuildTag() string {

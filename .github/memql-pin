@@ -64,4 +64,7 @@
 # field on ModelCallParams; this worker maps it to Ollama num_ctx. Model active
 # parameter counts still travel in Register labels. Pinned to the actual
 # engine main merge, including first-machine onboarding and chat targeting.
-87055f0961726940f735df2c4a3f4045aeb2672e
+# Fleet discovery and Ask reliability (memql PR #5244): shared authorized
+# catalog, streaming readiness, stable context allocation, and persistent
+# node liveness. Pin the exact tested engine main merge.
+275623b3d90d57368d0efec62261705db400a33d
