@@ -62,6 +62,6 @@
 # requires (openai-go in, go-openai out, gjson up) and nothing else.
 # Native inference coordination (memql PR #5238): adds the working-context
 # field on ModelCallParams; this worker maps it to Ollama num_ctx. Model active
-# parameter counts still travel in Register labels. The final merge updates
-# this pin to the engine main commit before the Cockpit release.
-aab0624ee0df485da0a2a50ca482ae2b2e04238f
+# parameter counts still travel in Register labels. Pinned to the actual
+# engine main merge, including first-machine onboarding and chat targeting.
+87055f0961726940f735df2c4a3f4045aeb2672e

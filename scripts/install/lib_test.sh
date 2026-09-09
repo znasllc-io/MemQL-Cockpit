@@ -397,6 +397,48 @@ for _installer in install-mac.sh install-linux.sh; do
 done
 
 # ---------------------------------------------------------------
+# Linux registration capabilities follow the runtime display preflight.
+# Load only the driver's config function, preserving its unconditional main.
+# Capture its writer arguments, then render real YAML to a task-specific file.
+# No HOME override, network, service call or user configuration write is needed.
+_linux_write_config="$(sed -n '/^function write_config()/,/^}/p' "${_script_dir}/install-linux.sh")"
+
+function check_linux_display_config() {
+    local name="$1" wayland="$2" session_type="$3" display="$4" expected="$5" flavour="${6:-computeruse}"
+    local output capabilities actual
+    output="$(
+        eval "$_linux_write_config"
+        # Called by the evaluated driver function, beyond ShellCheck's view.
+        # shellcheck disable=SC2317
+        function write_worker_yaml() { printf 'CAPABILITIES=%s\n' "$6"; }
+        # The evaluated write_config reads these installer variables.
+        # shellcheck disable=SC2034
+        FLAVOUR="$flavour" CLUSTER_URL=https://c.example TOKEN=mql_wkr_fixture NAME=fixture FORCE=no
+        WAYLAND_DISPLAY="$wayland" XDG_SESSION_TYPE="$session_type" DISPLAY="$display" write_config
+    )"
+    capabilities="$(printf '%s\n' "$output" | sed -n 's/^CAPABILITIES=//p')"
+    if [[ -z "$capabilities" ]]; then
+        fail "Linux ${name} did not call the config writer"
+        return
+    fi
+    if ! write_worker_yaml "${_tmp}/display-${name}.yaml" https://c.example mql_wkr_fixture fixture no "$capabilities" >/dev/null; then
+        fail "Linux ${name} config rendering failed"
+        return
+    fi
+    actual="$(sed -n '/^capabilities:/,$p' "${_tmp}/display-${name}.yaml" | tail -n +2 | sed 's/^  - //')"
+    expect_eq "Linux ${name} rendered capabilities" "$actual" "$expected"
+}
+
+check_linux_display_config wayland-with-xwayland wayland-0 wayland :0 HEADLESS
+check_linux_display_config wayland-env-wins wayland-0 x11 :0 HEADLESS
+check_linux_display_config padded-session "" $' \tWaYlAnD\r\n' :0 HEADLESS
+check_linux_display_config native-x11 "" x11 :0 $'HEADLESS\nCOMPUTERUSE'
+check_linux_display_config display-only "" "" :0 $'HEADLESS\nCOMPUTERUSE'
+check_linux_display_config no-display "" "" "" HEADLESS
+check_linux_display_config session-without-display "" x11 "" HEADLESS
+check_linux_display_config headless-build "" x11 :0 HEADLESS headless
+
+# ---------------------------------------------------------------
 # setup_inference -- the --inference pass-through
 # ---------------------------------------------------------------
 #

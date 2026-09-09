@@ -57,8 +57,8 @@ Required:
 
 Options:
     --name <name>             Worker name (default: hostname -s)
-    --computeruse                     Install the computer-use variant. Wayland only
-                              registers HEADLESS; X11 enables the COMPUTERUSE capability.
+    --computeruse             Install the computer-use variant. Wayland and
+                              displayless sessions register HEADLESS; X11 enables COMPUTERUSE.
     --inference               Also set this machine up to serve local models:
                               install a model runtime, pull the default models,
                               and write models.allow. A runtime install this
@@ -140,13 +140,10 @@ function write_config() {
     # HEADLESS-only. This platform-specific decision stays here; the
     # shared renderer (write_worker_yaml) only emits what it is handed
     # and honors --force.
-    local capabilities="HEADLESS"
-    if [[ "$FLAVOUR" == "computeruse" ]]; then
-        if [[ -n "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
-            echo "INFO: Wayland detected; registering HEADLESS only (X11 required for COMPUTERUSE)"
-        else
-            capabilities="HEADLESS,COMPUTERUSE"
-        fi
+    local capabilities
+    capabilities="$(linux_worker_capabilities "$FLAVOUR" "${WAYLAND_DISPLAY:-}" "${XDG_SESSION_TYPE:-}" "${DISPLAY:-}")"
+    if [[ "$FLAVOUR" == computeruse && "$capabilities" == HEADLESS ]]; then
+        echo "INFO: no supported X11 session detected; registering HEADLESS only (X11 required for COMPUTERUSE)"
     fi
     write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
 }

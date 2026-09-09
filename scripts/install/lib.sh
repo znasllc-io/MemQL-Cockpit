@@ -322,6 +322,24 @@ function install_binary_with_mode() {
     done
 }
 
+# Match tools.detectDisplayServer: Wayland wins even when XWayland supplies
+# DISPLAY; an X11 claim requires DISPLAY. Arguments make this independent of
+# the installer's environment and keep it testable without touching HOME.
+# Bash 3.2 has no lowercase expansion, so use a case-insensitive pattern.
+function linux_worker_capabilities() {
+    local flavour="$1" wayland_display="$2" session_type="$3" display="$4"
+    session_type="${session_type#"${session_type%%[![:space:]]*}"}"
+    session_type="${session_type%"${session_type##*[![:space:]]}"}"
+    if [[ "$flavour" != computeruse || -n "$wayland_display" || -z "$display" ]]; then
+        echo HEADLESS
+        return
+    fi
+    case "$session_type" in
+        [Ww][Aa][Yy][Ll][Aa][Nn][Dd]) echo HEADLESS ;;
+        *) echo HEADLESS,COMPUTERUSE ;;
+    esac
+}
+
 # write_worker_yaml renders ~/.memql/worker.yaml from the supplied
 # args. It is the SINGLE source of truth for the worker.yaml layout:
 # both install-mac.sh and install-linux.sh call it, so the config can
