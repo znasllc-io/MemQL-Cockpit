@@ -397,6 +397,48 @@ for _installer in install-mac.sh install-linux.sh; do
 done
 
 # ---------------------------------------------------------------
+# Linux registration capabilities follow the runtime display preflight.
+# Load only the driver's config function, preserving its unconditional main.
+# Capture its writer arguments, then render real YAML to a task-specific file.
+# No HOME override, network, service call or user configuration write is needed.
+_linux_write_config="$(sed -n '/^function write_config()/,/^}/p' "${_script_dir}/install-linux.sh")"
+
+function check_linux_display_config() {
+    local name="$1" wayland="$2" session_type="$3" display="$4" expected="$5" flavour="${6:-computeruse}"
+    local output capabilities actual
+    output="$(
+        eval "$_linux_write_config"
+        # Called by the evaluated driver function, beyond ShellCheck's view.
+        # shellcheck disable=SC2317
+        function write_worker_yaml() { printf 'CAPABILITIES=%s\n' "$6"; }
+        # The evaluated write_config reads these installer variables.
+        # shellcheck disable=SC2034
+        FLAVOUR="$flavour" CLUSTER_URL=https://c.example TOKEN=mql_wkr_fixture NAME=fixture FORCE=no
+        WAYLAND_DISPLAY="$wayland" XDG_SESSION_TYPE="$session_type" DISPLAY="$display" write_config
+    )"
+    capabilities="$(printf '%s\n' "$output" | sed -n 's/^CAPABILITIES=//p')"
+    if [[ -z "$capabilities" ]]; then
+        fail "Linux ${name} did not call the config writer"
+        return
+    fi
+    if ! write_worker_yaml "${_tmp}/display-${name}.yaml" https://c.example mql_wkr_fixture fixture no "$capabilities" >/dev/null; then
+        fail "Linux ${name} config rendering failed"
+        return
+    fi
+    actual="$(sed -n '/^capabilities:/,$p' "${_tmp}/display-${name}.yaml" | tail -n +2 | sed 's/^  - //')"
+    expect_eq "Linux ${name} rendered capabilities" "$actual" "$expected"
+}
+
+check_linux_display_config wayland-with-xwayland wayland-0 wayland :0 HEADLESS
+check_linux_display_config wayland-env-wins wayland-0 x11 :0 HEADLESS
+check_linux_display_config padded-session "" $' \tWaYlAnD\r\n' :0 HEADLESS
+check_linux_display_config native-x11 "" x11 :0 $'HEADLESS\nCOMPUTERUSE'
+check_linux_display_config display-only "" "" :0 $'HEADLESS\nCOMPUTERUSE'
+check_linux_display_config no-display "" "" "" HEADLESS
+check_linux_display_config session-without-display "" x11 "" HEADLESS
+check_linux_display_config headless-build "" x11 :0 HEADLESS headless
+
+# ---------------------------------------------------------------
 # setup_inference -- the --inference pass-through
 # ---------------------------------------------------------------
 #
@@ -554,9 +596,22 @@ function uninstall_fixture() {
             mkdir -p "${home}/.config/systemd/user"
             printf '[Unit]\n' > "${home}/.config/systemd/user/${SERVICE_LABEL_LINUX}.service"
             : > "${home}/.memql/worker.env"
+            # A machine `memql worker setup --inference` set up: the
+            # runtime's unit, its unpacked binary, and a pulled model.
+            printf '[Unit]\n' > "${home}/.config/systemd/user/${OLLAMA_LABEL_LINUX}.service"
+            mkdir -p "${home}/.memql/ollama/runtime/bin" "${home}/.memql/ollama/models/blobs"
+            printf '#!/bin/sh\nexit 0\n' > "${home}/.memql/ollama/runtime/bin/ollama"
+            : > "${home}/.memql/ollama/models/blobs/sha256-fixture"
             ;;
     esac
 }
+
+# Ordinary Linux removal exercises a successful isolated service manager;
+# explicit missing-command and failed-stop cases are tested separately below.
+_uninstall_systemctl_dir="${_tmp}/uninstall-systemctl"
+mkdir -p "$_uninstall_systemctl_dir"
+printf '#!/bin/bash\nexit 0\n' > "${_uninstall_systemctl_dir}/systemctl"
+chmod +x "${_uninstall_systemctl_dir}/systemctl"
 
 # run_uninstaller runs one uninstaller against a HOME with the reduced
 # PATH, from the script dir so the sibling lib.sh is what gets sourced.
@@ -565,7 +620,9 @@ function run_uninstaller() {
     local script="$1"
     local home="$2"
     shift 2
-    (cd "$_script_dir" && HOME="$home" PATH="$_nobin" bash "./${script}" "$@" 2>&1)
+    local tool_path="$_nobin"
+    if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
+    (cd "$_script_dir" && HOME="$home" PATH="$tool_path" bash "./${script}" "$@" 2>&1)
 }
 
 for _platform in mac linux; do
@@ -577,7 +634,7 @@ for _platform in mac linux; do
             ;;
         linux)
             _svc=".config/systemd/user/${SERVICE_LABEL_LINUX}.service"
-            _tool_line="INFO: systemctl not found"
+            _tool_line="INFO: stopped and disabled"
             ;;
     esac
 
@@ -608,9 +665,9 @@ for _platform in mac linux; do
     uninstall_fixture "$_uh" "$_platform"
     _out="$(run_uninstaller "$_un" "$_uh" --user-local)"
     _rc=$?
-    expect_eq "$_un --user-local exits 0 with launchctl/systemctl absent" "$_rc" "0"
+    expect_eq "$_un --user-local exits 0 after platform service cleanup" "$_rc" "0"
     if [[ "$_out" == *"$_tool_line"* ]]; then
-        pass "$_un says the service tool is missing and carries on"
+        pass "$_un reports the platform service cleanup"
     else
         fail "$_un should print '$_tool_line'; got: $_out"
     fi
@@ -636,6 +693,18 @@ for _platform in mac linux; do
         else
             fail "$_un --user-local left worker.env behind"
         fi
+        # The model runtime's unit goes with the worker's; the runtime and
+        # its models stay without --purge, and the summary names them.
+        if [[ ! -e "${_uh}/.config/systemd/user/${OLLAMA_LABEL_LINUX}.service" ]]; then
+            pass "$_un removes ${OLLAMA_LABEL_LINUX}.service"
+        else
+            fail "$_un left ${OLLAMA_LABEL_LINUX}.service behind"
+        fi
+        if [[ -f "${_uh}/.memql/ollama/runtime/bin/ollama" && "$_out" == *"kept ${_uh}/.memql/ollama"* ]]; then
+            pass "$_un keeps the model runtime and its models without --purge, and says so"
+        else
+            fail "$_un removed ~/.memql/ollama without --purge, or did not name it; got: $_out"
+        fi
     fi
     if [[ -f "${_uh}/.memql/policy.yaml" && -f "${_uh}/.memql/state/worker.log" ]]; then
         pass "$_un keeps policy.yaml and the state dir without --purge"
@@ -660,6 +729,13 @@ for _platform in mac linux; do
         pass "$_un --purge removes policy.yaml and the state dir"
     else
         fail "$_un --purge left policy.yaml or the state dir: $(ls -laR "${_ph}/.memql" 2>&1)"
+    fi
+    if [[ "$_platform" == "linux" ]]; then
+        if [[ ! -e "${_ph}/.memql/ollama" ]]; then
+            pass "$_un --purge removes the model runtime and its models"
+        else
+            fail "$_un --purge left ~/.memql/ollama: $(ls -laR "${_ph}/.memql/ollama" 2>&1)"
+        fi
     fi
     if [[ ! -e "${_ph}/.memql" ]]; then
         pass "$_un --purge removes an emptied ~/.memql"
@@ -748,6 +824,51 @@ else
             fail "$_un system mode should report nothing at /usr/local/bin; got: $_out"
         fi
     done
+fi
+
+# Exercise the real service-stop branch without reaching this host's manager.
+_native_systemctl_dir="${_tmp}/native-systemctl"
+mkdir -p "$_native_systemctl_dir"
+cat > "${_native_systemctl_dir}/systemctl" <<'STUB'
+#!/bin/bash
+printf '%s\n' "$*" >> "$MEMQL_TEST_SYSTEMCTL_LOG"
+if [[ "$*" == *"disable --now memql-ollama.service"* && "${MEMQL_TEST_STOP_FAIL:-}" == yes ]]; then
+    exit 1
+fi
+exit 0
+STUB
+chmod +x "${_native_systemctl_dir}/systemctl"
+for _stop_failure in no yes; do
+    _native_home="${_tmp}/native-stop-${_stop_failure}"
+    uninstall_fixture "$_native_home" linux
+    _native_log="${_tmp}/native-stop-${_stop_failure}.log"
+    _out="$(cd "$_script_dir" && HOME="$_native_home" PATH="${_native_systemctl_dir}:$_nobin" MEMQL_TEST_SYSTEMCTL_LOG="$_native_log" MEMQL_TEST_STOP_FAIL="$_stop_failure" bash ./uninstall-linux.sh --user-local --purge 2>&1)"
+    _rc=$?
+    if [[ "$_stop_failure" == no ]]; then
+        expect_eq "native uninstall exits cleanly after systemd stops" "$_rc" "0"
+        if grep -qF -- '--user disable --now memql-ollama.service' "$_native_log" && [[ ! -e "${_native_home}/.memql/ollama" ]]; then
+            pass "native uninstall stops the runtime and purges its files"
+        else
+            fail "native uninstall did not stop and purge the runtime"
+        fi
+    else
+        if [[ "$_rc" -ne 0 && "$_out" == *PARTIAL* && -e "${_native_home}/.memql/ollama/runtime/bin/ollama" && -e "${_native_home}/.config/systemd/user/memql-ollama.service" && ! -e "${_native_home}/.memql/worker.yaml" ]]; then
+            pass "failed runtime stop preserves runtime and reports partial uninstall while removing token"
+        else
+            fail "failed runtime stop must not purge or claim success: $_out"
+        fi
+    fi
+done
+
+# Missing the command does not establish that an installed service stopped.
+_native_missing_home="${_tmp}/native-stop-missing"
+uninstall_fixture "$_native_missing_home" linux
+_out="$(cd "$_script_dir" && HOME="$_native_missing_home" PATH="$_nobin" bash ./uninstall-linux.sh --user-local --purge 2>&1)"
+_rc=$?
+if [[ "$_rc" -ne 0 && "$_out" == *PARTIAL* && -e "${_native_missing_home}/.memql/ollama/runtime/bin/ollama" && -e "${_native_missing_home}/.config/systemd/user/memql-ollama.service" && ! -e "${_native_missing_home}/.memql/worker.yaml" ]]; then
+    pass "missing systemctl preserves runtime for safe retry and removes token"
+else
+    fail "missing systemctl must not purge a potentially running runtime: $_out"
 fi
 
 # ---------------------------------------------------------------

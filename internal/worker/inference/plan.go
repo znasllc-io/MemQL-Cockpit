@@ -60,19 +60,21 @@ const probeTimeout = 5 * time.Second
 // It is what this plan is ABOUT, not necessarily what is serving: when
 // RuntimePresent is true the machine already has something answering and
 // Install is empty, and this field then only says which runtime the
-// machine's platform would have got. Design D1 fixes the mapping -- native
-// Ollama on Apple Silicon, Docker on Linux -- and a refusal names none,
-// because there is no runtime to install.
+// machine's platform would have got. Native Ollama is the default on both
+// platforms -- through Homebrew on Apple Silicon, from the vendor's
+// release archive under the person's home on Linux (2026-09-08 record,
+// D1) -- and Docker is the Linux alternative behind --runtime docker. A
+// refusal names none, because there is no runtime to install.
 type Runtime string
 
 const (
 	// RuntimeNone is a plan that installs nothing, because it refuses.
 	RuntimeNone Runtime = ""
-	// RuntimeNative is Ollama installed on the host, which is the macOS
-	// path: a container has no access to the GPU there.
+	// RuntimeNative is Ollama on the host as a plain process: Homebrew's
+	// service on macOS, a user systemd unit on Linux.
 	RuntimeNative Runtime = "native"
 	// RuntimeDocker is the ollama/ollama image with GPU passthrough,
-	// which is the Linux path.
+	// which Linux offers under --runtime docker.
 	RuntimeDocker Runtime = "docker"
 )
 
@@ -162,6 +164,19 @@ type Host struct {
 	// unprobed: Docker is not a runtime option there, and probing it
 	// would invite a plan that used it.
 	Docker DockerFacts
+	// Native is what running Ollama as this user would need on Linux,
+	// and where it would go. Empty on macOS, where native means Homebrew.
+	Native NativeFacts
+	// Runtime is the runtime the PERSON asked for with --runtime, or ""
+	// for the platform's own choice. Decide honours it where the platform
+	// can serve it and refuses where it cannot; it never widens what the
+	// platform serves.
+	Runtime Runtime
+	// DockerFreeDisk is bytes available where the ollama/ollama image
+	// keeps its models, read only on Linux. FreeDisk is the native
+	// runtime's figure; the command swaps this one in under
+	// --runtime docker, because the two are different volumes.
+	DockerFreeDisk uint64
 	// Hardware is this machine's presence-facts inventory, from
 	// internal/worker/hardware. Decide reads it for ONE thing -- the
 	// machine class, which chooses the recommended set -- and it is a
@@ -243,6 +258,10 @@ type Plan struct {
 	// two computations of the same class can disagree while a person is
 	// looking at both answers at once.
 	MachineClass string
+	// Stage is the non-command half of a native Linux install -- the
+	// archive, its checksum, the unit file -- run after the same consent
+	// as Install and before its first command. Nil on every other plan.
+	Stage *Stage
 }
 
 // The sentences. Constants rather than fmt calls at the point of use, so
@@ -262,6 +281,35 @@ const (
 	refusalNoROCmDevices = "Docker is installed but cannot pass this machine's AMD GPU into a container, because /dev/kfd is missing. Install the amdgpu-dkms driver (see https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html) and run this again."
 
 	refusalNoGPUPassthrough = "Docker is installed and no GPU passthrough could be established for it. Install the nvidia-container-toolkit package for an NVIDIA GPU, or the amdgpu-dkms driver for an AMD GPU, then run this again."
+
+	// noteDropDockerFlag rides every Docker refusal on Linux, because
+	// every one of them is now reachable only under --runtime docker and
+	// the way out is the platform's own default.
+	noteDropDockerFlag = "Or drop --runtime docker: without it this command runs Ollama as your user, which needs none of that."
+
+	// The native Linux sentences (2026-09-08 record, D1).
+	noteNativeOnLinux = "Ollama will run as your user, from ~/.memql, kept running by a user systemd unit. Nothing here needs root and Docker is not involved; --runtime docker chooses the container instead."
+
+	refusalNoSystemdUser = "The systemd user manager is not available on this machine (no systemctl on PATH), and it is what keeps Ollama running across logins and reboots. Install Ollama yourself from https://ollama.com/download and start it, or run this again with --runtime docker."
+
+	refusalNoNativeArchive = "Ollama ships no Linux build for this processor, so there is nothing to unpack. Install Ollama yourself from https://ollama.com/download and start it, then run this again."
+
+	refusalNoROCmOnArm = "Ollama ships its ROCm libraries for x86-64 only, so an AMD GPU on this processor cannot be served natively. Install Ollama yourself from https://ollama.com/download and start it, then run this again."
+
+	refusalNVIDIADriverNotLoaded = "This machine has an NVIDIA GPU and its driver is not loaded: /dev/nvidiactl is missing. Install the NVIDIA driver for your distribution, reboot, and run this again."
+
+	refusalNVIDIADevicesNotAccessible = "This machine has an NVIDIA GPU and your user cannot open /dev/nvidiactl. Check the device's permissions (ls -l /dev/nvidiactl), log back in, and run this again."
+
+	refusalAMDDevicesNotAccessible = "This machine has an AMD GPU and your user cannot open /dev/kfd and a /dev/dri render node. Add yourself to the render and video groups with sudo usermod -aG render,video $USER, log back in, and run this again."
+
+	refusalNativeGPUUnknown = "No GPU this command can drive was found for the native runtime: neither nvidia-smi nor the amdgpu driver answered. Install the vendor's driver and run this again."
+)
+
+// The native install's commands. Both pass through the same splitter as
+// every other line, and both are safe to run twice.
+const (
+	installSystemdReload = "systemctl --user daemon-reload"
+	installSystemdEnable = "systemctl --user enable --now " + OllamaUnitName
 )
 
 // refusalUnknownPlatform is the sentence for a Host that names no
@@ -396,12 +444,83 @@ func decideDarwin(h Host, p Plan) Plan {
 	return p
 }
 
-// decideLinux: the ollama/ollama image with GPU passthrough (design D1).
+// decideLinux: Ollama as the person's own user by default (2026-09-08
+// record, D1), the ollama/ollama container under --runtime docker
+// (2026-09-06 record, D1).
 //
-// The runtime check comes FIRST, before Docker: a machine already serving
-// needs nothing installed, and refusing it for a missing Docker would
-// block a working inference machine over a runtime it is not using.
+// The runtime check comes FIRST on both paths: a machine already serving
+// needs nothing installed, and refusing it for a missing Docker or a
+// missing systemd would block a working inference machine over a runtime
+// it is not using.
 func decideLinux(h Host, p Plan) Plan {
+	if h.Runtime == RuntimeDocker {
+		return decideLinuxDocker(h, p)
+	}
+	return decideLinuxNative(h, p)
+}
+
+// decideLinuxNative: Ollama unpacked under the person's home and kept up
+// by a user unit. Nothing here needs root, which is the whole reason it
+// is the default: the container path below needs a root-installed
+// toolkit and a Docker restart on every fresh machine, and this command
+// runs no sudo.
+func decideLinuxNative(h Host, p Plan) Plan {
+	p.Runtime = RuntimeNative
+	if p.RuntimePresent {
+		return p
+	}
+	n := h.Native
+	if !h.lookPath("systemctl") {
+		p.Runtime = RuntimeNone
+		p.Refusal = refusalNoSystemdUser
+		return p
+	}
+	base := NativeArchiveName(h.GOARCH)
+	if base == "" {
+		p.Runtime = RuntimeNone
+		p.Refusal = refusalNoNativeArchive
+		return p
+	}
+	if !n.Devices {
+		p.Runtime = RuntimeNone
+		p.Refusal = n.DevicesReason
+		if p.Refusal == "" {
+			p.Refusal = refusalNativeGPUUnknown
+		}
+		return p
+	}
+	stage := &Stage{
+		RuntimeDir: n.RuntimeDir,
+		ModelsDir:  n.ModelsDir,
+		LogPath:    n.LogPath,
+		UnitPath:   n.UnitPath,
+		Listen:     nativeListen,
+	}
+	switch {
+	case n.Installed:
+		stage.Reuse = true
+	case n.Vendor == GPUVendorAMD:
+		rocm := NativeROCmArchiveName(h.GOARCH)
+		if rocm == "" {
+			p.Runtime = RuntimeNone
+			p.Refusal = refusalNoROCmOnArm
+			return p
+		}
+		stage.Archives = []Archive{{Name: base}, {Name: rocm}}
+	default:
+		stage.Archives = []Archive{{Name: base}}
+	}
+	p.Stage = stage
+	p.Install = []string{installSystemdReload, installSystemdEnable}
+	p.Note = noteNativeOnLinux
+	return p
+}
+
+// decideLinuxDocker: the ollama/ollama image with GPU passthrough, the
+// original Linux path, now behind --runtime docker. Every refusal it can
+// produce names the flag's way out, because each one is a root install
+// the default path does not need.
+func decideLinuxDocker(h Host, p Plan) Plan {
 	p.Runtime = RuntimeDocker
 	if p.RuntimePresent {
 		return p
@@ -409,22 +528,22 @@ func decideLinux(h Host, p Plan) Plan {
 	switch {
 	case !h.Docker.CLIPresent:
 		p.Runtime = RuntimeNone
-		p.Refusal = refusalNoDocker
+		p.Refusal = refusalNoDocker + " " + noteDropDockerFlag
 		return p
 	case !h.Docker.Present:
 		p.Runtime = RuntimeNone
-		p.Refusal = refusalDockerDaemonSilent
+		p.Refusal = refusalDockerDaemonSilent + " " + noteDropDockerFlag
 		return p
 	}
 	if !h.Docker.GPUToolkit {
 		p.Runtime = RuntimeNone
 		switch h.Docker.GPUVendor {
 		case GPUVendorNVIDIA:
-			p.Refusal = refusalNoNVIDIAToolkit
+			p.Refusal = refusalNoNVIDIAToolkit + " " + noteDropDockerFlag
 		case GPUVendorAMD:
-			p.Refusal = refusalNoROCmDevices
+			p.Refusal = refusalNoROCmDevices + " " + noteDropDockerFlag
 		default:
-			p.Refusal = refusalNoGPUPassthrough
+			p.Refusal = refusalNoGPUPassthrough + " " + noteDropDockerFlag
 		}
 		return p
 	}
@@ -463,7 +582,9 @@ func Gather(ctx context.Context, d *models.Discoverer) (Host, error) {
 	}
 	facts := gatherPlatform(ctx)
 	h.Docker = facts.Docker
+	h.Native = facts.Native
 	h.FreeDisk = facts.FreeDisk
+	h.DockerFreeDisk = facts.DockerFreeDisk
 	h.Hardware = hardware.Local(ctx)
 
 	// Checked again on the way out: the probes above shell out and dial,
@@ -479,8 +600,12 @@ func Gather(ctx context.Context, d *models.Discoverer) (Host, error) {
 // platformFacts is what the platform files answer. Everything that shells
 // out lives behind them, so plan_test.go needs no build tags.
 type platformFacts struct {
-	Docker   DockerFacts
-	FreeDisk uint64
+	Docker DockerFacts
+	Native NativeFacts
+	// FreeDisk is where the platform's DEFAULT runtime keeps models;
+	// DockerFreeDisk is the container's volume, Linux only.
+	FreeDisk       uint64
+	DockerFreeDisk uint64
 }
 
 // ollamaRunningNoModels is the fragment of the models package's probe note

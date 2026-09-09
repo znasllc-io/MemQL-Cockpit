@@ -81,13 +81,14 @@ const (
 // it is a fleet that quietly never ranks by size and never routes a tool
 // turn. TestWireContract is what holds the two halves to one spelling.
 const (
-	attrContext    = "ctx"
-	attrStructured = "structured"
-	attrEmbeddings = "embeddings"
-	attrMax        = "max"
-	attrParams     = "params"
-	attrQuant      = "quant"
-	attrTools      = "tools"
+	attrContext      = "ctx"
+	attrStructured   = "structured"
+	attrEmbeddings   = "embeddings"
+	attrMax          = "max"
+	attrParams       = "params"
+	attrActiveParams = "activeparams"
+	attrQuant        = "quant"
+	attrTools        = "tools"
 
 	// The four MODALITY keys (engine memql#5137, record D4). Same
 	// situation as the three above and one step further out: the engine
@@ -131,6 +132,8 @@ type Attributes struct {
 	// Zero means this machine did not say, and an unstated size sorts
 	// LAST -- a model does not become the fleet's strongest by silence.
 	Params int64
+	// ActiveParams counts parameters used per token by a mixture, when established by the runtime.
+	ActiveParams int64
 	// Quant is the quantization level exactly as the runtime spelled it
 	// ("Q4_K_M", "F16"). Verbatim rather than normalised, because an
 	// operator compares it against what `ollama list` prints, and a
@@ -201,6 +204,9 @@ func (a Attributes) String() string {
 	}
 	if a.Params > 0 {
 		parts = append(parts, fmt.Sprintf("%s=%d", attrParams, a.Params))
+	}
+	if a.ActiveParams > 0 {
+		parts = append(parts, fmt.Sprintf("%s=%d", attrActiveParams, a.ActiveParams))
 	}
 	if q := strings.TrimSpace(a.Quant); quantSafe(q) {
 		parts = append(parts, attrQuant+"="+q)
@@ -290,6 +296,10 @@ func ParseAttributes(value string) Attributes {
 			// ranking it belongs at the top of.
 			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 				a.Params = n
+			}
+		case attrActiveParams:
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+				a.ActiveParams = n
 			}
 		case attrQuant:
 			// Refused unless String could have emitted it, so the set of

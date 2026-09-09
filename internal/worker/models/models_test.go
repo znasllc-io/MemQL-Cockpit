@@ -56,6 +56,7 @@ func TestWireContract(t *testing.T) {
 		{attrEmbeddings, "embeddings", "model_routing.go:101"},
 		{attrMax, "max", "model_routing.go:102"},
 		{attrParams, "params", "design D5"},
+		{attrActiveParams, "activeparams", "engine model_routing.go -- memql#5235"},
 		{attrQuant, "quant", "design D5"},
 		{attrTools, "tools", "design D6 and D11"},
 		// The four modalities. NOT transcribed from the engine, because

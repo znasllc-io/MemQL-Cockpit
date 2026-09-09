@@ -53,10 +53,16 @@ func TestHardwareReportRendersEveryField(t *testing.T) {
 // answer to the question somebody actually has.
 func TestHardwareReportNamesTheRecommendedSet(t *testing.T) {
 	out := runHardware(t, macStudio())
-	for _, want := range []string{"qwen3.5:9b", "qwen3.8:27b", "qwen3-embedding:0.6b"} {
+	for _, want := range []string{"qwen3.8:27b", "qwen3-embedding:0.6b"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the class-32 set must name %q:\n%s", want, out)
 		}
+	}
+	// One text model per class (2026-09-08 record, D7): the 9B is the 16 GB
+	// pick and does not ride along on a machine whose rules would never
+	// choose it beside the 27B.
+	if strings.Contains(out, "qwen3.5:9b") {
+		t.Errorf("the class-32 set must not name the 16 GB model beside the 27B:\n%s", out)
 	}
 	if !strings.Contains(out, "memql worker setup --inference") {
 		t.Errorf("the report must name the command that acts on it:\n%s", out)
@@ -123,7 +129,7 @@ func TestHardwareReportSaysNothingWasEstablishedRatherThanUnsupported(t *testing
 	}
 	// It still recommends a set: a machine nobody could scan is not a
 	// machine nobody can set up.
-	if !strings.Contains(out, "qwen3.5:9b") {
+	if !strings.Contains(out, "qwen3.5:4b") {
 		t.Errorf("the smallest set must still be recommended:\n%s", out)
 	}
 }

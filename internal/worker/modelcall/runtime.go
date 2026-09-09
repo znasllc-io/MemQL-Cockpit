@@ -192,9 +192,11 @@ type Params struct {
 	TopP            float64
 	TopPSet         bool
 	MaxOutputTokens int64
-	Stop            []string
-	Seed            int64
-	SeedSet         bool
+	// ContextTokens is the total working window the engine requires, including output.
+	ContextTokens int64
+	Stop          []string
+	Seed          int64
+	SeedSet       bool
 }
 
 // ChatRequest is one chat generation.

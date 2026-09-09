@@ -78,7 +78,7 @@ such.
 |---|---|
 | `--model <id>` | Pull this model instead of the defaults. Repeatable. Hugging Face ids work unchanged: `hf.co/<owner>/<repo>` and `hf.co/<owner>/<repo>:<quant>` are resolved by Ollama itself. |
 | `--non-interactive` | Never ask. A runtime install it would have asked about is refused with **exit 3** and nothing is installed. |
-| `--runtime docker\|native` | Override the runtime this platform would choose. A combination the platform cannot serve is **refused**, not ignored. |
+| `--runtime docker\|native` | `native` is every platform's own default and changes nothing. `docker` on Linux chooses the `ollama/ollama` container instead of the user-space runtime; on macOS it is **refused**, not ignored, because a container has no access to the GPU there. |
 
 The runtime it installs is fixed by the platform, and the reason is the
 hardware floor:
@@ -88,11 +88,27 @@ hardware floor:
   offered: a container has no access to the GPU there, so Ollama in a
   container would serve from the CPU and this machine would not be
   advertised at all.
-- **Linux (discrete GPU)** — the `ollama/ollama` image with the GPU passed
-  through, published on the **loopback only** and restarted unless stopped.
-  Without the NVIDIA container toolkit (or the ROCm device nodes) it refuses
-  and names the package, because a container that cannot reach the GPU is
-  the CPU case again.
+- **Linux (discrete GPU)** — Ollama **as your user, from your own home
+  directory**: the vendor's release archive (`ollama-linux-<arch>.tar.zst`,
+  plus the ROCm add-on on an AMD machine) is downloaded from the
+  `ollama/ollama` GitHub release, checked against that release's
+  `sha256sum.txt`, unpacked into `~/.memql/ollama/runtime`, and kept
+  running by a user systemd unit, `memql-ollama.service`, that binds the
+  **loopback only** and keeps its models in `~/.memql/ollama/models`
+  (`OLLAMA_MODELS` in your environment wins). It reaches the GPU through the
+  same device nodes `nvidia-smi` used to pass the floor, so **nothing here
+  needs root**: no container toolkit, no Docker, no daemon restart, no
+  package repository. Its log is `~/.memql/state/ollama.log`. The command
+  says everything it will download and write before it asks, and a
+  `--runtime docker` run takes the container instead -- which does need the
+  NVIDIA container toolkit (a root install and a Docker restart), and refuses
+  without it, naming the package and the way out.
+
+The uninstaller is the other half: `uninstall-linux.sh` stops and removes
+`memql-ollama.service` with the worker's own unit, and `--purge` removes
+`~/.memql/ollama` -- the runtime and every model in it -- with the rest.
+Without `--purge` the models stay, because they were pulled on purpose and
+cost hours to pull again, and the closing block says so.
 
 Afterwards, a single model at a time:
 
@@ -397,7 +413,12 @@ And what `memql worker setup --inference` prints when it stops:
 
 | What it prints | What it means, and what to do |
 |---|---|
-| `Docker is installed but cannot pass this machine's NVIDIA GPU into a container` | Docker is there and the container toolkit is not, so a container would serve from the CPU — which is what the hardware floor exists to prevent, so the setup refuses rather than build one. Install `nvidia-container-toolkit`, run `nvidia-ctk runtime configure --runtime=docker`, restart Docker, then run the setup again. Those three need root: **the cockpit prints them for you to run and never runs one itself.** The AMD case names `amdgpu-dkms` and `/dev/kfd` instead — there is no "ROCm container toolkit" to install. Exit **4**. |
+| `Docker is installed but cannot pass this machine's NVIDIA GPU into a container` | Only under `--runtime docker`. Docker is there and the container toolkit is not, so a container would serve from the CPU — which is what the hardware floor exists to prevent, so the setup refuses rather than build one. Either drop the flag, which is the sentence's own last line — the default runs Ollama as your user and needs none of it — or install `nvidia-container-toolkit`, run `nvidia-ctk runtime configure --runtime=docker`, restart Docker (which restarts every container on the machine, a k3d cluster included), then run the setup again. Those three need root: **the cockpit prints them for you to run and never runs one itself.** The AMD case names `amdgpu-dkms` and `/dev/kfd` instead — there is no "ROCm container toolkit" to install. Exit **4**. |
+| `The systemd user manager is not available on this machine` | No `systemctl` on PATH, so nothing would keep Ollama running across a login. Install Ollama yourself from ollama.com and start it, or use `--runtime docker`. Exit **4**. |
+| `your user cannot open /dev/kfd and a /dev/dri render node` (AMD) or `cannot open /dev/nvidiactl` (NVIDIA) | The GPU is there and this user cannot reach it, so a runtime started now would serve from the CPU. The AMD fix is the `render` and `video` groups (`sudo usermod -aG render,video $USER`, then log back in); the NVIDIA one is the device's permissions. Printed for **you** to run. Exit **4**. |
+| `OLLAMA_HOST selects …, but native setup installs a loopback service` | The chosen endpoint is not serving, and differs from the native installer's `127.0.0.1:11434`. Start that runtime yourself, or unset `OLLAMA_HOST` and retry. Setup refuses before downloading or writing anything. Exit **4**. |
+| `the downloaded archive does not match the release's checksum` | The bytes fetched are not the ones the release's `sha256sum.txt` describes — a release being published mid-download, a proxy, or a tampered mirror. Nothing was unpacked and nothing was written; run the setup again. Exit **5**. |
+| `the runtime was installed and started, but nothing answered at http://127.0.0.1:11434 within 30s` | The unit was enabled and Ollama did not come up. Read the log the sentence names, `~/.memql/state/ollama.log`; `systemctl --user status memql-ollama.service` shows the unit's own view. Exit **5**. |
 | `This machine will not pull a model: models.pull is false in …/policy.yaml` | The pull switch is off in this machine's own policy. It defaults to **true** — a pull is the machine's owner acting on their own machine — so somebody set it deliberately. Remove the key or set it to `true`. Exit **4**. |
 | `Nothing was installed: --non-interactive cannot answer that question.` | A runtime install was needed and a scripted run may not approve one. Nothing was changed. Run the same command **without** `--non-interactive`, in a terminal, or run the printed commands yourself. Exit **3** — which is what the installers' `--inference` watches for, so they can print the interactive command for you. |
 | the pull finished, the closing block listed the model, and the portal still shows nothing | **Not a failure, and not due yet.** Model labels are bound at `Register`, so the cluster sees a newly allowed model only after the worker reconnects. The `SIGHUP` the setup sends arms that reconnect at once, but it still waits for any tool call, app session or model call in flight. A minute or two on an idle machine; longer on a busy one. Nothing is lost — the request survives the wait. |
@@ -484,9 +505,26 @@ machine with a general model rather than with only an embedder.
 
 | class | set |
 |---|---|
-| 16, 24, and below | `qwen3.5:9b`, `qwen3-embedding:0.6b` |
-| 32 | adds `qwen3.8:27b` |
-| 64, 128 | adds `qwen3.5:35b` and `gemma4:26b`; the embedder becomes `qwen3-embedding:4b` |
+| below 16 | `qwen3.5:4b`, `qwen3-embedding:0.6b` |
+| 16 | `qwen3.5:9b`, `qwen3-embedding:0.6b` |
+| 24, 32 | `qwen3.8:27b`, `qwen3-embedding:0.6b` |
+| 64, 128 | `qwen3.8:27b-q8_0`, `qwen3-embedding:0.6b` |
+
+One text model per class plus the cluster's embedder keeps the working set
+within the class budget. A bigger class buys a stronger model or the same
+one at higher precision. Fast-level calls choose the fastest eligible fleet
+model after a quality floor; strong and reasoning calls choose the strongest.
+The embedder uses an 8K working context. Chat calls pass the engine's required
+context window to Ollama instead of relying on its hardware-tier default.
+The 24 GB pair is budgeted at 32K chat context; larger contexts can require
+CPU offload or model eviction. The native Linux unit uses `q8_0` KV cache,
+with Flash Attention selected automatically by Ollama on supported devices.
+
+Setup leaves an already-serving runtime in place. For an older
+`memql-ollama.service`, add `Environment=OLLAMA_KV_CACHE_TYPE=q8_0` in its
+`[Service]` section, then run `systemctl --user daemon-reload` and
+`systemctl --user restart memql-ollama.service` between model calls to apply
+the cache setting. A runtime managed separately keeps its own configuration.
 
 `--model` still overrides, and the closing block still reports what the
 **cluster** will see rather than restating the command line.

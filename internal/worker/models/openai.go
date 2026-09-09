@@ -93,9 +93,10 @@ func (d *Discoverer) probeDeclared(ctx context.Context, rt DeclaredRuntime) ([]I
 				// Ollama's own /v1 endpoint to overrule the capability
 				// heuristic -- would otherwise DELETE tools=1 from that
 				// model rather than restate it.
-				Params: m.Params,
-				Quant:  strings.TrimSpace(m.Quant),
-				Tools:  m.Tools,
+				Params:       m.Params,
+				ActiveParams: m.ActiveParams,
+				Quant:        strings.TrimSpace(m.Quant),
+				Tools:        m.Tools,
 				// The four modalities, same wholesale-win reasoning:
 				// three of them have no probe anywhere, so a declared
 				// entry dropped here is a modality that can never be

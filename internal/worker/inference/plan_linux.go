@@ -9,16 +9,82 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The Linux facts: Docker, its GPU passthrough, and free disk on the
-// volume the image keeps models in (design D1 -- Docker is the runtime
-// here, and `docker` is already on the cockpit's shell allow-list where
-// `curl` and `sudo` are not).
+// The Linux facts: what running Ollama as this user needs and where it
+// goes (the default, 2026-09-08 record D1), plus Docker and its GPU
+// passthrough for --runtime docker, and free disk on each one's volume.
 func gatherPlatform(ctx context.Context) platformFacts {
 	docker := linuxDockerFacts(ctx)
+	native := linuxNativeFacts()
 	return platformFacts{
-		Docker:   docker,
-		FreeDisk: availableBytes(dockerModelsDir(ctx, docker)),
+		Docker:         docker,
+		Native:         native,
+		FreeDisk:       availableBytes(native.ModelsDir),
+		DockerFreeDisk: availableBytes(dockerModelsDir(ctx, docker)),
 	}
+}
+
+// linuxNativeFacts is what running Ollama as this user needs: the
+// vendor, whether this user can open its device nodes, whether an earlier
+// run already unpacked the runtime, and the layout under this home.
+//
+// The device check is the native path's whole GPU question. There is no
+// toolkit to install and no daemon to configure: the same nodes
+// nvidia-smi opened to pass the hardware floor are the ones Ollama's
+// bundled CUDA opens, and for ROCm the render node is the passthrough
+// exactly as it is for the container. A user who cannot open them gets a
+// runtime that quietly serves from the CPU, so the plan refuses first.
+func linuxNativeFacts() NativeFacts {
+	home, _ := os.UserHomeDir()
+	n := DefaultNativeFacts(home, os.Getenv("OLLAMA_MODELS"))
+	n.Installed = exists(filepath.Join(n.RuntimeDir, "bin", "ollama"))
+	n.FreeDisk = availableBytes(n.RuntimeDir)
+	switch {
+	case linuxHasNVIDIA():
+		n.Vendor = GPUVendorNVIDIA
+		switch {
+		case !exists("/dev/nvidiactl"):
+			n.DevicesReason = refusalNVIDIADriverNotLoaded
+		case !openable("/dev/nvidiactl"):
+			n.DevicesReason = refusalNVIDIADevicesNotAccessible
+		default:
+			n.Devices = true
+		}
+	case linuxHasAMDGPU():
+		n.Vendor = GPUVendorAMD
+		if openable("/dev/kfd") && anyOpenable("/dev/dri/renderD*") {
+			n.Devices = true
+		} else {
+			n.DevicesReason = refusalAMDDevicesNotAccessible
+		}
+	default:
+		n.DevicesReason = refusalNativeGPUUnknown
+	}
+	return n
+}
+
+// openable reports that this user may open the node read-write, which is
+// what a driver needs of it. A stat says the node exists; only an open
+// says the render group was granted.
+func openable(path string) bool {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
+
+func anyOpenable(pattern string) bool {
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return false
+	}
+	for _, m := range matches {
+		if openable(m) {
+			return true
+		}
+	}
+	return false
 }
 
 // linuxDockerFacts separates "the command is missing" from "the daemon

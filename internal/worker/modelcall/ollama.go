@@ -53,6 +53,12 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 		"model":    req.Model,
 		"messages": ollamaMessages(req.Messages),
 		"stream":   true,
+		// The engine estimates a working window; only the runtime tokenizes
+		// the rendered prompt. Refuse overflow instead of dropping history
+		// before generation or shifting it away during generation.
+		// Ollama v0.33.3 api.ChatRequest supports both fields.
+		"truncate": false,
+		"shift":    false,
 	}
 	if opts := ollamaOptions(req.Params); len(opts) > 0 {
 		body["options"] = opts
@@ -145,10 +151,26 @@ type ollamaEmbedResponse struct {
 	PromptEvalCount int64       `json:"prompt_eval_count"`
 }
 
+// embedWorkingContext is the context every embedding call is sent with.
+//
+// Ollama sizes a model's cache at load for the context it will run at,
+// and without a request value that is its VRAM-tier default -- 32K on a
+// 24 GB card -- for an embedder whose every layer is full attention. For
+// qwen3-embedding:0.6b that is a 3.8 GB cache in front of 639 MB of
+// weights, which is what stops the embedder sitting beside a 27B on a
+// 24 GB card and turns every embed-then-chat pair into a reload. The
+// usual inputs are chunks and queries, so 8K avoids the larger cache.
+// Inputs exceeding this working window or the model's own ceiling are
+// refused via truncate:false rather than embedded as a successful prefix
+// (2026-09-08 record, D6).
+const embedWorkingContext = 8192
+
 func (c *ollamaClient) Embed(ctx context.Context, req EmbedRequest) (Result, error) {
 	resp, err := c.post(ctx, "/api/embed", map[string]any{
-		"model": req.Model,
-		"input": req.Input,
+		"model":    req.Model,
+		"input":    req.Input,
+		"truncate": false,
+		"options":  map[string]any{"num_ctx": embedWorkingContext},
 	})
 	if err != nil {
 		return Result{}, err
@@ -291,6 +313,9 @@ func ollamaOptions(p Params) map[string]any {
 	}
 	if p.TopPSet {
 		out["top_p"] = p.TopP
+	}
+	if p.ContextTokens > 0 {
+		out["num_ctx"] = p.ContextTokens
 	}
 	if p.MaxOutputTokens > 0 {
 		out["num_predict"] = p.MaxOutputTokens

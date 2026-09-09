@@ -28,17 +28,19 @@ func TestRecommendedSetByClass(t *testing.T) {
 		class string
 		want  []string
 	}{
-		// The record names sets at 16, 32 and 64 only. A class between
-		// two named sets takes the largest named set at or below it --
-		// a 24 is a 16 that has not earned the 27B yet.
-		{"unsupported", []string{"qwen3.5:9b", "qwen3-embedding:0.6b"}},
+		// ONE text model per class plus the cluster's embedder, and the
+		// 24 GB rung is its own (2026-09-08 record, D5-D7). A single
+		// text model leaves room for the embedder and working context.
+		{"unsupported", []string{"qwen3.5:4b", "qwen3-embedding:0.6b"}},
 		{"16", []string{"qwen3.5:9b", "qwen3-embedding:0.6b"}},
-		{"24", []string{"qwen3.5:9b", "qwen3-embedding:0.6b"}},
-		{"32", []string{"qwen3.5:9b", "qwen3.8:27b", "qwen3-embedding:0.6b"}},
-		{"64", []string{"qwen3.5:9b", "qwen3.8:27b", "qwen3.5:35b", "gemma4:26b", "qwen3-embedding:4b"}},
-		{"128", []string{"qwen3.5:9b", "qwen3.8:27b", "qwen3.5:35b", "gemma4:26b", "qwen3-embedding:4b"}},
-		{"", []string{"qwen3.5:9b", "qwen3-embedding:0.6b"}},
-		{"nonsense", []string{"qwen3.5:9b", "qwen3-embedding:0.6b"}},
+		// THE RUNG THAT WAS MISSING: a 24 GB card is its own set, not a
+		// repeat of the 16 GB pair (2026-09-08 record, D5).
+		{"24", []string{"qwen3.8:27b", "qwen3-embedding:0.6b"}},
+		{"32", []string{"qwen3.8:27b", "qwen3-embedding:0.6b"}},
+		{"64", []string{"qwen3.8:27b-q8_0", "qwen3-embedding:0.6b"}},
+		{"128", []string{"qwen3.8:27b-q8_0", "qwen3-embedding:0.6b"}},
+		{"", []string{"qwen3.5:4b", "qwen3-embedding:0.6b"}},
+		{"nonsense", []string{"qwen3.5:4b", "qwen3-embedding:0.6b"}},
 	} {
 		t.Run(tc.class, func(t *testing.T) {
 			got := RecommendedSet(tc.class)
@@ -112,7 +114,7 @@ func TestDecidePutsTheClassAndItsSetOnThePlan(t *testing.T) {
 	if p.MachineClass != "32" {
 		t.Fatalf("MachineClass = %q, want 32 (48 GB usable of 64 GB unified)", p.MachineClass)
 	}
-	want := []string{"qwen3.5:9b", "qwen3.8:27b", "qwen3-embedding:0.6b"}
+	want := []string{"qwen3.8:27b", "qwen3-embedding:0.6b"}
 	if !reflect.DeepEqual(p.DefaultModels, want) {
 		t.Fatalf("DefaultModels = %v, want %v", p.DefaultModels, want)
 	}

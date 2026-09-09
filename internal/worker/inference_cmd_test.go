@@ -132,6 +132,19 @@ func linuxReady() inference.Host {
 	return h
 }
 
+// linuxNative is the machine that started all this: an RTX 4090 on a
+// distribution with no container toolkit in any repository, Docker
+// running the k3d cluster beside it, and nothing listening on 11434.
+// Under the 2026-09-08 record it needs nothing from root.
+func linuxNative() inference.Host {
+	h := linuxNoToolkit()
+	h.Native = inference.DefaultNativeFacts("/home/op", "")
+	h.Native.Vendor = inference.GPUVendorNVIDIA
+	h.Native.Devices = true
+	h.LookPath = pathWith("docker", "nvidia-smi", "systemctl")
+	return h
+}
+
 // -----------------------------------------------------------------------------
 // The fake machine the flow runs against
 // -----------------------------------------------------------------------------
@@ -150,8 +163,15 @@ type fakeSetup struct {
 	pullErr     error
 	allowErr    error
 	readvertErr error
+	stageErr    error
 	progress    map[string][]inference.Progress
 	inv         models.Inventory
+
+	// The native Linux stage, and the order everything happened in:
+	// "stage <runtime dir>" and "run <argv>" lines, because the stage
+	// running BEFORE the first command is the property worth pinning.
+	staged []inference.Stage
+	events []string
 }
 
 func newFakeSetup(t *testing.T, host inference.Host) *fakeSetup {
@@ -167,11 +187,16 @@ func newFakeSetup(t *testing.T, host inference.Host) *fakeSetup {
 		// consent counts as no" is exercised rather than restated: a
 		// fake that reimplemented the rule could agree with a version
 		// of it that no longer exists.
-		install: func(ctx context.Context, p inference.Plan, consent func([]string) bool, _ inference.Runner) error {
+		install: func(ctx context.Context, p inference.Plan, consent func([]string) bool, _ inference.Runner, _ inference.Stager) error {
 			f.consentWasNi = consent == nil
 			return inference.InstallRuntime(ctx, p, consent, func(_ context.Context, argv []string) error {
 				f.ran = append(f.ran, argv)
+				f.events = append(f.events, "run "+strings.Join(argv, " "))
 				return nil
+			}, func(_ context.Context, st inference.Stage, _ func(inference.Progress)) error {
+				f.staged = append(f.staged, st)
+				f.events = append(f.events, "stage "+st.RuntimeDir)
+				return f.stageErr
 			})
 		},
 		pull: func(_ context.Context, _, model string, onProgress func(inference.Progress)) error {
@@ -204,10 +229,10 @@ func (f *fakeSetup) run() (int, string) {
 
 func TestSetupInference_HappyPath(t *testing.T) {
 	f := newFakeSetup(t, macServing())
-	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
+	f.progress["qwen3.8:27b"] = onePull(4_661_211_808)
 	f.progress["qwen3-embedding:0.6b"] = onePull(274_302_450)
 	f.inv = servingInventory(
-		offeredModel("qwen3.5:9b", models.Attributes{
+		offeredModel("qwen3.8:27b", models.Attributes{
 			ContextWindow: 131072, StructuredOutput: true, Tools: true,
 			Params: 8_030_000_000, Quant: "Q4_K_M", MaxConcurrent: 1,
 		}),
@@ -230,7 +255,7 @@ func TestSetupInference_HappyPath(t *testing.T) {
 		"  Hardware   Apple M2 Max, 32 GB, macOS 15 -- meets the floor",
 		"  Runtime    Ollama, already running at http://127.0.0.1:11434",
 		"  Class      24 -- 24.0 GB usable, 75% of 32 GB unified",
-		"  Models     qwen3.5:9b, qwen3-embedding:0.6b",
+		"  Models     qwen3.8:27b, qwen3-embedding:0.6b",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the preamble must carry %q:\n%s", want, out)
@@ -240,10 +265,10 @@ func TestSetupInference_HappyPath(t *testing.T) {
 	// Both defaults, in the order the plan states them: one general
 	// model and one embedding model, because the operations this fleet
 	// serves locally are both kinds.
-	if got := strings.Join(f.pulled, ","); got != "qwen3.5:9b,qwen3-embedding:0.6b" {
+	if got := strings.Join(f.pulled, ","); got != "qwen3.8:27b,qwen3-embedding:0.6b" {
 		t.Errorf("pulled = %q, want the default pair", got)
 	}
-	if got := strings.Join(f.allowed, ","); got != "qwen3.5:9b,qwen3-embedding:0.6b" {
+	if got := strings.Join(f.allowed, ","); got != "qwen3.8:27b,qwen3-embedding:0.6b" {
 		t.Errorf("allowed = %q, want both models", got)
 	}
 	if !f.readvertised {
@@ -278,10 +303,10 @@ func TestSetupInference_HappyPath(t *testing.T) {
 func TestSetupInference_HappyPathOnATerminal(t *testing.T) {
 	f := newFakeSetup(t, macServing())
 	f.setup.tty = true
-	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
+	f.progress["qwen3.8:27b"] = onePull(4_661_211_808)
 	f.progress["qwen3-embedding:0.6b"] = onePull(274_302_450)
 	f.inv = servingInventory(
-		offeredModel("qwen3.5:9b", models.Attributes{
+		offeredModel("qwen3.8:27b", models.Attributes{
 			ContextWindow: 131072, StructuredOutput: true, Tools: true,
 			Params: 8_030_000_000, Quant: "Q4_K_M", MaxConcurrent: 1,
 		}),
@@ -301,7 +326,7 @@ func TestSetupInference_HappyPathOnATerminal(t *testing.T) {
 		t.Errorf("a terminal must be redrawn in place:\n%q", out)
 	}
 	for _, want := range []string{
-		"Pulling qwen3.5:9b",
+		"Pulling qwen3.8:27b",
 		"  4.7 GB total",
 		"[========================================] 100%   4.7 GB / 4.7 GB",
 		"Pulling qwen3-embedding:0.6b",
@@ -329,7 +354,7 @@ func TestSetupInference_ModelFlagOverridesTheDefaults(t *testing.T) {
 	if got := strings.Join(f.pulled, ","); got != "qwen2.5:7b,hf.co/owner/repo:Q4_K_M" {
 		t.Errorf("pulled = %q, want the ids as typed, deduplicated", got)
 	}
-	if strings.Contains(out, "qwen3.5:9b") {
+	if strings.Contains(out, "qwen3.8:27b") {
 		t.Errorf("a default must not be pulled beside an explicit --model:\n%s", out)
 	}
 }
@@ -371,8 +396,11 @@ func TestSetupInference_BelowTheFloorIsPrerequisite(t *testing.T) {
 // Docker present, no GPU toolkit: the same code, a different sentence,
 // and the sudo commands are LABELLED as the person's to run. A line the
 // cockpit prints and a line the cockpit runs look identical on screen.
+// Reachable only under --runtime docker now: without the flag the same
+// machine takes the native path below and needs nothing from root.
 func TestSetupInference_NoGPUToolkitNamesThePackageAndTheSudoRule(t *testing.T) {
 	f := newFakeSetup(t, linuxNoToolkit())
+	f.setup.runtimeFlag = "docker"
 	code, out := f.run()
 	t.Logf("transcript:\n%s", out)
 
@@ -387,6 +415,111 @@ func TestSetupInference_NoGPUToolkitNamesThePackageAndTheSudoRule(t *testing.T) 
 	}
 	if !strings.Contains(flat(out), "for you to run yourself") {
 		t.Errorf("a printed sudo command must be labelled as the person's to run:\n%s", out)
+	}
+	// And the way out, which is the whole reason the flag exists.
+	if !strings.Contains(flat(out), "drop --runtime docker") {
+		t.Errorf("a Docker refusal must name the native default as the way out:\n%s", out)
+	}
+	if len(f.staged) != 0 || len(f.ran) != 0 {
+		t.Errorf("a refusal must stage and run nothing; staged %d, ran %v", len(f.staged), f.ran)
+	}
+}
+
+// THE MACHINE THAT STARTED ALL THIS, without the flag: the runtime is
+// staged as the user, the unit enabled, and nothing about Docker, the
+// toolkit or sudo reaches the screen.
+func TestSetupInference_LinuxDefaultStagesTheRuntimeAsTheUser(t *testing.T) {
+	f := newFakeSetup(t, linuxNative())
+	f.setup.in = strings.NewReader("y\n")
+	f.inv = servingInventory(offeredModel("qwen3.8:27b", models.Attributes{ContextWindow: 131072}))
+
+	code, out := f.run()
+	t.Logf("transcript:\n%s", out)
+
+	if code != SetupExitOK {
+		t.Fatalf("exit code = %d, want %d\n%s", code, SetupExitOK, out)
+	}
+	// Say it before you do it, in both halves: the stage as sentences,
+	// the commands as the lines that run.
+	for _, want := range []string{
+		"Ollama is not installed. This machine needs it to serve models.",
+		"Ollama will run as your user, from ~/.memql",
+		"This will:",
+		"  download ollama-linux-amd64.tar.zst from https://github.com/ollama/ollama/releases/latest/download",
+		"unpack it into /home/op/.memql/ollama/runtime",
+		"  write /home/op/.config/systemd/user/memql-ollama.service",
+		"and then run:",
+		"  systemctl --user daemon-reload",
+		"  systemctl --user enable --now memql-ollama.service",
+		"Run them now? [y/N]",
+		"The runtime is installed and started.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the install ask must carry %q:\n%s", want, out)
+		}
+	}
+	for _, banned := range []string{"sudo", "nvidia-container-toolkit", "docker run"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("the native path must not mention %q:\n%s", banned, out)
+		}
+	}
+	// The stage ran ONCE, before the first command, and named this
+	// machine's archive and unit.
+	want := []string{
+		"stage /home/op/.memql/ollama/runtime",
+		"run systemctl --user daemon-reload",
+		"run systemctl --user enable --now memql-ollama.service",
+	}
+	if strings.Join(f.events, "|") != strings.Join(want, "|") {
+		t.Errorf("events = %v, want %v", f.events, want)
+	}
+	if len(f.staged) != 1 || len(f.staged[0].Archives) != 1 || f.staged[0].Archives[0].Name != "ollama-linux-amd64.tar.zst" {
+		t.Fatalf("staged = %+v, want the amd64 archive", f.staged)
+	}
+	if f.staged[0].UnitPath != "/home/op/.config/systemd/user/memql-ollama.service" {
+		t.Errorf("unit at %q", f.staged[0].UnitPath)
+	}
+	if len(f.pulled) == 0 {
+		t.Error("an installed runtime must go on to pull")
+	}
+}
+
+// A unit that was enabled and never answered is exit 5, and the failure
+// names the log: an install command exiting zero is a service asked to
+// start, not one that listens, and the next step pulls against the socket.
+func TestSetupInference_RuntimeSilentAfterInstallIsOperationFailed(t *testing.T) {
+	f := newFakeSetup(t, linuxNative())
+	f.setup.in = strings.NewReader("y\n")
+	f.setup.ready = func(context.Context, string) error {
+		return errors.New("nothing answered at http://127.0.0.1:11434 within 30s")
+	}
+
+	err := f.setup.run(context.Background())
+	if code := SetupExitCode(err); code != SetupExitOpFailed {
+		t.Fatalf("exit code = %d, want %d: %v", code, SetupExitOpFailed, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "Its log is /home/op/.memql/state/ollama.log") {
+		t.Errorf("the failure must name the runtime's log: %v", err)
+	}
+	if len(f.pulled) != 0 {
+		t.Errorf("nothing may be pulled against a runtime that is not answering; pulled %v", f.pulled)
+	}
+}
+
+// --non-interactive on the native path: the stage and the commands are on
+// screen, nothing is fetched, nothing is written.
+func TestSetupInference_NonInteractiveStagesNothing(t *testing.T) {
+	f := newFakeSetup(t, linuxNative())
+	f.setup.nonInteractive = true
+	code, out := f.run()
+	if code != SetupExitRefused {
+		t.Fatalf("exit code = %d, want %d\n%s", code, SetupExitRefused, out)
+	}
+	if len(f.staged) != 0 || len(f.ran) != 0 {
+		t.Errorf("staged %d, ran %v; want nothing without an answer", len(f.staged), f.ran)
+	}
+	if !strings.Contains(out, "download ollama-linux-amd64.tar.zst") {
+		t.Errorf("the stage must be on screen even though it did not run:\n%s", out)
 	}
 }
 
@@ -528,15 +661,39 @@ func TestSetupInference_RuntimeNativeAcceptedWhenLinuxAlreadyServes(t *testing.T
 	}
 }
 
-func TestSetupInference_RuntimeNativeRefusedOnLinuxWithNoRuntime(t *testing.T) {
-	f := newFakeSetup(t, linuxReady())
+// --runtime native on Linux names the default and changes nothing.
+func TestSetupInference_RuntimeNativeOnLinuxIsTheDefault(t *testing.T) {
+	f := newFakeSetup(t, linuxNative())
 	f.setup.runtimeFlag = "native"
+	f.setup.in = strings.NewReader("y\n")
+	f.inv = servingInventory(offeredModel("qwen3.8:27b", models.Attributes{ContextWindow: 131072}))
 	code, out := f.run()
-	if code != SetupExitUsage {
-		t.Errorf("exit code = %d, want %d\n%s", code, SetupExitUsage, out)
+	if code != SetupExitOK {
+		t.Errorf("exit code = %d, want %d\n%s", code, SetupExitOK, out)
 	}
-	if !strings.Contains(flat(out), "https://ollama.com/download") {
-		t.Errorf("the refusal must name the fix:\n%s", out)
+	if len(f.staged) != 1 {
+		t.Errorf("staged %d, want the native runtime staged once", len(f.staged))
+	}
+}
+
+// --runtime docker on a Linux machine with the toolkit takes the
+// container path, and the disk figure follows it to Docker's volume.
+func TestSetupInference_RuntimeDockerOnLinuxTakesTheContainer(t *testing.T) {
+	h := linuxReady()
+	h.DockerFreeDisk = 123_000_000_000
+	f := newFakeSetup(t, h)
+	f.setup.runtimeFlag = "docker"
+	f.setup.in = strings.NewReader("y\n")
+	f.inv = servingInventory(offeredModel("qwen3.8:27b", models.Attributes{ContextWindow: 131072}))
+	code, out := f.run()
+	if code != SetupExitOK {
+		t.Fatalf("exit code = %d, want %d\n%s", code, SetupExitOK, out)
+	}
+	if len(f.staged) != 0 {
+		t.Errorf("the container path stages nothing; staged %+v", f.staged)
+	}
+	if len(f.ran) != 1 || f.ran[0][0] != "docker" {
+		t.Errorf("ran %v, want the docker run line", f.ran)
 	}
 }
 
@@ -830,8 +987,8 @@ func TestSetupInference_DiskRefusalNamesBothNumbers(t *testing.T) {
 	// flow will actually ask for. A fixture keyed on some other model
 	// fires no progress at all, and the disk refusal this test exists
 	// for is then never reached.
-	f.progress["qwen3.5:9b"] = onePull(4_661_211_808)
-	f.pullErr = errors.New("pulling qwen3.5:9b was cancelled: context canceled")
+	f.progress["qwen3.8:27b"] = onePull(4_661_211_808)
+	f.pullErr = errors.New("pulling qwen3.8:27b was cancelled: context canceled")
 
 	code, out := f.run()
 	t.Logf("transcript:\n%s", out)
@@ -844,7 +1001,7 @@ func TestSetupInference_DiskRefusalNamesBothNumbers(t *testing.T) {
 	if strings.Contains(out, "context canceled") {
 		t.Errorf("the cancellation must not be what is reported:\n%s", out)
 	}
-	for _, want := range []string{"not enough disk", "4.7 GB", "2.1 GB", "qwen3.5:9b"} {
+	for _, want := range []string{"not enough disk", "4.7 GB", "2.1 GB", "qwen3.8:27b"} {
 		if !strings.Contains(strings.ToLower(flat(out)), strings.ToLower(want)) {
 			t.Errorf("the refusal must name %q:\n%s", want, out)
 		}
@@ -1103,5 +1260,22 @@ func TestAlreadySaidPrintsNothingTwice(t *testing.T) {
 	// carries its message, so runInferenceSetup has something to print.
 	if msg := setupFailed("this machine could not be inspected: %v", errors.New("boom")).Error(); msg == "" {
 		t.Error("an unclassified failure must carry a message for stderr")
+	}
+}
+
+func TestSetupInferenceRefusesUnavailableCustomEndpointBeforeInstall(t *testing.T) {
+	for _, base := range []string{"http://127.0.0.1:11435", "http://remote.example:11434", "https://localhost:11434"} {
+		t.Run(base, func(t *testing.T) {
+			f := newFakeSetup(t, linuxNative())
+			f.setup.base = func() string { return base }
+			f.setup.in = strings.NewReader("yes\n")
+			err := f.setup.run(context.Background())
+			if SetupExitCode(err) != SetupExitPrereq || !strings.Contains(err.Error(), "OLLAMA_HOST") {
+				t.Errorf("expected endpoint refusal naming OLLAMA_HOST, got %v", err)
+			}
+			if len(f.staged) > 0 || len(f.ran) > 0 || len(f.pulled) > 0 || len(f.allowed) > 0 {
+				t.Errorf("mutated machine before endpoint refusal: events=%v pulled=%v", f.events, f.pulled)
+			}
+		})
 	}
 }
