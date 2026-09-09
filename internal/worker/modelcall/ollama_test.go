@@ -58,6 +58,56 @@ func serveRaw(t *testing.T, body string) (*httptest.Server, *[]byte) {
 
 func discardEmit(string) error { return nil }
 
+// The default 2048-token compute batch can evict a resident chat model even
+// with an 8K embedding context. Bound that allocation without shortening input.
+func TestOllamaEmbedBoundsComputeBatchWithoutShorteningInput(t *testing.T) {
+	input := strings.Repeat("MemQL first-machine acceptance. ", 1360)
+	srv, seen := serveRaw(t, `{"model":"qwen3-embedding:0.6b","embeddings":[[1,2]],"prompt_eval_count":8162}`)
+	client := &ollamaClient{baseURL: srv.URL, http: srv.Client()}
+	result, err := client.Embed(context.Background(), EmbedRequest{Model: "qwen3-embedding:0.6b", Input: []string{input}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request struct {
+		Input    []string       `json:"input"`
+		Truncate *bool          `json:"truncate"`
+		Options  map[string]int `json:"options"`
+	}
+	if err := json.Unmarshal(*seen, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Options["num_batch"] != 512 || request.Options["num_ctx"] != 8192 {
+		t.Fatalf("embedding options = %v, want batch512/context8192", request.Options)
+	}
+	if len(request.Input) != 1 || request.Input[0] != input || request.Truncate == nil || *request.Truncate {
+		t.Fatal("embedding request must preserve the complete input and explicitly refuse truncation")
+	}
+	if result.Usage.InputTokens != 8162 || len(result.Embeddings) != 1 {
+		t.Fatalf("embedding result lost token usage or vectors: %+v", result)
+	}
+}
+
+func TestOllamaEmbedPreservesOtherModelsBatchDefaults(t *testing.T) {
+	for _, model := range []string{"nomic-embed-text", "bert", "custom/qwen3-embedding:0.6b", "qwen3-embedding:8b"} {
+		t.Run(model, func(t *testing.T) {
+			srv, seen := serveRaw(t, `{"embeddings":[[1,2]]}`)
+			client := &ollamaClient{baseURL: srv.URL, http: srv.Client()}
+			if _, err := client.Embed(context.Background(), EmbedRequest{Model: model, Input: []string{strings.Repeat("document ", 1200)}}); err != nil {
+				t.Fatal(err)
+			}
+			var request struct {
+				Options map[string]int `json:"options"`
+			}
+			if err := json.Unmarshal(*seen, &request); err != nil {
+				t.Fatal(err)
+			}
+			if _, present := request.Options["num_batch"]; present {
+				t.Fatal("unverified embedding architectures must retain the runtime's batch default")
+			}
+		})
+	}
+}
+
 // TestOllamaChat_ToolCallsArriveComplete. Ollama never streams a partial
 // tool call, so the decoder appends whole ones and has no accumulator.
 // This is the test that pins that: if Ollama ever did split a call, the

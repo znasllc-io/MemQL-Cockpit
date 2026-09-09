@@ -166,11 +166,21 @@ type ollamaEmbedResponse struct {
 const embedWorkingContext = 8192
 
 func (c *ollamaClient) Embed(ctx context.Context, req EmbedRequest) (Result, error) {
+	options := map[string]any{"num_ctx": embedWorkingContext}
+	// This curated causal embedder can process its full 8K window in smaller
+	// batches. On a 24 GB RTX 4090, Ollama 0.33.3's default 2048 batch ran out
+	// of compute-buffer memory beside the 32K chat model. A 512 batch kept
+	// both resident (with CPU offload) and embedded all 8162 acceptance tokens.
+	// Keep other models' defaults: noncausal embedders can require the whole
+	// input to fit in one physical batch, so this is not a generic input cap.
+	if req.Model == "qwen3-embedding:0.6b" {
+		options["num_batch"] = 512
+	}
 	resp, err := c.post(ctx, "/api/embed", map[string]any{
 		"model":    req.Model,
 		"input":    req.Input,
 		"truncate": false,
-		"options":  map[string]any{"num_ctx": embedWorkingContext},
+		"options":  options,
 	})
 	if err != nil {
 		return Result{}, err
