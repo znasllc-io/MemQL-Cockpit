@@ -272,3 +272,70 @@ func TestSaveWorkersMode0600(t *testing.T) {
 		t.Fatalf("mode %04o; want 0600", info.Mode().Perm())
 	}
 }
+
+func TestUpsertHomeSameURLDifferentIDNoForce(t *testing.T) {
+	dir := t.TempDir()
+	workers := filepath.Join(dir, "workers.yaml")
+	legacy := filepath.Join(dir, "worker.yaml")
+
+	// Pair path: explicit --home-id local for api.memql.localhost.
+	if _, err := UpsertHome(UpsertHomeOptions{
+		WorkersPath: workers, LegacyPath: legacy,
+		ID: "local", ClusterURL: "https://api.memql.localhost",
+		Token: "mql_wkr_local_bbbbbbbbbbbb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Install path: empty ID → HomeIDFromURL = api.memql.localhost.
+	// Same cluster_url must refresh WITHOUT --force and keep id "local".
+	w, err := UpsertHome(UpsertHomeOptions{
+		WorkersPath: workers, LegacyPath: legacy,
+		ClusterURL: "https://api.memql.localhost",
+		Token:      "mql_wkr_local_cccccccccccc",
+	})
+	if err != nil {
+		t.Fatalf("same URL refresh without force: %v", err)
+	}
+	if len(w.Homes) != 1 {
+		t.Fatalf("homes = %d, want 1 (no duplicate)", len(w.Homes))
+	}
+	if w.Homes[0].ID != "local" {
+		t.Fatalf("id = %q, want preserved local", w.Homes[0].ID)
+	}
+	if w.Homes[0].Token != "mql_wkr_local_cccccccccccc" {
+		t.Fatalf("token not refreshed")
+	}
+}
+
+func TestUpsertHomeForceRequiredForIDRemap(t *testing.T) {
+	dir := t.TempDir()
+	workers := filepath.Join(dir, "workers.yaml")
+	legacy := filepath.Join(dir, "worker.yaml")
+	if _, err := UpsertHome(UpsertHomeOptions{
+		WorkersPath: workers, LegacyPath: legacy,
+		ID: "local", ClusterURL: "https://api.memql.localhost",
+		Token: "mql_wkr_local_bbbbbbbbbbbb",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := UpsertHome(UpsertHomeOptions{
+		WorkersPath: workers, LegacyPath: legacy,
+		ID: "local", ClusterURL: "https://api.other.example",
+		Token: "mql_wkr_other_dddddddddddd",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("want --force required for id remap, got %v", err)
+	}
+	w, err := UpsertHome(UpsertHomeOptions{
+		WorkersPath: workers, LegacyPath: legacy,
+		ID: "local", ClusterURL: "https://api.other.example",
+		Token: "mql_wkr_other_dddddddddddd", Force: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.Homes) != 1 || w.Homes[0].ClusterURL != "https://api.other.example" {
+		t.Fatalf("force remap failed: %+v", w.Homes)
+	}
+}

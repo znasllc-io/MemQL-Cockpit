@@ -110,7 +110,7 @@ func handlePair(args []string) {
 	overrideIdentity := fs.String("identity", "", "advanced: override identity service URL (skips active-cluster lookup)")
 	token := fs.String("token", "", "advanced: worker token (skip redeem; assumes pre-existing token)")
 	homeID := fs.String("home-id", "", "home id in workers.yaml (default: clusters.yaml name or URL host)")
-	force := fs.Bool("force", false, "replace the matched home only (never clobbers sibling homes)")
+	force := fs.Bool("force", false, "remap a home id onto a different cluster_url (not required for same-URL refresh)")
 	logLevel := fs.String("log-level", "info", "log level")
 	_ = fs.Parse(args)
 
@@ -720,7 +720,7 @@ func printUsage() {
 	fmt.Println("PAIR FLAGS")
 	fmt.Println("  --cluster <name>     Cluster NAME from clusters.yaml (identity lookup).")
 	fmt.Println("  --home-id <id>       Home id in workers.yaml (default: URL host / cluster name).")
-	fmt.Println("  --force              Replace the matched home only (never clobbers siblings).")
+	fmt.Println("  --force              Remap a home id onto a different cluster_url (siblings kept).")
 	fmt.Println("  --identity <url>     Advanced: override identity service URL.")
 	fmt.Println("  --token <token>      Advanced: worker token (skip redeem).")
 	fmt.Println("  --log-level <l>      Log level: debug | info | warn | error")

@@ -379,14 +379,20 @@ type UpsertHomeOptions struct {
 	ClusterURL   string
 	Token        string
 	Name         string // updates worker_name when non-empty
-	Force        bool   // replace THAT home only; refused when id/url collides without force
+	Force        bool   // remap same home id onto a different cluster_url; not required for same-URL refresh
 	Capabilities []string
 }
 
 // UpsertHome adds or updates one home in workers.yaml without clobbering
-// siblings. --force replaces the matched home only.
+// siblings.
 //
-// Match order: explicit id, else cluster_url (host-normalized).
+// Same cluster_url OR same home id with the same URL refreshes the token
+// without --force (and preserves the enrolled id when the suggested id
+// differs — e.g. install derives the URL host while pair --home-id uses
+// a clusters.yaml slot name). --force is required only to remap an
+// existing home id onto a *different* cluster_url.
+//
+// Match order: cluster_url first (host-normalized), else explicit id.
 func UpsertHome(opts UpsertHomeOptions) (WorkersFile, error) {
 	workersPath := opts.WorkersPath
 	if workersPath == "" {
@@ -435,32 +441,37 @@ func UpsertHome(opts UpsertHomeOptions) (WorkersFile, error) {
 		Enabled:    &enabled,
 	}
 
-	idx := -1
+	// Match by id first, else by cluster_url. Same URL under a
+	// different enrolled id (install host-id vs pair --home-id local)
+	// refreshes in place without --force and preserves the enrolled id.
+	idxByID, idxByURL := -1, -1
 	for i, h := range w.Homes {
-		if h.ID == id || sameClusterURL(h.ClusterURL, clusterURL) {
-			idx = i
-			break
+		if h.ID == id {
+			idxByID = i
+		}
+		if sameClusterURL(h.ClusterURL, clusterURL) {
+			idxByURL = i
 		}
 	}
-	if idx >= 0 {
-		// Matched an existing home (by id or URL). Same-id token
-		// refresh is always allowed. Force is required only when the
-		// URL collides with a home that has a different id.
-		if !opts.Force && w.Homes[idx].ID != id && sameClusterURL(w.Homes[idx].ClusterURL, clusterURL) {
-			return WorkersFile{}, fmt.Errorf("upsert home: cluster_url already enrolled as home %q; pass --force to replace that home", w.Homes[idx].ID)
-		}
-		prev := w.Homes[idx]
+	switch {
+	case idxByURL >= 0:
+		// Same cluster_url → token refresh. Preserve enrolled id unless
+		// --force + explicit ID renames the slot.
+		prev := w.Homes[idxByURL]
 		newHome.ID = prev.ID
-		if opts.ID != "" {
+		if opts.Force && strings.TrimSpace(opts.ID) != "" {
 			newHome.ID = id
 		}
-		w.Homes[idx] = newHome
-	} else {
-		for _, h := range w.Homes {
-			if h.ID == id && !sameClusterURL(h.ClusterURL, clusterURL) && !opts.Force {
-				return WorkersFile{}, fmt.Errorf("upsert home: home id %q already exists for %s; pass --force to replace that home", id, h.ClusterURL)
-			}
+		w.Homes[idxByURL] = newHome
+		newHome = w.Homes[idxByURL]
+	case idxByID >= 0:
+		// Same id, different cluster_url → cluster identity remap.
+		prev := w.Homes[idxByID]
+		if !sameClusterURL(prev.ClusterURL, clusterURL) && !opts.Force {
+			return WorkersFile{}, fmt.Errorf("upsert home: home id %q already exists for %s; pass --force to remap that home to %s (siblings are preserved)", id, prev.ClusterURL, clusterURL)
 		}
+		w.Homes[idxByID] = newHome
+	default:
 		w.Homes = append(w.Homes, newHome)
 	}
 

@@ -195,6 +195,121 @@ else
     fail "write_worker_yaml --force must not drop sibling homes"
 fi
 
+# Same cluster_url under a different enrolled id (pair --home-id local
+# vs install host-id) refreshes WITHOUT --force and keeps the enrolled id.
+_url_mismatch="$(mktemp -d)/worker.yaml"
+_url_workers="$(dirname "$_url_mismatch")/workers.yaml"
+mkdir -p "$(dirname "$_url_mismatch")"
+cat > "$_url_workers" << 'WY'
+version: 1
+worker_name: host1
+labels:
+  os: darwin
+  arch: arm64
+concurrency:
+  HEADLESS: 8
+  COMPUTERUSE: 1
+state_dir: /tmp/x
+log_level: info
+capabilities:
+  - HEADLESS
+homes:
+  - id: local
+    cluster_url: https://api.memql.localhost
+    token: mql_wkr_local_bbbbbbbbbbbb
+    enabled: true
+WY
+if write_worker_yaml "$_url_mismatch" "https://api.memql.localhost" "mql_wkr_local_cccccccccccc" "host1" "no" "HEADLESS" >/dev/null 2>&1; then
+    if grep -q 'id: local' "$_url_workers" && grep -q 'mql_wkr_local_cccccccccccc' "$_url_workers"; then
+        if grep -q 'id: api.memql.localhost' "$_url_workers"; then
+            fail "write_worker_yaml must not invent a second home for the same cluster_url"
+        else
+            pass "write_worker_yaml same cluster_url different id refreshes without --force"
+        fi
+    else
+        fail "write_worker_yaml should keep id local and refresh token"
+        cat "$_url_workers" >&2
+    fi
+else
+    fail "write_worker_yaml should refresh same cluster_url without --force when ids differ"
+fi
+
+# Same id + different cluster_url still requires --force.
+_remap="$(mktemp -d)/worker.yaml"
+_remap_workers="$(dirname "$_remap")/workers.yaml"
+mkdir -p "$(dirname "$_remap")"
+cat > "$_remap_workers" << 'WY'
+version: 1
+worker_name: host1
+capabilities:
+  - HEADLESS
+homes:
+  - id: local
+    cluster_url: https://api.memql.localhost
+    token: mql_wkr_local_bbbbbbbbbbbb
+    enabled: true
+WY
+if write_worker_yaml "$_remap" "https://api.other.example" "mql_wkr_other_dddddddddddd" "host1" "no" "HEADLESS" >/dev/null 2>&1; then
+    # home_id from other URL is api.other.example — additive new home, OK.
+    # Remap conflict is same *id* local onto a new URL.
+    pass "write_worker_yaml additive different URL under new id does not need --force"
+else
+    fail "write_worker_yaml should append a new home for a new cluster_url"
+fi
+# Force the id-conflict path: write with a URL whose host_id is "local"
+# is hard; instead pre-seed id matching host and try different URL via
+# manually calling with cluster that home_id_from maps... Use explicit
+# seed where id equals derived host of NEW url? Better: seed id c.example
+# for url https://old.example and upsert https://c.example (home_id=c.example).
+_idconflict="$(mktemp -d)/worker.yaml"
+_idc_workers="$(dirname "$_idconflict")/workers.yaml"
+mkdir -p "$(dirname "$_idconflict")"
+cat > "$_idc_workers" << 'WY'
+version: 1
+worker_name: host1
+capabilities:
+  - HEADLESS
+homes:
+  - id: c.example
+    cluster_url: https://old.example
+    token: mql_wkr_old_eeeeeeeeeeeeee
+    enabled: true
+WY
+if write_worker_yaml "$_idconflict" "https://c.example" "mql_wkr_new_ffffffffffffff" "host1" "no" "HEADLESS" >/dev/null 2>&1; then
+    fail "write_worker_yaml must require --force to remap home id onto a different cluster_url"
+else
+    pass "write_worker_yaml requires --force for home id cluster remap"
+fi
+if write_worker_yaml "$_idconflict" "https://c.example" "mql_wkr_new_ffffffffffffff" "host1" "yes" "HEADLESS" >/dev/null 2>&1; then
+    if grep -q 'cluster_url: https://c.example' "$_idc_workers" && grep -q 'id: c.example' "$_idc_workers"; then
+        pass "write_worker_yaml --force remaps home id onto new cluster_url"
+    else
+        fail "write_worker_yaml --force should remap cluster_url"
+        cat "$_idc_workers" >&2
+    fi
+else
+    fail "write_worker_yaml --force should allow home id cluster remap"
+fi
+
+# ---------------------------------------------------------------
+# Version helpers (compare / parse / resolve)
+# ---------------------------------------------------------------
+
+expect_eq "normalize_semver strips v" "$(normalize_semver 'v0.12.1')" "0.12.1"
+expect_eq "parse_memql_version_line" "$(parse_memql_version_line 'memql 0.12.1 (headless)')" "0.12.1"
+expect_eq "compare_semver equal" "$(compare_semver '0.12.1' '0.12.1')" "0"
+expect_eq "compare_semver older" "$(compare_semver '0.11.0' '0.12.1')" "-1"
+expect_eq "compare_semver newer" "$(compare_semver '0.13.0' '0.12.1')" "1"
+
+# Fake installed binary via a shim that answers --version.
+_verdir="$(mktemp -d)"
+printf '%s\n' '#!/bin/sh' 'echo "memql 0.12.1 (headless)"' > "$_verdir/memql-same"
+chmod +x "$_verdir/memql-same"
+expect_eq "read_binary_version" "$(read_binary_version "$_verdir/memql-same")" "0.12.1"
+
+# resolve_target_version from download-base tag path
+expect_eq "resolve_target_version from download-base"     "$(resolve_target_version 'https://github.com/znasllc-io/memql-cockpit/releases/download/v0.12.1')"     "0.12.1"
+
 # Second upsert must preserve Go-tuned shared header knobs (concurrency,
 # labels, worker_name, state_dir, log_level), not rebuild them from
 # install defaults.
