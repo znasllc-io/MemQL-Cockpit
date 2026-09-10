@@ -25,7 +25,8 @@
 # And the uninstallers: --help and the unknown-flag exit, lib.sh
 # sourcing (they join the installers' loop), and real runs against a
 # throwaway HOME with launchctl / systemctl / sudo cut out of PATH --
-# what --user-local removes and keeps, what --purge adds, the
+# what --user-local removes and keeps (worker.yaml + workers.yaml),
+# what --purge adds, the
 # nothing-installed run, ~/.memql kept for the CLI's clusters.yaml, and
 # the fence that keeps a state_dir outside ~/.memql from being deleted.
 #
@@ -154,24 +155,90 @@ else
     pass "write_worker_yaml default omits COMPUTERUSE capability"
 fi
 
-# Refuses to clobber an existing file without force.
+# Same-URL refresh without --force is allowed (token rotation).
 if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "no" >/dev/null 2>&1; then
-    fail "write_worker_yaml clobbered an existing file without --force"
+    pass "write_worker_yaml refreshes the same home without --force"
 else
-    pass "write_worker_yaml refuses to clobber without --force"
+    fail "write_worker_yaml should refresh the same cluster_url without --force"
 fi
 
-# Overwrites with force=yes and the computer-use capability set.
-if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "yes" "HEADLESS,COMPUTERUSE" >/dev/null 2>&1; then
-    pass "write_worker_yaml overwrites with --force"
+# Additive: a second cluster keeps the first home in workers.yaml.
+_wy_workers="$(dirname "$_wy")/workers.yaml"
+if write_worker_yaml "$_wy" "https://d.example" "mql_wkr_def" "host1" "no" "HEADLESS" >/dev/null 2>&1; then
+    if grep -q 'id: c.example' "$_wy_workers" && grep -q 'id: d.example' "$_wy_workers"; then
+        pass "write_worker_yaml additive upsert keeps sibling homes"
+    else
+        fail "write_worker_yaml should keep both c.example and d.example in workers.yaml"
+        echo "---- workers.yaml ----" >&2
+        cat "$_wy_workers" >&2
+    fi
 else
-    fail "write_worker_yaml should overwrite with --force"
+    fail "write_worker_yaml should accept a second cluster without --force"
+fi
+
+# --force replaces THAT home only (computer-use caps) and keeps siblings.
+if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "yes" "HEADLESS,COMPUTERUSE" >/dev/null 2>&1; then
+    pass "write_worker_yaml --force replaces matched home"
+else
+    fail "write_worker_yaml should accept --force for the matched home"
 fi
 
 if grep -qx '  - HEADLESS' "$_wy" && grep -qx '  - COMPUTERUSE' "$_wy"; then
     pass "write_worker_yaml computeruse lists HEADLESS + COMPUTERUSE"
 else
     fail "write_worker_yaml computeruse should list HEADLESS + COMPUTERUSE"
+fi
+
+if grep -q 'id: d.example' "$_wy_workers"; then
+    pass "write_worker_yaml --force preserves sibling homes"
+else
+    fail "write_worker_yaml --force must not drop sibling homes"
+fi
+
+# Second upsert must preserve Go-tuned shared header knobs (concurrency,
+# labels, worker_name, state_dir, log_level), not rebuild them from
+# install defaults.
+_hdr="${_tmp}/header-preserve"
+mkdir -p "$_hdr"
+_hdr_legacy="${_hdr}/worker.yaml"
+_hdr_workers="${_hdr}/workers.yaml"
+cat > "$_hdr_workers" << 'HDR'
+version: 1
+worker_name: tuned-name
+labels:
+  os: darwin
+  arch: arm64
+  tier: gold
+concurrency:
+  HEADLESS: 3
+  COMPUTERUSE: 2
+state_dir: /custom/state
+log_level: debug
+capabilities:
+  - HEADLESS
+homes:
+  - id: c.example
+    cluster_url: https://c.example
+    token: mql_wkr_oldtokennnnnnn
+    enabled: true
+HDR
+if write_worker_yaml "$_hdr_legacy" "https://e.example" "mql_wkr_newtokennnnnnn" "should-not-replace-name" "no" "HEADLESS" >/dev/null 2>&1; then
+    if grep -q 'worker_name: tuned-name' "$_hdr_workers" \
+        && grep -q 'tier: gold' "$_hdr_workers" \
+        && grep -q 'HEADLESS: 3' "$_hdr_workers" \
+        && grep -q 'COMPUTERUSE: 2' "$_hdr_workers" \
+        && grep -q 'state_dir: /custom/state' "$_hdr_workers" \
+        && grep -q 'log_level: debug' "$_hdr_workers" \
+        && grep -q 'id: c.example' "$_hdr_workers" \
+        && grep -q 'id: e.example' "$_hdr_workers"; then
+        pass "write_worker_yaml upsert preserves tuned registry header fields"
+    else
+        fail "write_worker_yaml upsert clobbered tuned header or dropped homes"
+        echo "---- workers.yaml ----" >&2
+        cat "$_hdr_workers" >&2
+    fi
+else
+    fail "write_worker_yaml should upsert beside a tuned registry"
 fi
 
 # ---------------------------------------------------------------
@@ -573,15 +640,18 @@ else
 fi
 
 # uninstall_fixture lays down what an install leaves behind, for the
-# platform under test: worker.yaml with a token, policy.yaml, a state
-# dir with a log, a --user-local binary with its symlink, and the
-# service file (plus worker.env on linux).
+# platform under test: workers.yaml + legacy worker.yaml with tokens,
+# policy.yaml, a state dir with a log, a --user-local binary with its
+# symlink, and the service file (plus worker.env on linux).
 function uninstall_fixture() {
     local home="$1"
     local platform="$2"
     mkdir -p "${home}/.memql/state" "${home}/.memql/bin"
     printf 'cluster_url: https://c.example\ntoken: mql_wkr_fixture\nstate_dir: %s/.memql/state\n' \
         "$home" > "${home}/.memql/worker.yaml"
+    # Multi-home registry (install writes this first; legacy is the mirror).
+    printf 'version: 1\nworker_name: fixture\nstate_dir: %s/.memql/state\nhomes:\n  - id: c.example\n    cluster_url: https://c.example\n    token: mql_wkr_fixture\n    enabled: true\n' \
+        "$home" > "${home}/.memql/workers.yaml"
     printf 'apps:\n  allow: []\n' > "${home}/.memql/policy.yaml"
     printf 'log line\n' > "${home}/.memql/state/worker.log"
     printf '#!/bin/sh\nexit 0\n' > "${home}/.memql/bin/${_pf_headless}"
@@ -676,6 +746,11 @@ for _platform in mac linux; do
     else
         fail "$_un --user-local left worker.yaml behind"
     fi
+    if [[ ! -e "${_uh}/.memql/workers.yaml" ]]; then
+        pass "$_un --user-local removes workers.yaml (multi-home registry tokens)"
+    else
+        fail "$_un --user-local left workers.yaml behind"
+    fi
     if [[ ! -e "${_uh}/.memql/bin/${INSTALLED_COMMAND}" && ! -L "${_uh}/.memql/bin/${INSTALLED_COMMAND}" \
         && ! -e "${_uh}/.memql/bin/${_pf_headless}" ]]; then
         pass "$_un --user-local removes the binary and its symlink"
@@ -757,6 +832,21 @@ for _platform in mac linux; do
         pass "$_un --purge keeps clusters.yaml and says it kept ~/.memql for it"
     else
         fail "$_un --purge should keep clusters.yaml and name it; got: $_out"
+    fi
+
+    # Multi-home registry only (no legacy worker.yaml): full uninstall
+    # still removes workers.yaml so tokens are not left behind.
+    _mh="${_tmp}/un-multi-home-${_platform}"
+    mkdir -p "${_mh}/.memql"
+    printf 'version: 1\nhomes:\n  - id: c.example\n    cluster_url: https://c.example\n    token: mql_wkr_only_registry\n    enabled: true\n' \
+        > "${_mh}/.memql/workers.yaml"
+    _out="$(run_uninstaller "$_un" "$_mh" --user-local)"
+    _rc=$?
+    expect_eq "$_un with workers.yaml-only exits 0" "$_rc" "0"
+    if [[ ! -e "${_mh}/.memql/workers.yaml" ]]; then
+        pass "$_un removes workers.yaml when legacy worker.yaml is absent"
+    else
+        fail "$_un left workers.yaml behind on a registry-only machine"
     fi
 
     # Nothing installed: every step reports nothing to remove, exit 0,

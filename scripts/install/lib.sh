@@ -7,7 +7,7 @@
 # function-based helpers sourced by the OS-specific drivers
 # install-mac.sh and install-linux.sh, and by their inverses
 # uninstall-mac.sh and uninstall-linux.sh. write_worker_yaml (below) is
-# the single renderer for ~/.memql/worker.yaml, so the config layout
+# the single renderer for ~/.memql/workers.yaml (+ legacy mirror), so the config layout
 # can never drift between the two platforms; the uninstall helpers at
 # the bottom are the single statement of what an uninstall removes,
 # for the same reason. The pure-logic helpers are exercised by
@@ -340,18 +340,17 @@ function linux_worker_capabilities() {
     esac
 }
 
-# write_worker_yaml renders ~/.memql/worker.yaml from the supplied
-# args. It is the SINGLE source of truth for the worker.yaml layout:
-# both install-mac.sh and install-linux.sh call it, so the config can
-# never drift between platforms. Refuses to clobber an existing file
-# unless force == "yes" (the installers' --force flag).
+# write_worker_yaml upserts one home into ~/.memql/workers.yaml and
+# mirrors that home into the legacy worker.yaml path. ADDITIVE: a
+# second install against a different cluster keeps the first home.
+# --force (force == "yes") replaces the MATCHED home only.
 #
 # Args:
-#   $1 path          -- destination file (usually ~/.memql/worker.yaml)
+#   $1 path          -- legacy worker.yaml path (usually ~/.memql/worker.yaml)
 #   $2 cluster_url   -- cluster edge URL
 #   $3 token         -- worker token (mql_wkr_...)
 #   $4 name          -- worker name
-#   $5 force         -- "yes" to overwrite an existing file (default "no")
+#   $5 force         -- "yes" to replace the matched home (default "no")
 #   $6 capabilities  -- comma-separated capability list to advertise
 #                       (default "HEADLESS"; pass "HEADLESS,COMPUTERUSE"
 #                       for the computer-use variant). The Wayland
@@ -367,28 +366,150 @@ function write_worker_yaml() {
     local name="$4"
     local force="${5:-no}"
     local capabilities="${6:-HEADLESS}"
-    if [[ -e "$path" && "$force" != "yes" ]]; then
-        echo "ERROR: $path already exists; pass --force to overwrite" >&2
-        return 1
+    local dir workers_path home_id
+    dir="$(dirname "$path")"
+    workers_path="${dir}/workers.yaml"
+    home_id="$(echo "$cluster_url" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' | sed -E 's#/.*##' | sed -E 's#:[0-9]+$##' | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$home_id" ]]; then
+        home_id="default"
     fi
-    mkdir -p "$(dirname "$path")"
+
+    mkdir -p "$dir"
+
+    # Refuse to silently replace an existing DIFFERENT home at the same
+    # id without --force. Same-id / same-url refresh is always allowed
+    # (token rotation). A brand-new id always appends.
+    if [[ -e "$workers_path" ]]; then
+        if grep -qE "^[[:space:]]*-[[:space:]]*id:[[:space:]]*${home_id}$|^[[:space:]]*id:[[:space:]]*${home_id}$" "$workers_path"; then
+            if [[ "$force" != "yes" ]]; then
+                # Same home id: allow in-place token refresh by rewriting
+                # the whole registry from a temp rebuild below.
+                :
+            fi
+        elif grep -qF "cluster_url: ${cluster_url}" "$workers_path" && [[ "$force" != "yes" ]]; then
+            echo "ERROR: $workers_path already has cluster_url ${cluster_url}; pass --force to replace that home" >&2
+            return 1
+        fi
+    elif [[ -e "$path" && "$force" != "yes" ]]; then
+        # Legacy-only machine: promote via rewrite rather than refuse —
+        # the Go loader migrates on first run too. Still require --force
+        # only when we would destroy the legacy token for a *different*
+        # URL; same URL refresh is fine.
+        local legacy_url
+        legacy_url="$(grep -E '^cluster_url:' "$path" | head -1 | sed -E 's/^cluster_url:[[:space:]]*//')"
+        if [[ -n "$legacy_url" && "$legacy_url" != "$cluster_url" ]]; then
+            echo "ERROR: $path already exists for ${legacy_url}; pass --force to replace that home (siblings are preserved in workers.yaml)" >&2
+            return 1
+        fi
+    fi
+
+    # Rebuild workers.yaml: keep sibling homes, upsert this one.
+    # Preserve existing registry HEADER fields (worker_name, labels,
+    # concurrency, state_dir, log_level) when present so a second
+    # install/pair does not clobber Go-tuned shared knobs. Capabilities
+    # still come from this install (computer-use may widen them), matching
+    # Go UpsertHome when Capabilities is non-empty. Fresh files get defaults.
+    local tmp
+    tmp="$(mktemp)"
+    local out_name out_state out_log
+    out_name="$name"
+    out_state="$STATE_DIR_DEFAULT"
+    out_log="info"
+    local labels_block concurrency_block
+    labels_block="$(printf 'labels:\n  os: %s\n  arch: %s\n' "$(detect_os)" "$(detect_arch)")"
+    concurrency_block="$(printf 'concurrency:\n  HEADLESS: 8\n  COMPUTERUSE: 1\n')"
+    if [[ -e "$workers_path" ]]; then
+        local existing
+        existing="$(sed -n -E 's/^worker_name:[[:space:]]*//p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_name="$existing"
+        existing="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_state="$existing"
+        existing="$(sed -n -E 's/^log_level:[[:space:]]*//p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_log="$existing"
+        existing="$(awk '
+            /^labels:[[:space:]]*$/ {grab=1; print; next}
+            grab && /^[^[:space:]#]/ {exit}
+            grab {print}
+        ' "$workers_path")"
+        [[ -n "$existing" ]] && labels_block="$existing"
+        existing="$(awk '
+            /^concurrency:[[:space:]]*$/ {grab=1; print; next}
+            grab && /^[^[:space:]#]/ {exit}
+            grab {print}
+        ' "$workers_path")"
+        [[ -n "$existing" ]] && concurrency_block="$existing"
+    fi
+    {
+        echo "version: 1"
+        echo "worker_name: ${out_name}"
+        printf '%s\n' "$labels_block"
+        printf '%s\n' "$concurrency_block"
+        echo "state_dir: ${out_state}"
+        echo "log_level: ${out_log}"
+        echo "capabilities:"
+        echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /'
+        echo "homes:"
+        if [[ -e "$workers_path" ]]; then
+            # Emit sibling home blocks (naive YAML slice between "- id:" entries).
+            awk -v keep_id="$home_id" -v force="$force" '
+                BEGIN { in_homes=0; skip=0; buf="" }
+                /^homes:[[:space:]]*$/ { in_homes=1; next }
+                !in_homes { next }
+                /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
+                    if (buf != "" && !skip) printf "%s", buf
+                    buf = $0 "\n"
+                    id=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", id)
+                    skip = (id == keep_id) ? 1 : 0
+                    next
+                }
+                in_homes {
+                    if (buf == "") next
+                    buf = buf $0 "\n"
+                }
+                END { if (buf != "" && !skip) printf "%s", buf }
+            ' "$workers_path"
+        elif [[ -e "$path" ]]; then
+            # Promote legacy single-home when present and URL differs.
+            local leg_url leg_token leg_id
+            leg_url="$(grep -E '^cluster_url:' "$path" | head -1 | sed -E 's/^cluster_url:[[:space:]]*//')"
+            leg_token="$(grep -E '^token:' "$path" | head -1 | sed -E 's/^token:[[:space:]]*//')"
+            if [[ -n "$leg_url" && "$leg_url" != "$cluster_url" && -n "$leg_token" ]]; then
+                leg_id="$(echo "$leg_url" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' | sed -E 's#/.*##' | sed -E 's#:[0-9]+$##' | tr '[:upper:]' '[:lower:]')"
+                echo "  - id: ${leg_id}"
+                echo "    cluster_url: ${leg_url}"
+                echo "    token: ${leg_token}"
+                echo "    enabled: true"
+            fi
+        fi
+        echo "  - id: ${home_id}"
+        echo "    cluster_url: ${cluster_url}"
+        echo "    token: ${token}"
+        echo "    enabled: true"
+    } > "$tmp"
+    mv "$tmp" "$workers_path"
+    chmod 600 "$workers_path"
+    echo "INFO: upserted home ${home_id} in $workers_path (capabilities: ${capabilities})"
+
+    # Legacy mirror for older tooling / mid-transition LaunchAgents.
+    # state_dir is namespaced per home (homes/<id>) to match ConfigForHome
+    # so a single-file reader does not share registration with siblings.
     cat > "$path" << YAML
 cluster_url: ${cluster_url}
 token: ${token}
-name: ${name}
+name: ${out_name}
 labels:
   os: $(detect_os)
   arch: $(detect_arch)
 concurrency:
   HEADLESS: 8
   COMPUTERUSE: 1
-state_dir: ${STATE_DIR_DEFAULT}
-log_level: info
+state_dir: ${out_state}/homes/${home_id}
+log_level: ${out_log}
 capabilities:
 $(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
 YAML
     chmod 600 "$path"
-    echo "INFO: wrote $path (capabilities: ${capabilities})"
+    echo "INFO: mirrored legacy $path"
 }
 
 # setup_inference turns the freshly paired machine into an INFERENCE
@@ -479,7 +600,7 @@ function record_kept() {
 # under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
 # ONLY tree the uninstallers delete recursively. It is strict about
 # shape on purpose -- absolute, no `..` segment -- because a state_dir
-# read out of worker.yaml is operator-authored text, and the one thing
+# read out of worker config is operator-authored text, and the one thing
 # an uninstaller must never do is `rm -rf` wherever a file it did not
 # write points.
 function under_memql_home() {
@@ -510,6 +631,16 @@ function remove_path_if_present() {
     record_removed "$path"
 }
 
+# remove_worker_config deletes the worker token files on a full
+# uninstall: the multi-home registry (~/.memql/workers.yaml) and the
+# legacy single-home mirror (~/.memql/worker.yaml). Both hold cluster
+# tokens, so both always go -- not only under --purge. clusters.yaml
+# and credentials/ stay: they belong to `memql cluster`, not the worker.
+function remove_worker_config() {
+    remove_path_if_present "${HOME}/.memql/workers.yaml"
+    remove_path_if_present "${HOME}/.memql/worker.yaml"
+}
+
 # remove_tree_if_present deletes a directory recursively, inside the
 # ~/.memql fence and nowhere else. Outside it the directory is KEPT
 # and reported with its path, so the person can decide. That is not
@@ -530,18 +661,25 @@ function remove_tree_if_present() {
     record_removed "$dir"
 }
 
-# worker_state_dir_from_yaml prints the state_dir worker.yaml names,
-# or the default when the file or the key is absent. The drivers call
-# it BEFORE worker.yaml is removed: --purge has to delete the
+# worker_state_dir_from_yaml prints the state_dir worker config names,
+# or the default when the file or the key is absent. Prefers the path
+# handed in (usually legacy worker.yaml), then the multi-home registry
+# workers.yaml beside it -- install always mirrors both, but a machine
+# that only has the registry still has a purge target. The drivers call
+# it BEFORE the token files are removed: --purge has to delete the
 # directory the worker actually used, and write_worker_yaml's default
 # is only where that usually is. A leading `~/` is expanded the way
 # the shell would have; anything else reaches the fence as written.
 function worker_state_dir_from_yaml() {
     local path="$1"
     local dir=""
-    if [[ -f "$path" ]]; then
-        dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$path" | head -1)"
-    fi
+    local try
+    for try in "$path" "$(dirname "$path")/workers.yaml"; do
+        if [[ -f "$try" ]]; then
+            dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$try" | head -1)"
+            [[ -n "$dir" ]] && break
+        fi
+    done
     case "$dir" in
         "")   dir="$STATE_DIR_DEFAULT" ;;
         \~/*) dir="${HOME}/${dir#\~/}" ;;
