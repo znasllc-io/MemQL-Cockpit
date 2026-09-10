@@ -404,7 +404,7 @@ function write_worker_yaml() {
     fi
 
     # Rebuild workers.yaml: keep sibling homes, upsert this one.
-    local tmp existing_body
+    local tmp
     tmp="$(mktemp)"
     {
         echo "version: 1"
