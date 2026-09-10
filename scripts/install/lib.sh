@@ -404,19 +404,48 @@ function write_worker_yaml() {
     fi
 
     # Rebuild workers.yaml: keep sibling homes, upsert this one.
+    # Preserve existing registry HEADER fields (worker_name, labels,
+    # concurrency, state_dir, log_level) when present so a second
+    # install/pair does not clobber Go-tuned shared knobs. Capabilities
+    # still come from this install (computer-use may widen them), matching
+    # Go UpsertHome when Capabilities is non-empty. Fresh files get defaults.
     local tmp
     tmp="$(mktemp)"
+    local out_name out_state out_log
+    out_name="$name"
+    out_state="$STATE_DIR_DEFAULT"
+    out_log="info"
+    local labels_block concurrency_block
+    labels_block="$(printf 'labels:\n  os: %s\n  arch: %s\n' "$(detect_os)" "$(detect_arch)")"
+    concurrency_block="$(printf 'concurrency:\n  HEADLESS: 8\n  COMPUTERUSE: 1\n')"
+    if [[ -e "$workers_path" ]]; then
+        local existing
+        existing="$(sed -n -E 's/^worker_name:[[:space:]]*//p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_name="$existing"
+        existing="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_state="$existing"
+        existing="$(sed -n -E 's/^log_level:[[:space:]]*//p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_log="$existing"
+        existing="$(awk '
+            /^labels:[[:space:]]*$/ {grab=1; print; next}
+            grab && /^[^[:space:]#]/ {exit}
+            grab {print}
+        ' "$workers_path")"
+        [[ -n "$existing" ]] && labels_block="$existing"
+        existing="$(awk '
+            /^concurrency:[[:space:]]*$/ {grab=1; print; next}
+            grab && /^[^[:space:]#]/ {exit}
+            grab {print}
+        ' "$workers_path")"
+        [[ -n "$existing" ]] && concurrency_block="$existing"
+    fi
     {
         echo "version: 1"
-        echo "worker_name: ${name}"
-        echo "labels:"
-        echo "  os: $(detect_os)"
-        echo "  arch: $(detect_arch)"
-        echo "concurrency:"
-        echo "  HEADLESS: 8"
-        echo "  COMPUTERUSE: 1"
-        echo "state_dir: ${STATE_DIR_DEFAULT}"
-        echo "log_level: info"
+        echo "worker_name: ${out_name}"
+        printf '%s\n' "$labels_block"
+        printf '%s\n' "$concurrency_block"
+        echo "state_dir: ${out_state}"
+        echo "log_level: ${out_log}"
         echo "capabilities:"
         echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /'
         echo "homes:"
@@ -462,18 +491,20 @@ function write_worker_yaml() {
     echo "INFO: upserted home ${home_id} in $workers_path (capabilities: ${capabilities})"
 
     # Legacy mirror for older tooling / mid-transition LaunchAgents.
+    # state_dir is namespaced per home (homes/<id>) to match ConfigForHome
+    # so a single-file reader does not share registration with siblings.
     cat > "$path" << YAML
 cluster_url: ${cluster_url}
 token: ${token}
-name: ${name}
+name: ${out_name}
 labels:
   os: $(detect_os)
   arch: $(detect_arch)
 concurrency:
   HEADLESS: 8
   COMPUTERUSE: 1
-state_dir: ${STATE_DIR_DEFAULT}
-log_level: info
+state_dir: ${out_state}/homes/${home_id}
+log_level: ${out_log}
 capabilities:
 $(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
 YAML
@@ -569,7 +600,7 @@ function record_kept() {
 # under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
 # ONLY tree the uninstallers delete recursively. It is strict about
 # shape on purpose -- absolute, no `..` segment -- because a state_dir
-# read out of worker.yaml is operator-authored text, and the one thing
+# read out of worker config is operator-authored text, and the one thing
 # an uninstaller must never do is `rm -rf` wherever a file it did not
 # write points.
 function under_memql_home() {
@@ -600,6 +631,16 @@ function remove_path_if_present() {
     record_removed "$path"
 }
 
+# remove_worker_config deletes the worker token files on a full
+# uninstall: the multi-home registry (~/.memql/workers.yaml) and the
+# legacy single-home mirror (~/.memql/worker.yaml). Both hold cluster
+# tokens, so both always go -- not only under --purge. clusters.yaml
+# and credentials/ stay: they belong to `memql cluster`, not the worker.
+function remove_worker_config() {
+    remove_path_if_present "${HOME}/.memql/workers.yaml"
+    remove_path_if_present "${HOME}/.memql/worker.yaml"
+}
+
 # remove_tree_if_present deletes a directory recursively, inside the
 # ~/.memql fence and nowhere else. Outside it the directory is KEPT
 # and reported with its path, so the person can decide. That is not
@@ -620,18 +661,25 @@ function remove_tree_if_present() {
     record_removed "$dir"
 }
 
-# worker_state_dir_from_yaml prints the state_dir worker.yaml names,
-# or the default when the file or the key is absent. The drivers call
-# it BEFORE worker.yaml is removed: --purge has to delete the
+# worker_state_dir_from_yaml prints the state_dir worker config names,
+# or the default when the file or the key is absent. Prefers the path
+# handed in (usually legacy worker.yaml), then the multi-home registry
+# workers.yaml beside it -- install always mirrors both, but a machine
+# that only has the registry still has a purge target. The drivers call
+# it BEFORE the token files are removed: --purge has to delete the
 # directory the worker actually used, and write_worker_yaml's default
 # is only where that usually is. A leading `~/` is expanded the way
 # the shell would have; anything else reaches the fence as written.
 function worker_state_dir_from_yaml() {
     local path="$1"
     local dir=""
-    if [[ -f "$path" ]]; then
-        dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$path" | head -1)"
-    fi
+    local try
+    for try in "$path" "$(dirname "$path")/workers.yaml"; do
+        if [[ -f "$try" ]]; then
+            dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$try" | head -1)"
+            [[ -n "$dir" ]] && break
+        fi
+    done
     case "$dir" in
         "")   dir="$STATE_DIR_DEFAULT" ;;
         \~/*) dir="${HOME}/${dir#\~/}" ;;

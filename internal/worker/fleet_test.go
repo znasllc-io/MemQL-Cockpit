@@ -37,4 +37,7 @@ func TestEnabledHomesIsolation(t *testing.T) {
 	if ca.Token == cc.Token || ca.ClusterURL == cc.ClusterURL {
 		t.Fatal("homes must project distinct credentials")
 	}
+	if ca.StateDir == cc.StateDir {
+		t.Fatal("homes must project distinct StateDir namespaces")
+	}
 }

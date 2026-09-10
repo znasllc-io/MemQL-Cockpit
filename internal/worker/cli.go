@@ -643,6 +643,7 @@ func handleConfig(args []string) {
 		fmt.Printf("\n  [%s] %s\n", h.ID, en)
 		fmt.Printf("    Cluster URL: %s\n", emptyOrValue(h.ClusterURL))
 		fmt.Printf("    Token:       %s\n", maskToken(h.Token))
+		fmt.Printf("    State dir:   %s\n", w.ConfigForHome(h).StateDir)
 	}
 	if err := w.Validate(); err != nil {
 		fmt.Printf("\nValidation: ERROR -- %v\n", err)

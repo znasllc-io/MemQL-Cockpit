@@ -207,6 +207,50 @@ func TestConfigForHome(t *testing.T) {
 	if cfg.Name != "znas-mac" || cfg.ClusterURL != "https://api.example" {
 		t.Fatalf("projection: %+v", cfg)
 	}
+	wantState := filepath.Join("/tmp/state", "homes", "production")
+	if cfg.StateDir != wantState {
+		t.Fatalf("StateDir = %q, want namespaced %q", cfg.StateDir, wantState)
+	}
+}
+
+func TestConfigForHomeNamespacesDistinctHomes(t *testing.T) {
+	t.Parallel()
+	on := true
+	w := WorkersFile{
+		Version: 1, WorkerName: "mac", StateDir: "/var/memql/state",
+		Capabilities: []string{"HEADLESS"},
+		Homes: []Home{
+			{ID: "a.example", ClusterURL: "https://a.example", Token: "mql_wkr_aaaaaaaaaaaaaa", Enabled: &on},
+			{ID: "b.example", ClusterURL: "https://b.example", Token: "mql_wkr_bbbbbbbbbbbbbb", Enabled: &on},
+		},
+	}
+	ca := w.ConfigForHome(w.Homes[0])
+	cb := w.ConfigForHome(w.Homes[1])
+	if ca.StateDir == cb.StateDir {
+		t.Fatalf("homes share StateDir %q; want distinct namespaces", ca.StateDir)
+	}
+	if !strings.HasSuffix(ca.StateDir, filepath.Join("homes", "a.example")) {
+		t.Fatalf("home a StateDir = %q", ca.StateDir)
+	}
+	if !strings.HasSuffix(cb.StateDir, filepath.Join("homes", "b.example")) {
+		t.Fatalf("home b StateDir = %q", cb.StateDir)
+	}
+}
+
+func TestSanitizeHomeID(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"":                "default",
+		"api.example.com": "api.example.com",
+		"prod/west":       "prod_west",
+		"..":              "default",
+		"a b":             "a_b",
+	}
+	for in, want := range cases {
+		if got := sanitizeHomeID(in); got != want {
+			t.Errorf("sanitizeHomeID(%q) = %q, want %q", in, got, want)
+		}
+	}
 }
 
 func TestSaveWorkersMode0600(t *testing.T) {

@@ -320,17 +320,55 @@ func (w WorkersFile) EnabledHomes() []Home {
 
 // ConfigForHome projects shared defaults + one home into the single-home
 // Config the Runner already understands.
+//
+// StateDir is namespaced per home as <state_dir>/homes/<sanitized-id>
+// so backup registration files, appsession ledgers, and other per-home
+// artifacts cannot clobber siblings. Existing single-home content that
+// lived directly under state_dir is left in place; the next RegisterAck
+// / session write populates the namespaced path. sanitizeHomeID keeps
+// the id filesystem-safe (home ids are usually DNS hosts).
 func (w WorkersFile) ConfigForHome(h Home) Config {
+	stateDir := w.StateDir
+	if stateDir == "" {
+		stateDir = defaultStateDir()
+	}
+	stateDir = filepath.Join(stateDir, "homes", sanitizeHomeID(h.ID))
 	return Config{
 		ClusterURL:   h.ClusterURL,
 		Token:        h.Token,
 		Name:         w.WorkerName,
 		Labels:       cloneStringMap(w.Labels),
 		Concurrency:  cloneUint32Map(w.Concurrency),
-		StateDir:     w.StateDir,
+		StateDir:     stateDir,
 		LogLevel:     w.LogLevel,
 		Capabilities: append([]string(nil), w.Capabilities...),
 	}
+}
+
+// sanitizeHomeID maps a home id to a single path segment. Empty becomes
+// "default"; path separators and ".." are rejected so a hand-edited id
+// cannot escape the homes/ tree.
+func sanitizeHomeID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "default"
+	}
+	var b strings.Builder
+	b.Grow(len(id))
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" || out == "." || out == ".." {
+		return "default"
+	}
+	return out
 }
 
 // UpsertHomeOptions controls UpsertHome.
