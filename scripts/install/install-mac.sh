@@ -18,7 +18,7 @@
 #   --computeruse               Install the computer-use variant (memql-computeruse).
 #   --inference         Also set this machine up to serve local models.
 #   --download-base <u> Base URL for binary downloads.
-#   --force             Overwrite existing worker.yaml.
+#   --force             Replace the matched home only in workers.yaml (siblings kept).
 #   --no-service        Skip LaunchAgent installation.
 
 set -euo pipefail
@@ -84,7 +84,7 @@ Options:
                               user account can swap the binary without
                               privilege escalation.
     --download-base <url>     Override binary download base URL
-    --force                   Overwrite existing worker.yaml
+    --force                   Replace the matched home only in workers.yaml (siblings kept)
     --no-service              Skip LaunchAgent installation
     --help                    Print this help
 EOF
@@ -241,7 +241,7 @@ function main() {
 SUCCESS: memql-worker installed.
 
 Binary:    ${INSTALLED_BINARY}
-Config:    ${HOME}/.memql/worker.yaml
+Config:    ${HOME}/.memql/workers.yaml (legacy mirror: worker.yaml)
 Logs:      ${HOME}/.memql/state/worker.log
 
 The worker is running as a LaunchAgent and will reconnect on

@@ -7,7 +7,7 @@
 # function-based helpers sourced by the OS-specific drivers
 # install-mac.sh and install-linux.sh, and by their inverses
 # uninstall-mac.sh and uninstall-linux.sh. write_worker_yaml (below) is
-# the single renderer for ~/.memql/worker.yaml, so the config layout
+# the single renderer for ~/.memql/workers.yaml (+ legacy mirror), so the config layout
 # can never drift between the two platforms; the uninstall helpers at
 # the bottom are the single statement of what an uninstall removes,
 # for the same reason. The pure-logic helpers are exercised by
@@ -340,18 +340,17 @@ function linux_worker_capabilities() {
     esac
 }
 
-# write_worker_yaml renders ~/.memql/worker.yaml from the supplied
-# args. It is the SINGLE source of truth for the worker.yaml layout:
-# both install-mac.sh and install-linux.sh call it, so the config can
-# never drift between platforms. Refuses to clobber an existing file
-# unless force == "yes" (the installers' --force flag).
+# write_worker_yaml upserts one home into ~/.memql/workers.yaml and
+# mirrors that home into the legacy worker.yaml path. ADDITIVE: a
+# second install against a different cluster keeps the first home.
+# --force (force == "yes") replaces the MATCHED home only.
 #
 # Args:
-#   $1 path          -- destination file (usually ~/.memql/worker.yaml)
+#   $1 path          -- legacy worker.yaml path (usually ~/.memql/worker.yaml)
 #   $2 cluster_url   -- cluster edge URL
 #   $3 token         -- worker token (mql_wkr_...)
 #   $4 name          -- worker name
-#   $5 force         -- "yes" to overwrite an existing file (default "no")
+#   $5 force         -- "yes" to replace the matched home (default "no")
 #   $6 capabilities  -- comma-separated capability list to advertise
 #                       (default "HEADLESS"; pass "HEADLESS,COMPUTERUSE"
 #                       for the computer-use variant). The Wayland
@@ -367,11 +366,102 @@ function write_worker_yaml() {
     local name="$4"
     local force="${5:-no}"
     local capabilities="${6:-HEADLESS}"
-    if [[ -e "$path" && "$force" != "yes" ]]; then
-        echo "ERROR: $path already exists; pass --force to overwrite" >&2
-        return 1
+    local dir workers_path home_id
+    dir="$(dirname "$path")"
+    workers_path="${dir}/workers.yaml"
+    home_id="$(echo "$cluster_url" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' | sed -E 's#/.*##' | sed -E 's#:[0-9]+$##' | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$home_id" ]]; then
+        home_id="default"
     fi
-    mkdir -p "$(dirname "$path")"
+
+    mkdir -p "$dir"
+
+    # Refuse to silently replace an existing DIFFERENT home at the same
+    # id without --force. Same-id / same-url refresh is always allowed
+    # (token rotation). A brand-new id always appends.
+    if [[ -e "$workers_path" ]]; then
+        if grep -qE "^[[:space:]]*-[[:space:]]*id:[[:space:]]*${home_id}$|^[[:space:]]*id:[[:space:]]*${home_id}$" "$workers_path"; then
+            if [[ "$force" != "yes" ]]; then
+                # Same home id: allow in-place token refresh by rewriting
+                # the whole registry from a temp rebuild below.
+                :
+            fi
+        elif grep -qF "cluster_url: ${cluster_url}" "$workers_path" && [[ "$force" != "yes" ]]; then
+            echo "ERROR: $workers_path already has cluster_url ${cluster_url}; pass --force to replace that home" >&2
+            return 1
+        fi
+    elif [[ -e "$path" && "$force" != "yes" ]]; then
+        # Legacy-only machine: promote via rewrite rather than refuse —
+        # the Go loader migrates on first run too. Still require --force
+        # only when we would destroy the legacy token for a *different*
+        # URL; same URL refresh is fine.
+        local legacy_url
+        legacy_url="$(grep -E '^cluster_url:' "$path" | head -1 | sed -E 's/^cluster_url:[[:space:]]*//')"
+        if [[ -n "$legacy_url" && "$legacy_url" != "$cluster_url" ]]; then
+            echo "ERROR: $path already exists for ${legacy_url}; pass --force to replace that home (siblings are preserved in workers.yaml)" >&2
+            return 1
+        fi
+    fi
+
+    # Rebuild workers.yaml: keep sibling homes, upsert this one.
+    local tmp existing_body
+    tmp="$(mktemp)"
+    {
+        echo "version: 1"
+        echo "worker_name: ${name}"
+        echo "labels:"
+        echo "  os: $(detect_os)"
+        echo "  arch: $(detect_arch)"
+        echo "concurrency:"
+        echo "  HEADLESS: 8"
+        echo "  COMPUTERUSE: 1"
+        echo "state_dir: ${STATE_DIR_DEFAULT}"
+        echo "log_level: info"
+        echo "capabilities:"
+        echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /'
+        echo "homes:"
+        if [[ -e "$workers_path" ]]; then
+            # Emit sibling home blocks (naive YAML slice between "- id:" entries).
+            awk -v keep_id="$home_id" -v force="$force" '
+                BEGIN { in_homes=0; skip=0; buf="" }
+                /^homes:[[:space:]]*$/ { in_homes=1; next }
+                !in_homes { next }
+                /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
+                    if (buf != "" && !skip) printf "%s", buf
+                    buf = $0 "\n"
+                    id=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", id)
+                    skip = (id == keep_id) ? 1 : 0
+                    next
+                }
+                in_homes {
+                    if (buf == "") next
+                    buf = buf $0 "\n"
+                }
+                END { if (buf != "" && !skip) printf "%s", buf }
+            ' "$workers_path"
+        elif [[ -e "$path" ]]; then
+            # Promote legacy single-home when present and URL differs.
+            local leg_url leg_token leg_id
+            leg_url="$(grep -E '^cluster_url:' "$path" | head -1 | sed -E 's/^cluster_url:[[:space:]]*//')"
+            leg_token="$(grep -E '^token:' "$path" | head -1 | sed -E 's/^token:[[:space:]]*//')"
+            if [[ -n "$leg_url" && "$leg_url" != "$cluster_url" && -n "$leg_token" ]]; then
+                leg_id="$(echo "$leg_url" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' | sed -E 's#/.*##' | sed -E 's#:[0-9]+$##' | tr '[:upper:]' '[:lower:]')"
+                echo "  - id: ${leg_id}"
+                echo "    cluster_url: ${leg_url}"
+                echo "    token: ${leg_token}"
+                echo "    enabled: true"
+            fi
+        fi
+        echo "  - id: ${home_id}"
+        echo "    cluster_url: ${cluster_url}"
+        echo "    token: ${token}"
+        echo "    enabled: true"
+    } > "$tmp"
+    mv "$tmp" "$workers_path"
+    chmod 600 "$workers_path"
+    echo "INFO: upserted home ${home_id} in $workers_path (capabilities: ${capabilities})"
+
+    # Legacy mirror for older tooling / mid-transition LaunchAgents.
     cat > "$path" << YAML
 cluster_url: ${cluster_url}
 token: ${token}
@@ -388,7 +478,7 @@ capabilities:
 $(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
 YAML
     chmod 600 "$path"
-    echo "INFO: wrote $path (capabilities: ${capabilities})"
+    echo "INFO: mirrored legacy $path"
 }
 
 # setup_inference turns the freshly paired machine into an INFERENCE

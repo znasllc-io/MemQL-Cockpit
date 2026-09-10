@@ -154,24 +154,44 @@ else
     pass "write_worker_yaml default omits COMPUTERUSE capability"
 fi
 
-# Refuses to clobber an existing file without force.
+# Same-URL refresh without --force is allowed (token rotation).
 if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "no" >/dev/null 2>&1; then
-    fail "write_worker_yaml clobbered an existing file without --force"
+    pass "write_worker_yaml refreshes the same home without --force"
 else
-    pass "write_worker_yaml refuses to clobber without --force"
+    fail "write_worker_yaml should refresh the same cluster_url without --force"
 fi
 
-# Overwrites with force=yes and the computer-use capability set.
-if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "yes" "HEADLESS,COMPUTERUSE" >/dev/null 2>&1; then
-    pass "write_worker_yaml overwrites with --force"
+# Additive: a second cluster keeps the first home in workers.yaml.
+_wy_workers="$(dirname "$_wy")/workers.yaml"
+if write_worker_yaml "$_wy" "https://d.example" "mql_wkr_def" "host1" "no" "HEADLESS" >/dev/null 2>&1; then
+    if grep -q 'id: c.example' "$_wy_workers" && grep -q 'id: d.example' "$_wy_workers"; then
+        pass "write_worker_yaml additive upsert keeps sibling homes"
+    else
+        fail "write_worker_yaml should keep both c.example and d.example in workers.yaml"
+        echo "---- workers.yaml ----" >&2
+        cat "$_wy_workers" >&2
+    fi
 else
-    fail "write_worker_yaml should overwrite with --force"
+    fail "write_worker_yaml should accept a second cluster without --force"
+fi
+
+# --force replaces THAT home only (computer-use caps) and keeps siblings.
+if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "yes" "HEADLESS,COMPUTERUSE" >/dev/null 2>&1; then
+    pass "write_worker_yaml --force replaces matched home"
+else
+    fail "write_worker_yaml should accept --force for the matched home"
 fi
 
 if grep -qx '  - HEADLESS' "$_wy" && grep -qx '  - COMPUTERUSE' "$_wy"; then
     pass "write_worker_yaml computeruse lists HEADLESS + COMPUTERUSE"
 else
     fail "write_worker_yaml computeruse should list HEADLESS + COMPUTERUSE"
+fi
+
+if grep -q 'id: d.example' "$_wy_workers"; then
+    pass "write_worker_yaml --force preserves sibling homes"
+else
+    fail "write_worker_yaml --force must not drop sibling homes"
 fi
 
 # ---------------------------------------------------------------
